@@ -189,3 +189,63 @@ the stored output. Unknown event types must be ignored.
 - `GET /health` (no auth): `{status: 'ok', version, protocol_version}`.
 - Everything outside `/api` and `/client` serves the web UI, with unknown
   paths falling back to `index.html`.
+
+## Milestone 3 additions
+
+### Device network
+
+`Device` gains `network: { ssid: string | null; ip: string | null }` — what
+the client reported in its last handshake (both null if it reported nothing).
+
+### `wifi.join` jobs
+
+`POST /jobs` accepts `kind: 'wifi.join'` with payload
+
+```ts
+type WifiJoin = {
+  ssid: string                 // 1..32 bytes
+  password?: string            // 8..63 characters; omit for an open network
+  coordinator_url?: string     // ws:// or wss://; the coordinator to use from then on
+}
+```
+
+Violations are `400 invalid_payload`. Stored payloads returned by `GET /jobs`
+and `GET /jobs/{id}` have `password` replaced by `"********"` when present.
+
+A `wifi.join` target that is still `running` after its device has been
+offline for two minutes becomes `succeeded` with `reason: null` and a
+`message` saying the device left and did not return (it is presumed to have
+joined the network and may now be reporting to another coordinator).
+
+### `job.output` offset
+
+`job.output` events gain `offset: number`: the length, in Unicode code
+points, of the target's stored output before this event's `data` was
+appended. A view that loaded a job with output of N code points ignores
+events with `offset < N` and appends the rest.
+
+### Hotspot (only when `capabilities.hotspot`; served by the manager)
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /manager/hotspot` | | `200 Hotspot` |
+| `POST /manager/hotspot/start` | `{key_id}` | `200 Hotspot`; `404 not_found` (no such key); `400 key_revoked`; `502 hotspot_failed` (message says why) |
+| `POST /manager/hotspot/stop` | | `200 Hotspot` |
+
+```ts
+type Hotspot = {
+  control: 'automatic' | 'manual' | 'unsupported'  // manual: the operator enables it by hand (macOS)
+  state: 'off' | 'starting' | 'on' | 'error'
+  key_id: string | null        // enrollment key the hotspot was started for
+  ssid: string | null          // "SC-" + first 8 characters of the key id
+  passphrase: string | null    // derived from the key's secret
+  client_port: number          // port devices connect to on this computer
+  error: string | null         // why the last start failed
+  instructions: string[]       // steps for the operator when control is 'manual'
+}
+```
+
+With `control: 'manual'`, `start` records the key and returns `state: 'on'`
+with the SSID, passphrase and instructions; the operator turns the hotspot on
+themselves. Devices enrolled with that key find the SSID, join it and connect
+to the embedded coordinator on `client_port`.
