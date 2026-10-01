@@ -276,6 +276,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The CLI checks every signature it makes against the configured public
+      # key; the committed tauri.conf.json leaves it empty, so supply it here.
+      - name: Updater public key for the build
+        shell: bash
+        run: |
+          key="$(tr -d "
+" < crates/manager/updater.pub)"
+          printf "{\"plugins\":{\"updater\":{\"pubkey\":\"%s\"}}}" "$key" > crates/manager/tauri.release.conf.json
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -288,6 +297,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
+          args: --config tauri.release.conf.json
 
   publish:
     name: Publish release
