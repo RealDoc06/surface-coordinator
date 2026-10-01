@@ -1,16 +1,20 @@
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { AccountsPage } from './pages/AccountsPage'
-import { ComposePage } from './pages/ComposePage'
 import { DeviceDetailPage } from './pages/DeviceDetailPage'
 import { DevicesPage } from './pages/DevicesPage'
+import { GroupPage } from './pages/GroupPage'
+import { GroupsPage } from './pages/GroupsPage'
 import { JobDetailPage } from './pages/JobDetailPage'
 import { JobsPage } from './pages/JobsPage'
 import { HotspotPage } from './pages/HotspotPage'
 import { KeysPage } from './pages/KeysPage'
 import { LoginPage, TokenNotice } from './pages/LoginPage'
 import { RejectedPage } from './pages/RejectedPage'
-import { WifiPage } from './pages/WifiPage'
+import { NewJobPage } from './pages/NewJobPage'
+import { ScriptEditPage } from './pages/ScriptEditPage'
+import { ScriptsPage } from './pages/ScriptsPage'
+import { UpdatesPage } from './pages/UpdatesPage'
 import { SessionProvider, useSessionContext } from './session/SessionProvider'
 import { StoreProvider } from './state/StoreProvider'
 
@@ -61,8 +65,17 @@ function Gate() {
           <Routes>
             <Route path="/" element={<DevicesPage />} />
             <Route path="/devices/:id" element={<DeviceDetailPage />} />
-            <Route path="/run" element={<ComposePage />} />
-            <Route path="/wifi" element={<WifiPage />} />
+            <Route path="/run" element={<NewJobPage kind="script.run" />} />
+            <Route path="/launch" element={<NewJobPage kind="app.launch" />} />
+            <Route path="/setting" element={<NewJobPage kind="setting.apply" />} />
+            <Route path="/power" element={<NewJobPage kind="power" />} />
+            <Route path="/wifi" element={<NewJobPage kind="wifi.join" />} />
+            <Route path="/update" element={<NewJobPage kind="client.update" />} />
+            <Route path="/groups" element={<GroupsPage />} />
+            <Route path="/groups/:id" element={<GroupPage />} />
+            <Route path="/scripts" element={<ScriptsPage />} />
+            <Route path="/scripts/:id" element={<ScriptEditPage />} />
+            <Route path="/updates" element={<UpdatesPage />} />
             <Route path="/jobs" element={<JobsPage />} />
             <Route path="/jobs/:id" element={<JobDetailPage />} />
             <Route path="/keys" element={<KeysPage />} />

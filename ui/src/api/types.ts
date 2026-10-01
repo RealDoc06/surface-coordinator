@@ -36,6 +36,17 @@ export type Device = {
   last_seen_at: number
   /** Optional: coordinators older than milestone 3 do not send it. */
   network?: DeviceNetwork
+  /** Optional: coordinators older than milestone 4 do not send it. */
+  group_ids?: string[]
+  /** Optional: coordinators older than milestone 5 do not send it. */
+  protocol_version?: number
+  /**
+   * Connected with a protocol version this coordinator no longer supports; it
+   * only accepts `client.update`. Optional: older coordinators do not send it.
+   */
+  restricted?: boolean
+  /** Its `client_version` is older than the newest cached one. Optional likewise. */
+  update_available?: boolean
 }
 
 export type TargetState = 'queued' | 'sent' | 'running' | 'succeeded' | 'failed' | 'expired'
@@ -45,7 +56,11 @@ export type Target = {
   device_id: string
   state: TargetState
   exit_code: number | null
-  /** unsupported, timeout, nonzero_exit, invalid_payload, interrupted, error */
+  /**
+   * unsupported, timeout, nonzero_exit, invalid_payload, interrupted, error,
+   * cancelled, no_user_session, bad_signature, bad_hash, downgrade_refused,
+   * download_failed, rolled_back. See lib/reasons.ts.
+   */
   reason: string | null
   message: string | null
   /** stdout and stderr interleaved; absent in listings and events. */
@@ -79,16 +94,35 @@ export type WifiJoin = {
   coordinator_url?: string
 }
 
-/**
- * Which devices a job goes to. Later milestones add device groups as a third
- * variant; everything that handles targets switches on `type`.
- */
-export type TargetSpec = { type: 'all' } | { type: 'devices'; device_ids: string[] }
+/** Which devices a job goes to. Everything that handles targets switches on `type`. */
+export type TargetSpec =
+  | { type: 'all' }
+  | { type: 'devices'; device_ids: string[] }
+  /** The members at the moment the job is created. */
+  | { type: 'group'; group_id: string }
+
+export type AppLaunch = {
+  /** 1..1024 characters */
+  path: string
+  /** at most 64, each at most 1024 characters */
+  arguments?: string[]
+}
+
+export type SettingApply = { setting: string; value: boolean | number | string }
+
+export type PowerAction = 'restart' | 'shutdown' | 'sleep'
+export type Power = { action: PowerAction }
+
+export type ClientUpdate = { version: string; downgrade?: boolean }
 
 /** One variant per job kind the UI can create. */
 export type CreateJob =
   | { kind: 'script.run'; payload: ScriptRun; targets: TargetSpec }
   | { kind: 'wifi.join'; payload: WifiJoin; targets: TargetSpec }
+  | { kind: 'app.launch'; payload: AppLaunch; targets: TargetSpec }
+  | { kind: 'setting.apply'; payload: SettingApply; targets: TargetSpec }
+  | { kind: 'power'; payload: Power; targets: TargetSpec }
+  | { kind: 'client.update'; payload: ClientUpdate; targets: TargetSpec }
 
 export type Job = {
   id: string
@@ -157,6 +191,59 @@ export type Hotspot = {
   instructions: string[]
 }
 
+export type SettingValueType =
+  | { type: 'bool' }
+  | { type: 'integer'; min: number; max: number; unit: string }
+  | { type: 'text'; max_len: number }
+
+/** An entry of the settings catalogue (`GET /settings-catalogue`). */
+export type Setting = {
+  id: string
+  label: string
+  description: string
+  /** user: needs someone logged in on the device */
+  scope: 'machine' | 'user'
+  value: SettingValueType
+}
+
+export type Group = { id: string; name: string; created_at: number; device_ids: string[] }
+
+export type Script = {
+  id: string
+  name: string
+  shell: Shell
+  body: string
+  built_in: boolean
+  created_at: number
+  updated_at: number
+}
+
+export type ScriptInput = { name: string; shell: Shell; body: string }
+
+export type ClientRelease = {
+  /** "1.2.3" */
+  version: string
+  /** "windows-x86_64" */
+  target: string
+  size: number
+  sha256: string
+  cached_at: number
+  notes: string | null
+}
+
+export type Updates = {
+  /** false: no update key is built in or checking is turned off */
+  enabled: boolean
+  /** e.g. "RealDoc06/surface-coordinator" */
+  source: string | null
+  last_checked_at: number | null
+  last_error: string | null
+  /** newest cached, verified version */
+  latest: ClientRelease | null
+  /** newest first */
+  cached: ClientRelease[]
+}
+
 export type ServerEvent =
   | { type: 'device.updated'; device: Device }
   | { type: 'device.removed'; device_id: string }
@@ -164,4 +251,6 @@ export type ServerEvent =
   | { type: 'job.target.updated'; job_id: string; target: Target }
   | JobOutputEvent
   | { type: 'connection.rejected'; rejected: Rejected }
+  /** Groups or their membership changed: refetch groups and devices. */
+  | { type: 'groups.changed' }
   | { type: 'resync' }

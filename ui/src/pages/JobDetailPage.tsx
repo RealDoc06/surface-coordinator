@@ -1,28 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError, errorMessage } from '../api/client'
 import type { Target } from '../api/types'
 import { ErrorNote, StateBadge, StateCounts } from '../components/bits'
+import { ConfirmDialog } from '../components/Modal'
 import { OutputPane } from '../components/OutputPane'
-import { formatDateTime, formatDuration, shortId, useNow } from '../lib/format'
+import { formatDateTime, formatDuration, plural, shortId, useNow } from '../lib/format'
 import { JobPayload, jobKindLabel, rerunRequest } from '../lib/jobKinds'
+import { isCancelled, reasonText } from '../lib/reasons'
 import { useStore } from '../state/StoreProvider'
 import { isTerminal } from '../state/store'
-
-const REASONS: Record<string, string> = {
-  unsupported: 'Not supported by this client',
-  timeout: 'Timed out',
-  nonzero_exit: 'Non-zero exit code',
-  invalid_payload: 'Client rejected the job parameters',
-  interrupted: 'Interrupted',
-  error: 'Error',
-}
-
-function reasonText(target: Target): string {
-  const reason = target.reason ? (REASONS[target.reason] ?? target.reason) : ''
-  if (reason && target.message) return `${reason}: ${target.message}`
-  return reason || target.message || ''
-}
 
 function duration(target: Target, now: number): string {
   if (target.started_at === null) return ''
@@ -32,6 +19,7 @@ function duration(target: Target, now: number): string {
 
 function outputPlaceholder(target: Target, loaded: boolean): string {
   if (!loaded) return 'Loading output…'
+  if (isCancelled(target)) return 'Cancelled. The device produced no output.'
   switch (target.state) {
     case 'queued':
       return 'Waiting for the device to connect.'
@@ -62,6 +50,9 @@ function JobDetail({ id }: { id: string }) {
   const [status, setStatus] = useState<Status>('loading')
   const [error, setError] = useState<string | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelBusy, setCancelBusy] = useState(false)
+  const [cancelError, setCancelError] = useState<string | null>(null)
   /** Finished targets as of the last load, to spot ones that finish while watching. */
   const finishedSeen = useRef(0)
 
@@ -87,6 +78,7 @@ function JobDetail({ id }: { id: string }) {
   useEffect(() => () => dispatch({ type: 'job.detail.released', jobId: id }), [dispatch, id])
 
   const job = state.jobs[id]
+  const context = useMemo(() => ({ settings: state.catalogue }), [state.catalogue])
   const finished = job ? job.targets.filter((t) => isTerminal(t.state)).length : 0
 
   // Events from a coordinator that sends no output offsets are placed by
@@ -121,7 +113,27 @@ function JobDetail({ id }: { id: string }) {
     .sort((a, b) => hostname(a.device_id).localeCompare(hostname(b.device_id), undefined, { numeric: true }))
   const selected = targets.find((t) => t.id === selectedId) ?? targets[0]
   const output = selected ? state.outputs[selected.id] : undefined
-  const rerun = rerunRequest(job)
+  const rerun = rerunRequest(job, context)
+  const active = job.targets.filter((t) => !isTerminal(t.state)).length
+
+  async function cancelJob() {
+    setCancelBusy(true)
+    setCancelError(null)
+    try {
+      const { job: updated } = await api.cancelJob(id)
+      // Each change is also announced as an event; apply them now so the page is current.
+      for (const target of updated.targets) {
+        dispatch({ type: 'event', event: { type: 'job.target.updated', job_id: id, target } })
+      }
+      setCancelling(false)
+      void load()
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) setStatus('missing')
+      setCancelError(errorMessage(err))
+    } finally {
+      setCancelBusy(false)
+    }
+  }
 
   return (
     <>
@@ -133,6 +145,11 @@ function JobDetail({ id }: { id: string }) {
         </span>
         <span className="toolbar-spacer" />
         <StateCounts targets={job.targets} />
+        {active > 0 ? (
+          <button type="button" className="danger" onClick={() => setCancelling(true)}>
+            Cancel job
+          </button>
+        ) : null}
         {rerun ? (
           <button type="button" onClick={() => navigate(rerun.path, { state: rerun.state })}>
             Run again
@@ -142,7 +159,7 @@ function JobDetail({ id }: { id: string }) {
       <ErrorNote message={error} onRetry={reload} />
 
       <section className="panel">
-        <JobPayload job={job} />
+        <JobPayload job={job} context={context} />
       </section>
 
       <div className="split">
@@ -171,7 +188,7 @@ function JobDetail({ id }: { id: string }) {
                     </button>
                   </td>
                   <td>
-                    <StateBadge state={target.state} />
+                    <StateBadge state={target.state} reason={target.reason} />
                   </td>
                   <td className="mono">{target.exit_code ?? ''}</td>
                   <td className="nowrap">{duration(target, now)}</td>
@@ -200,7 +217,7 @@ function JobDetail({ id }: { id: string }) {
                   hostname(selected.device_id)
                 )}
               </h2>
-              <StateBadge state={selected.state} />
+              <StateBadge state={selected.state} reason={selected.reason} />
             </div>
             <OutputPane
               streamKey={selected.id}
@@ -212,6 +229,27 @@ function JobDetail({ id }: { id: string }) {
           </section>
         ) : null}
       </div>
+
+      {cancelling ? (
+        <ConfirmDialog
+          title="Cancel this job?"
+          confirmLabel="Cancel job"
+          danger
+          busy={cancelBusy}
+          error={cancelError}
+          onConfirm={() => void cancelJob()}
+          onCancel={() => {
+            setCancelling(false)
+            setCancelError(null)
+          }}
+        >
+          <p>
+            {plural(active, 'device')} {active === 1 ? 'has' : 'have'} not finished. Devices that have not started yet
+            will not run it; the ones that are running are told to stop (a device that is offline is marked cancelled
+            at once). Devices that already finished keep their result.
+          </p>
+        </ConfirmDialog>
+      ) : null}
     </>
   )
 }

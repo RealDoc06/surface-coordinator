@@ -421,3 +421,28 @@ describe('job list paging', () => {
     expect(listedJobs(state).map((j) => j.id)).toEqual(['j3', 'j2'])
   })
 })
+
+describe('groups and the catalogue', () => {
+  it('asks for groups and devices to be refetched on groups.changed', () => {
+    const before = initialState.groupsEpoch
+    const next = applyEvent(initialState, { type: 'groups.changed' })
+    expect(next.groupsEpoch).toBe(before + 1)
+    // Not a full resync: jobs and outputs are not reloaded for it.
+    expect(next.syncEpoch).toBe(initialState.syncEpoch)
+  })
+
+  it('keeps the loaded groups and the catalogue', () => {
+    const groups = [{ id: 'g1', name: 'Lab', created_at: 1, device_ids: ['a'] }]
+    const settings = [
+      { id: 'x', label: 'X', description: '', scope: 'machine' as const, value: { type: 'bool' as const } },
+    ]
+    const state = run(initialState, { type: 'groups.loaded', groups }, { type: 'catalogue.loaded', settings })
+    expect(state.groups).toEqual(groups)
+    expect(state.groupsLoaded).toBe(true)
+    expect(state.catalogue).toEqual(settings)
+  })
+
+  it('ignores event types it does not know', () => {
+    expect(applyEvent(initialState, { type: 'something.new', anything: 1 })).toBe(initialState)
+  })
+})

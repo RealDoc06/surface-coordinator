@@ -1,7 +1,8 @@
 // Small presentational pieces shared by the pages.
 
 import { useRef, useState } from 'react'
-import type { Target, TargetState } from '../api/types'
+import type { Device, Group, Target, TargetState } from '../api/types'
+import { isCancelled } from '../lib/reasons'
 
 export function StatusDot({ online }: { online: boolean }) {
   return (
@@ -9,28 +10,41 @@ export function StatusDot({ online }: { online: boolean }) {
   )
 }
 
-const STATE_LABELS: Record<TargetState, string> = {
+const STATE_LABELS: Record<TargetState | 'cancelled', string> = {
   queued: 'queued',
   sent: 'sent',
   running: 'running',
   succeeded: 'succeeded',
   failed: 'failed',
+  cancelled: 'cancelled',
   expired: 'expired',
 }
 
-export function StateBadge({ state }: { state: TargetState }) {
-  // A state this UI does not know yet (newer coordinator) still gets shown.
-  return <span className={`badge state-${state}`}>{STATE_LABELS[state] ?? state}</span>
+/**
+ * A cancelled target is `failed` with reason `cancelled` on the wire; the
+ * operator asked for it, so it is shown as "cancelled" in a neutral colour.
+ */
+function displayState(target: Pick<Target, 'state'> & { reason?: string | null }): string {
+  return isCancelled({ state: target.state, reason: target.reason ?? null }) ? 'cancelled' : target.state
 }
 
-const STATE_ORDER: TargetState[] = ['succeeded', 'failed', 'running', 'sent', 'queued', 'expired']
+export function StateBadge({ state, reason }: { state: TargetState; reason?: string | null }) {
+  const shown = displayState({ state, reason })
+  // A state this UI does not know yet (newer coordinator) still gets shown.
+  return <span className={`badge state-${shown}`}>{STATE_LABELS[shown as TargetState] ?? shown}</span>
+}
+
+const STATE_ORDER: string[] = ['succeeded', 'failed', 'cancelled', 'running', 'sent', 'queued', 'expired']
 
 /** "2 succeeded · 1 running · 1 queued" */
-export function StateCounts({ targets }: { targets: Pick<Target, 'state'>[] }) {
+export function StateCounts({ targets }: { targets: (Pick<Target, 'state'> & { reason?: string | null })[] }) {
   if (targets.length === 0) return <span className="muted">no devices</span>
   const counts = new Map<string, number>()
-  for (const t of targets) counts.set(t.state, (counts.get(t.state) ?? 0) + 1)
-  const order = [...STATE_ORDER, ...[...counts.keys()].filter((s) => !STATE_ORDER.includes(s as TargetState))]
+  for (const t of targets) {
+    const shown = displayState(t)
+    counts.set(shown, (counts.get(shown) ?? 0) + 1)
+  }
+  const order = [...STATE_ORDER, ...[...counts.keys()].filter((s) => !STATE_ORDER.includes(s))]
   return (
     <span className="state-counts">
       {order
@@ -108,5 +122,43 @@ export function CopyField({ label, value }: { label: string; value: string }) {
         </button>
       </span>
     </label>
+  )
+}
+
+/** The client version, with "update available" and "restricted" markers when the coordinator says so. */
+export function ClientVersion({ device }: { device: Pick<Device, 'client_version' | 'update_available' | 'restricted'> }) {
+  return (
+    <span className="version-cell">
+      {device.client_version}
+      {device.update_available ? (
+        <span className="badge badge-info" title="A newer client version has been downloaded and can be installed on this device.">
+          update available
+        </span>
+      ) : null}
+      {device.restricted ? (
+        <span
+          className="badge badge-warn"
+          title="This device runs a client too old for this coordinator. It only accepts client updates until it is updated."
+        >
+          restricted
+        </span>
+      ) : null}
+    </span>
+  )
+}
+
+/** The groups a device belongs to, as small chips (by name; ids of unknown groups are skipped). */
+export function GroupChips({ device, groups }: { device: Pick<Device, 'group_ids'>; groups: Group[] }) {
+  const ids = new Set(device.group_ids ?? [])
+  const named = groups.filter((g) => ids.has(g.id))
+  if (named.length === 0) return <span className="muted">&mdash;</span>
+  return (
+    <span className="chips">
+      {named.map((g) => (
+        <span key={g.id} className="chip">
+          {g.name}
+        </span>
+      ))}
+    </span>
   )
 }

@@ -1,8 +1,8 @@
 import { useId, useState, type FormEvent, type ReactNode } from 'react'
 import { api, errorMessage } from '../api/client'
-import type { CreateJob, Device, Job, TargetSpec } from '../api/types'
+import type { CreateJob, Device, Group, Job, TargetSpec } from '../api/types'
 import { plural } from '../lib/format'
-import { resolveTargets, type WifiPrefill } from '../lib/targets'
+import { noTargetsMessage, requestTargets, resolveTargets, type WifiPrefill } from '../lib/targets'
 import {
   PASSWORD_MAX_CHARS,
   PASSWORD_MIN_CHARS,
@@ -19,6 +19,8 @@ type Props = {
   targets: TargetSpec | null
   /** Every device the coordinator knows. */
   devices: Device[]
+  /** Every group, to describe a group target. */
+  groups?: Group[]
   /** Values to start from ("Run again"). */
   initial?: WifiPrefill
   /** Ways to change the targets, supplied by the page. */
@@ -30,7 +32,7 @@ type Props = {
 type Errors = WifiErrors & { targets?: string }
 
 /** The form that creates a wifi.join job: move devices to another Wi-Fi network. */
-export function WifiJoinForm({ targets, devices, initial, targetActions, onCreated, onCancel }: Props) {
+export function WifiJoinForm({ targets, devices, groups, initial, targetActions, onCreated, onCancel }: Props) {
   const [ssid, setSsid] = useState(initial?.ssid ?? '')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
@@ -40,7 +42,7 @@ export function WifiJoinForm({ targets, devices, initial, targetActions, onCreat
   const [submitting, setSubmitting] = useState(false)
   const ids = useId()
 
-  const resolved = targets ? resolveTargets(targets, devices) : null
+  const resolved = targets ? resolveTargets(targets, devices, groups) : null
   const targetCount = resolved?.devices.length ?? 0
   const ssidBytes = utf8Length(ssid)
 
@@ -49,8 +51,7 @@ export function WifiJoinForm({ targets, devices, initial, targetActions, onCreat
     const form = { ssid, password, coordinatorUrl }
     const next: Errors = validateWifiForm(form)
     if (!targets || !resolved || targetCount === 0) {
-      next.targets =
-        targets?.type === 'all' ? 'There are no devices to move yet.' : 'Select at least one device to move.'
+      next.targets = noTargetsMessage(targets, 'move')
     }
     setErrors(next)
     setApiError(null)
@@ -59,10 +60,7 @@ export function WifiJoinForm({ targets, devices, initial, targetActions, onCreat
     const request: CreateJob = {
       kind: 'wifi.join',
       payload: wifiPayload(form),
-      targets:
-        targets.type === 'devices'
-          ? { type: 'devices', device_ids: resolved.devices.map((d) => d.id) }
-          : targets,
+      targets: requestTargets(targets, resolved),
     }
     setSubmitting(true)
     try {
@@ -98,7 +96,7 @@ export function WifiJoinForm({ targets, devices, initial, targetActions, onCreat
 
       <section className="panel" aria-labelledby={`${ids}-targets`}>
         <h2 id={`${ids}-targets`}>Devices to move</h2>
-        {targets ? <TargetSummary spec={targets} devices={devices} /> : <p>No devices selected.</p>}
+        {targets ? <TargetSummary spec={targets} devices={devices} groups={groups} /> : <p>No devices selected.</p>}
         {targetActions ? <div className="target-actions">{targetActions}</div> : null}
         {errors.targets ? (
           <p className="error" role="alert">

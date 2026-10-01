@@ -31,6 +31,7 @@ export function JobsPage() {
   }, [dispatch, state.syncEpoch])
 
   const jobs = useMemo(() => listedJobs(state), [state.jobs, state.jobList])
+  const context = useMemo(() => ({ settings: state.catalogue }), [state.catalogue])
   const { loaded, cursor, hasMore } = state.jobList
 
   async function loadMore() {
@@ -83,7 +84,7 @@ export function JobsPage() {
                   <td className="nowrap">{jobKindLabel(job.kind)}</td>
                   <td className="col-preview">
                     <Link className="mono preview" to={`/jobs/${encodeURIComponent(job.id)}`}>
-                      {jobPreview(job) || '(empty)'}
+                      {jobPreview(job, context) || '(empty)'}
                     </Link>
                   </td>
                   <td className="nowrap">{job.created_by ?? <span className="muted">&mdash;</span>}</td>

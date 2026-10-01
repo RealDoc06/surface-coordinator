@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError, errorMessage } from '../api/client'
-import { ErrorNote, StateBadge, StatusDot } from '../components/bits'
+import { ClientVersion, ErrorNote, GroupChips, StateBadge, StatusDot } from '../components/bits'
+import { MenuButton } from '../components/MenuButton'
 import { NetworkCell } from '../components/DeviceList'
 import { ConfirmDialog } from '../components/Modal'
 import { formatDateTime, relativeTime, useNow } from '../lib/format'
+import { actionFor, type ActionKind } from '../lib/actions'
 import { jobKindLabel, jobPreview } from '../lib/jobKinds'
 import type { ComposeRequest } from '../lib/targets'
 import { useStore } from '../state/StoreProvider'
@@ -52,6 +54,7 @@ function DeviceDetail({ id }: { id: string }) {
 
   const device = state.devices[id]
   const targets = state.deviceTargets[id]
+  const context = useMemo(() => ({ settings: state.catalogue }), [state.catalogue])
 
   async function forget() {
     setForgetting(true)
@@ -97,6 +100,21 @@ function DeviceDetail({ id }: { id: string }) {
         <button type="button" onClick={() => navigate('/wifi', { state: runRequest })}>
           Move to Wi-Fi&hellip;
         </button>
+        <MenuButton
+          label="More actions…"
+          items={(
+            [
+              ['launch', 'app.launch', 'Launch app…'],
+              ['setting', 'setting.apply', 'Apply setting…'],
+              ['power', 'power', 'Restart, shut down or sleep…'],
+              ['update', 'client.update', 'Update client…'],
+            ] as [string, ActionKind, string][]
+          ).map(([key, kind, label]) => ({
+            key,
+            label,
+            onSelect: () => navigate(actionFor(kind).path, { state: runRequest }),
+          }))}
+        />
         <button type="button" className="danger" onClick={() => setConfirming(true)}>
           Forget device
         </button>
@@ -115,8 +133,24 @@ function DeviceDetail({ id }: { id: string }) {
           </div>
           <div>
             <dt>Client version</dt>
-            <dd>{device.client_version}</dd>
+            <dd>
+              <ClientVersion device={device} />
+            </dd>
           </div>
+          {device.protocol_version !== undefined ? (
+            <div>
+              <dt>Protocol version</dt>
+              <dd>{device.protocol_version}</dd>
+            </div>
+          ) : null}
+          {state.groups.length > 0 ? (
+            <div>
+              <dt>Groups</dt>
+              <dd>
+                <GroupChips device={device} groups={state.groups} />
+              </dd>
+            </div>
+          ) : null}
           <div>
             <dt>Network</dt>
             <dd>
@@ -167,11 +201,11 @@ function DeviceDetail({ id }: { id: string }) {
                   <td className="nowrap">{jobKindLabel(target.job.kind)}</td>
                   <td className="col-preview">
                     <Link className="mono preview" to={`/jobs/${encodeURIComponent(target.job.id)}`}>
-                      {(job && jobPreview(job)) || 'Open job'}
+                      {(job && jobPreview(job, context)) || 'Open job'}
                     </Link>
                   </td>
                   <td>
-                    <StateBadge state={target.state} />
+                    <StateBadge state={target.state} reason={target.reason} />
                   </td>
                   <td className="mono">{target.exit_code ?? ''}</td>
                 </tr>

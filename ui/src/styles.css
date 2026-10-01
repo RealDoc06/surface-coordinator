@@ -197,6 +197,7 @@ button.link:hover:not(:disabled) {
 input[type='text'],
 input[type='search'],
 input[type='password'],
+input[type='number'],
 select,
 textarea {
   padding: 5px 8px;
@@ -842,4 +843,506 @@ fieldset.choice label {
 
 .panel > .hint {
   margin: 8px 0;
+}
+
+/* Cancelled targets: the operator asked for it, so neutral rather than red. */
+
+.badge.state-cancelled {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  padding: 0 7px;
+}
+
+.badge.badge-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.badge.badge-warn {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.version-cell {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 3px 4px;
+}
+
+.chip {
+  display: inline-block;
+  padding: 0 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* Menus: "More actions" and the Administration entry of the navigation */
+
+.menu-root {
+  position: relative;
+  display: inline-flex;
+  align-self: stretch;
+  align-items: center;
+}
+
+.menu-caret {
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+.menu {
+  position: absolute;
+  top: 100%;
+  z-index: 5;
+  min-width: 220px;
+  margin-top: 2px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+}
+
+.menu-left {
+  left: 0;
+}
+
+.menu-right {
+  right: 0;
+}
+
+.menu .menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  font-weight: normal;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.menu .menu-item:hover:not(:disabled),
+.menu .menu-item:focus-visible {
+  background: var(--surface-alt);
+  text-decoration: none;
+}
+
+.menu .menu-item:focus-visible {
+  outline-offset: -2px;
+}
+
+.menu .menu-item.active {
+  font-weight: 600;
+}
+
+.menu .menu-item.danger {
+  color: var(--red);
+}
+
+.menu-separator {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
+.app-header nav button.nav-menu {
+  align-self: stretch;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 0 10px;
+  color: var(--text-muted);
+}
+
+.app-header nav button.nav-menu:hover:not(:disabled) {
+  background: none;
+  color: var(--text);
+}
+
+.app-header nav button.nav-menu.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.nav-badge.info {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+/* Header navigation sits on one row; the toolbar's menus open downwards. */
+
+.toolbar .menu-root {
+  align-self: auto;
+}
+
+/* The "New job" page: choose the action */
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs a {
+  padding: 5px 12px;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+
+.tabs a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.tabs a.active {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.section-head h2 {
+  margin: 0;
+}
+
+.target-actions {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+a.button {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+a.button:hover {
+  background: var(--surface-alt);
+  text-decoration: none;
+}
+
+a.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.field-label {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.block {
+  display: block;
+}
+
+/* Pickers and lists to choose from */
+
+.modal.modal-wide {
+  width: 620px;
+}
+
+.modal .pick-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.pick-list li + li {
+  border-top: 1px solid var(--border);
+}
+
+.pick-item {
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: none;
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.pick-name {
+  font-weight: 600;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.checklist-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  columns: 2 280px;
+  column-gap: 0;
+}
+
+.checklist-items li {
+  break-inside: avoid;
+  padding: 0;
+}
+
+.checklist-items li > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.checklist-items li > label:hover {
+  background: var(--surface-alt);
+}
+
+.checklist-items li.muted {
+  padding: 8px 10px;
+}
+
+/* Job forms */
+
+.arg-editor {
+  border: none;
+  margin: 0 0 10px;
+  padding: 0;
+}
+
+.arg-editor legend {
+  font-weight: 600;
+  font-size: 13px;
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+.arg-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  max-width: 640px;
+}
+
+.arg-row input {
+  flex: 1 1 320px;
+}
+
+.arg-row .arg-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.arg-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.arg-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.number-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.number-row input[type='range'] {
+  width: 220px;
+  accent-color: var(--accent);
+}
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  position: relative;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 38px;
+  height: 22px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.switch-track {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  border-radius: 11px;
+  background: var(--border-strong);
+  transition: background-color 0.12s;
+  flex: none;
+}
+
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: transform 0.12s;
+}
+
+.switch input:checked + .switch-track {
+  background: var(--accent);
+}
+
+.switch input:checked + .switch-track::after {
+  transform: translateX(16px);
+}
+
+.switch input:focus-visible + .switch-track {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+fieldset.choice.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.power-option {
+  display: flex !important;
+  align-items: flex-start !important;
+  gap: 10px !important;
+  padding: 6px 8px !important;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  max-width: 560px;
+  cursor: pointer;
+}
+
+.power-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.power-option.danger-text:has(input:checked) {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
+.power-option input {
+  margin-top: 3px;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px 0;
+  cursor: pointer;
+}
+
+.check-row input {
+  margin-top: 3px;
+}
+
+.release-notes {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 80ch;
+  margin: 0;
+}
+
+.table .col-notes {
+  max-width: 60ch;
+}
+
+.modal-body > :last-child {
+  margin-bottom: 0;
+}
+
+/* The device toolbar: filters on the left, selection and actions on the right;
+   when they do not fit side by side the actions drop to their own row. */
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.toolbar-actions {
+  margin-left: auto;
+  justify-content: flex-end;
+}
+
+.table .row-actions.left {
+  text-align: left !important;
+}
+
+.table .row-actions.left button:first-child {
+  margin-left: 0;
+}
+
+.panel .release-notes {
+  margin-bottom: 8px;
+}
+
+.field > select {
+  align-self: flex-start;
+  min-width: 200px;
+  max-width: 100%;
+}
+
+.arg-footer {
+  margin-top: 8px;
 }

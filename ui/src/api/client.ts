@@ -7,12 +7,17 @@ import type {
   CreateJob,
   Device,
   DeviceTarget,
+  Group,
   Hotspot,
   Job,
   Key,
   KeyWithSecret,
   Rejected,
+  Script,
+  ScriptInput,
   Session,
+  Setting,
+  Updates,
 } from './types'
 
 export const API_BASE = '/api/v1'
@@ -119,6 +124,30 @@ export const api = {
     return request<{ jobs: Job[] }>('GET', `/jobs?${params.toString()}`)
   },
   getJob: (id: string) => request<{ job: Job }>('GET', `/jobs/${seg(id)}`),
+  cancelJob: (id: string) => request<{ job: Job }>('POST', `/jobs/${seg(id)}/cancel`),
+
+  // Settings catalogue
+  getSettingsCatalogue: () => request<{ settings: Setting[] }>('GET', '/settings-catalogue'),
+
+  // Groups
+  listGroups: () => request<{ groups: Group[] }>('GET', '/groups'),
+  createGroup: (name: string) => request<{ group: Group }>('POST', '/groups', { name }),
+  renameGroup: (id: string, name: string) => request<{ group: Group }>('PATCH', `/groups/${seg(id)}`, { name }),
+  deleteGroup: (id: string) => request<void>('DELETE', `/groups/${seg(id)}`),
+  /** Replaces the whole membership. */
+  setGroupMembers: (id: string, deviceIds: string[]) =>
+    request<{ group: Group }>('PUT', `/groups/${seg(id)}/members`, { device_ids: deviceIds }),
+
+  // Script library
+  listScripts: () => request<{ scripts: Script[] }>('GET', '/scripts'),
+  createScript: (script: ScriptInput) => request<{ script: Script }>('POST', '/scripts', script),
+  updateScript: (id: string, script: ScriptInput) =>
+    request<{ script: Script }>('PUT', `/scripts/${seg(id)}`, script),
+  deleteScript: (id: string) => request<void>('DELETE', `/scripts/${seg(id)}`),
+
+  // Client updates
+  getUpdates: () => request<Updates>('GET', '/updates'),
+  checkUpdates: () => request<Updates>('POST', '/updates/check'),
 
   // Enrollment keys
   listKeys: () => request<{ keys: Key[] }>('GET', '/enrollment-keys'),
@@ -150,7 +179,10 @@ const MESSAGES: Record<string, string> = {
   cannot_delete_self: 'You cannot delete the account you are signed in with.',
   unsupported_kind: 'The coordinator does not support this kind of job.',
   unknown_device: 'One of the selected devices no longer exists. Go back and select again.',
-  no_targets: 'The job has no target devices.',
+  no_targets: 'The job has no target devices. If you chose a group, it has no members.',
+  unknown_group: 'That group no longer exists. Go back and choose again.',
+  name_taken: 'Another entry already has that name. Choose a different name.',
+  built_in: 'Built-in scripts cannot be changed or deleted. Duplicate it to make your own copy.',
   invalid_key: 'The key id or secret is not valid.',
   key_exists: 'An enrollment key with that id already exists.',
   key_revoked: 'That enrollment key has been revoked. Choose another one.',

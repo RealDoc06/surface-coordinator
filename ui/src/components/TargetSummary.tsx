@@ -1,4 +1,4 @@
-import type { Device, TargetSpec } from '../api/types'
+import type { Device, Group, TargetSpec } from '../api/types'
 import { plural, shortId } from '../lib/format'
 import { resolveTargets } from '../lib/targets'
 
@@ -8,11 +8,13 @@ type Props = {
   spec: TargetSpec
   /** Every device the coordinator knows. */
   devices: Device[]
+  /** Every group; needed to describe a group target. */
+  groups?: Group[]
 }
 
 /** Says, in words, which devices a job will go to. */
-export function TargetSummary({ spec, devices }: Props) {
-  const resolved = resolveTargets(spec, devices)
+export function TargetSummary({ spec, devices, groups = [] }: Props) {
+  const resolved = resolveTargets(spec, devices, groups)
   const count = resolved.devices.length
 
   let headline: string
@@ -27,11 +29,23 @@ export function TargetSummary({ spec, devices }: Props) {
       headline = count === 0 ? 'No devices selected' : `${plural(count, 'selected device')}: ${listed}${more}`
       break
     }
+    case 'group':
+      headline = resolved.group
+        ? `Group “${resolved.group.name}” (${plural(count, 'device')} now)`
+        : 'This group no longer exists'
+      break
   }
 
   return (
     <div className="target-summary">
       <p className="target-headline">{headline}</p>
+      {spec.type === 'group' && resolved.group ? (
+        <p className="muted">
+          Membership is taken at the moment the job is created, so devices added to or removed from the group
+          before then are included or left out.
+          {count === 0 ? ' The group has no devices at the moment.' : ''}
+        </p>
+      ) : null}
       {resolved.offline > 0 ? (
         <p className="muted">
           {resolved.offline === count

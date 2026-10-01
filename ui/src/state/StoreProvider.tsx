@@ -9,8 +9,9 @@ import {
   type Dispatch,
   type ReactNode,
 } from 'react'
-import { api, errorMessage } from '../api/client'
+import { api, ApiError, errorMessage } from '../api/client'
 import { EventStream } from '../api/events'
+import type { Group } from '../api/types'
 import { initialState, reducer, type Action, type State } from './store'
 
 type StoreContextValue = {
@@ -22,9 +23,21 @@ type StoreContextValue = {
   reload: () => void
   /** Refetch the enrollment keys after changing them. */
   reloadKeys: () => Promise<void>
+  /** Refetch groups and devices after changing groups (the coordinator also announces it). */
+  reloadGroups: () => void
 }
 
 const StoreContext = createContext<StoreContextValue | null>(null)
+
+/** Groups arrived with milestone 4: an older coordinator answers 404, meaning there are none. */
+async function listGroupsIfSupported(): Promise<Group[]> {
+  try {
+    return (await api.listGroups()).groups
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return []
+    throw err
+  }
+}
 
 type Props = {
   children: ReactNode
@@ -57,8 +70,8 @@ export function StoreProvider({ children, onDisconnected }: Props) {
   useEffect(() => {
     let cancelled = false
     dispatch({ type: 'base.requested' })
-    Promise.all([api.listDevices(), api.listKeys(), api.listRejected()]).then(
-      ([devices, keys, rejected]) => {
+    Promise.all([api.listDevices(), api.listKeys(), api.listRejected(), listGroupsIfSupported()]).then(
+      ([devices, keys, rejected, groups]) => {
         if (cancelled) return
         dispatch({
           type: 'base.loaded',
@@ -66,6 +79,7 @@ export function StoreProvider({ children, onDisconnected }: Props) {
           keys: keys.keys,
           rejected: rejected.rejected,
         })
+        dispatch({ type: 'groups.loaded', groups })
         setLoadError(null)
       },
       (err: unknown) => {
@@ -73,6 +87,21 @@ export function StoreProvider({ children, onDisconnected }: Props) {
         dispatch({ type: 'base.failed' })
         setLoadError(errorMessage(err))
       },
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [state.syncEpoch, state.groupsEpoch])
+
+  // The catalogue only changes with the coordinator's version. It is optional:
+  // previews fall back to setting ids when it cannot be loaded.
+  useEffect(() => {
+    let cancelled = false
+    api.getSettingsCatalogue().then(
+      ({ settings }) => {
+        if (!cancelled) dispatch({ type: 'catalogue.loaded', settings })
+      },
+      () => {},
     )
     return () => {
       cancelled = true
@@ -85,9 +114,11 @@ export function StoreProvider({ children, onDisconnected }: Props) {
     dispatch({ type: 'keys.loaded', keys })
   }, [])
 
+  const reloadGroups = useCallback(() => dispatch({ type: 'event', event: { type: 'groups.changed' } }), [])
+
   const value = useMemo(
-    () => ({ state, dispatch, loadError, reload, reloadKeys }),
-    [state, loadError, reload, reloadKeys],
+    () => ({ state, dispatch, loadError, reload, reloadKeys, reloadGroups }),
+    [state, loadError, reload, reloadKeys, reloadGroups],
   )
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>
 }

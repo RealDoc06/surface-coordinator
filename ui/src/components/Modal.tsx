@@ -4,12 +4,14 @@ const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([
 
 type ModalProps = {
   title: string
+  /** For content that needs room, such as a list to choose from. */
+  wide?: boolean
   children: ReactNode
   onClose: () => void
 }
 
 /** A modal dialog: focus moves in, Tab stays inside, Escape closes, focus returns. */
-export function Modal({ title, children, onClose }: ModalProps) {
+export function Modal({ title, wide = false, children, onClose }: ModalProps) {
   const titleId = useId()
   const panel = useRef<HTMLDivElement>(null)
 
@@ -46,7 +48,7 @@ export function Modal({ title, children, onClose }: ModalProps) {
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div
         ref={panel}
-        className="modal"
+        className={wide ? 'modal modal-wide' : 'modal'}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

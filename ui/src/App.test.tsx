@@ -210,7 +210,9 @@ describe('live updates', () => {
     act(() => socket.send({ type: 'connection.rejected', rejected }))
     expect(within(nav).getByLabelText('1 new')).toBeInTheDocument()
 
-    await user.click(within(nav).getByRole('link', { name: /Rejected connections/ }))
+    // Rejected connections is in the Administration menu, which carries the badge.
+    await user.click(within(nav).getByRole('button', { name: /Administration/ }))
+    await user.click(within(nav).getByRole('menuitem', { name: /Rejected connections/ }))
     expect(await screen.findByText('unknown enrollment key')).toBeInTheDocument()
     expect(screen.getByText('ROGUE')).toBeInTheDocument()
     await waitFor(() => expect(within(nav).queryByLabelText('1 new')).not.toBeInTheDocument())

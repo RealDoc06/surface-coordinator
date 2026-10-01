@@ -6,11 +6,13 @@ import type { ConnectionStatus } from '../api/events'
 import type {
   Device,
   DeviceTarget,
+  Group,
   Job,
   JobOutputEvent,
   Key,
   Rejected,
   ServerEvent,
+  Setting,
   Target,
   TargetState,
 } from '../api/types'
@@ -28,6 +30,16 @@ export type State = {
   devices: Record<string, Device>
   devicesLoaded: boolean
   keys: Key[] | null
+  /** Groups, ordered by name as the coordinator sends them. */
+  groups: Group[]
+  groupsLoaded: boolean
+  /**
+   * Bumped by `groups.changed`: groups and devices are refetched (the devices
+   * carry their group ids). Older coordinators never send it.
+   */
+  groupsEpoch: number
+  /** The settings catalogue; null until loaded (or when the coordinator has none). */
+  catalogue: Setting[] | null
   /**
    * Device and rejected-connection events received while those lists are
    * being fetched (null when no fetch is in flight). The response may predate
@@ -60,6 +72,10 @@ export const initialState: State = {
   devices: {},
   devicesLoaded: false,
   keys: null,
+  groups: [],
+  groupsLoaded: false,
+  groupsEpoch: 0,
+  catalogue: null,
   baseBuffer: null,
   jobs: {},
   jobList: { loaded: false, cursor: null, hasMore: false },
@@ -80,6 +96,8 @@ export type Action =
   | { type: 'base.failed' }
   | { type: 'devices.loaded'; devices: Device[] }
   | { type: 'keys.loaded'; keys: Key[] }
+  | { type: 'groups.loaded'; groups: Group[] }
+  | { type: 'catalogue.loaded'; settings: Setting[] }
   | { type: 'rejected.loaded'; rejected: Rejected[] }
   | { type: 'rejected.seen' }
   | { type: 'jobs.loaded'; jobs: Job[]; pageSize: number; append: boolean }
@@ -338,6 +356,9 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
       }
     }
 
+    case 'groups.changed':
+      return { ...state, groupsEpoch: state.groupsEpoch + 1 }
+
     case 'resync':
       return { ...state, syncEpoch: state.syncEpoch + 1 }
 
@@ -397,6 +418,12 @@ export function reducer(state: State, action: Action): State {
 
     case 'keys.loaded':
       return { ...state, keys: action.keys }
+
+    case 'groups.loaded':
+      return { ...state, groups: action.groups, groupsLoaded: true }
+
+    case 'catalogue.loaded':
+      return { ...state, catalogue: action.settings }
 
     case 'rejected.loaded': {
       let unseen = state.rejectedUnseen
@@ -530,4 +557,10 @@ export function keyLabels(state: State): Record<string, string> {
   const labels: Record<string, string> = {}
   for (const key of state.keys ?? []) labels[key.id] = key.label
   return labels
+}
+
+export function groupNames(state: State): Record<string, string> {
+  const names: Record<string, string> = {}
+  for (const group of state.groups) names[group.id] = group.name
+  return names
 }

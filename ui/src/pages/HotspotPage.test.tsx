@@ -95,15 +95,20 @@ afterEach(() => {
 describe('Hotspot navigation', () => {
   it('has a Hotspot entry only when the manager offers hotspot control', async () => {
     manager()
+    const user = userEvent.setup()
     render(<App />)
-    expect(await screen.findByRole('link', { name: 'Hotspot' })).toHaveAttribute('href', '/hotspot')
+    // Hotspot lives in the Administration menu.
+    await user.click(await screen.findByRole('button', { name: 'Administration' }))
+    expect(await screen.findByRole('menuitem', { name: 'Hotspot' })).toHaveAttribute('href', '/hotspot')
   })
 
   it('has none otherwise, and the page says it is not available', async () => {
     const server = manager({ hotspotAvailable: false })
     render(<App />)
     expect(await screen.findByText('Hotspot control is not available here')).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: 'Hotspot' })).not.toBeInTheDocument()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Administration' }))
+    expect(screen.getByRole('menuitem', { name: 'Enrollment keys' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Hotspot' })).not.toBeInTheDocument()
     expect(gets(server.calls)).toHaveLength(0)
   })
 })
