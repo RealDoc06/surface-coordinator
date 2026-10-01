@@ -5,6 +5,7 @@
 //! the two and never talks to clients itself.
 
 pub mod embedded;
+pub mod hotspot;
 pub mod remote;
 pub mod settings;
 

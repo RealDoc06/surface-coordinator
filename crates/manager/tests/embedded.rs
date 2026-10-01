@@ -1,18 +1,18 @@
 //! The embedded coordinator without a window.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use coordinator_core::Capabilities;
 use manager::embedded::{Embedded, Options};
-use manager::remote;
+use manager::{hotspot, remote};
 use serde_json::{json, Value};
 
 fn options() -> Options {
     Options {
         // The app uses the fixed client port; tests must not collide.
         client_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-        capabilities: Capabilities::default(),
-        extra_api_routes: None,
+        // Never this computer's real hotspot.
+        hotspot: Arc::new(hotspot::Unsupported),
     }
 }
 

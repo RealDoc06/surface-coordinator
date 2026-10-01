@@ -28,5 +28,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url = "2"
 
+[target.'cfg(windows)'.dependencies]
+# Mobile Hotspot (WinRT tethering API). 0.62 is what Tauri already pulls in.
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Networking",
+    "Networking_Connectivity",
+    "Networking_NetworkOperators",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
