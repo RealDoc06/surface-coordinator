@@ -48,7 +48,7 @@ fn all_client_messages() -> Vec<ClientMessage> {
 fn all_server_messages() -> Vec<ServerMessage> {
     vec![
         ServerMessage::Challenge { nonce: "01".repeat(32), mac: "02".repeat(32) },
-        ServerMessage::Welcome { heartbeat_interval_secs: 30 },
+        ServerMessage::Welcome { heartbeat_interval_ms: 30_000 },
         ServerMessage::Reject { reason: "bad_mac".into() },
         ServerMessage::HeartbeatAck,
         ServerMessage::Job {
@@ -154,10 +154,10 @@ fn unknown_message_types_decode_as_unknown() {
 
 #[test]
 fn unknown_fields_are_ignored() {
-    let json = r#"{"type":"welcome","heartbeat_interval_secs":30,"restricted":true,"extra":{"x":1}}"#;
+    let json = r#"{"type":"welcome","heartbeat_interval_ms":30000,"restricted":true,"extra":{"x":1}}"#;
     assert_eq!(
         ServerMessage::from_json(json).unwrap(),
-        ServerMessage::Welcome { heartbeat_interval_secs: 30 }
+        ServerMessage::Welcome { heartbeat_interval_ms: 30_000 }
     );
     let json = r#"{"type":"heartbeat","uptime_secs":12}"#;
     assert_eq!(ClientMessage::from_json(json).unwrap(), ClientMessage::Heartbeat);

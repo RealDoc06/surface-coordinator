@@ -80,7 +80,7 @@ pub enum ServerMessage {
     #[serde(rename = "challenge")]
     Challenge { nonce: String, mac: String },
     #[serde(rename = "welcome")]
-    Welcome { heartbeat_interval_secs: u64 },
+    Welcome { heartbeat_interval_ms: u64 },
     #[serde(rename = "reject")]
     Reject { reason: String },
     #[serde(rename = "heartbeat_ack")]

@@ -52,7 +52,7 @@ Coordinator to client:
 | type | fields |
 |---|---|
 | `challenge` | `nonce`, `mac` |
-| `welcome` | `heartbeat_interval_secs` |
+| `welcome` | `heartbeat_interval_ms` |
 | `reject` | `reason` |
 | `heartbeat_ack` | — |
 | `job` | `job_target_id`, `job_id`, `kind` (free string), `payload` (raw JSON) |
