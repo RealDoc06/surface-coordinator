@@ -1,0 +1,69 @@
+# systemd unit for the Surface Coordinator server.
+#
+# Install as /etc/systemd/system/coordinator.service with the binary at
+# /usr/local/bin/coordinator. See deploy/README.md.
+#
+# The server listens on plain HTTP and WebSocket on 127.0.0.1:8080 and is meant
+# to sit behind a TLS-terminating reverse proxy (deploy/Caddyfile.example).
+# Settings come from the Environment= lines below and from the optional file
+# /etc/surface-coordinator/coordinator.env, which wins. The variable names are
+# the ones `coordinator serve --help` documents.
+
+[Unit]
+Description=Surface Coordinator server
+Documentation=https://github.com/RealDoc06/surface-coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=surface-coordinator
+Group=surface-coordinator
+
+# Defaults. Override them in the environment file rather than editing this unit.
+Environment=SC_BIND=127.0.0.1:8080
+Environment=SC_DATA_DIR=/var/lib/surface-coordinator
+Environment=SC_AUTH=accounts
+# Set to true in the environment file once the proxy serves HTTPS.
+Environment=SC_SECURE_COOKIES=false
+# The leading "-" makes the file optional. Values here override the lines above.
+EnvironmentFile=-/etc/surface-coordinator/coordinator.env
+
+ExecStart=/usr/local/bin/coordinator serve
+
+# Created on first start, owned by the service user, mode 0750.
+# This is /var/lib/surface-coordinator (the SC_DATA_DIR above).
+StateDirectory=surface-coordinator
+StateDirectoryMode=0750
+
+Restart=on-failure
+RestartSec=5
+# The server stops cleanly on SIGTERM; give it time to close connections.
+TimeoutStopSec=30
+
+# Hardening. The server only needs its data directory and the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# If you move SC_DATA_DIR elsewhere, list the new directory here too.
+ReadWritePaths=/var/lib/surface-coordinator
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Port 8080 needs no privileges.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

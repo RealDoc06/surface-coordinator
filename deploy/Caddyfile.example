@@ -1,0 +1,28 @@
+# Caddy reverse proxy for the Surface Coordinator server.
+#
+# Caddy obtains and renews a Let's Encrypt certificate for the hostname by
+# itself (the name must resolve to this server and ports 80 and 443 must be
+# reachable from the internet). It proxies WebSocket connections without any
+# extra configuration.
+#
+# Replace coordinator.example.com with your hostname, then either put this in
+# /etc/caddy/Caddyfile or add it with `import`, and run
+#   systemctl reload caddy
+#
+# With this in place:
+#   - the web UI and API are at   https://coordinator.example.com
+#   - clients connect to          wss://coordinator.example.com
+#     (the "coordinator URL" of an enrollment, and of a wifi.join job)
+#   - set SC_SECURE_COOKIES=true in /etc/surface-coordinator/coordinator.env
+#     so the session cookie is only sent over HTTPS, then restart the service.
+#
+# The coordinator listens on 127.0.0.1:8080 (SC_BIND) and must not be exposed
+# directly; block port 8080 from outside if the firewall allows it.
+
+coordinator.example.com {
+	encode zstd gzip
+
+	# Clients keep one long-lived WebSocket open; Caddy's defaults leave
+	# connections alone, so nothing else is needed here.
+	reverse_proxy 127.0.0.1:8080
+}

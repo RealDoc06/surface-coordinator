@@ -1,0 +1,332 @@
+name: Release
+
+# Push a tag vX.Y.Z that matches [workspace.package] version in Cargo.toml.
+# The workflow builds everything into a DRAFT GitHub Release and publishes it
+# only when every job has succeeded.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Check, build web UI, create draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      version: ${{ steps.version.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the workspace version
+        id: version
+        run: |
+          version=$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+            }' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::Could not read [workspace.package] version from Cargo.toml."
+            exit 1
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::The workspace version '$version' is not major.minor.patch."
+            exit 1
+          fi
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The tag is '$TAG' but the workspace version in Cargo.toml is '$version'. Expected the tag 'v$version'. Fix the version or the tag."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check that the release keys exist
+        run: |
+          missing=0
+          for file in release-keys/client-update.pub crates/manager/updater.pub; do
+            if [ ! -s "$file" ]; then
+              echo "::error::$file is missing or empty. Generate the release keys first, see release-keys/README.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check that the signing secrets are set
+        env:
+          SC_UPDATE_SIGNING_KEY: ${{ secrets.SC_UPDATE_SIGNING_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=0
+          if [ -z "$SC_UPDATE_SIGNING_KEY" ]; then
+            echo "::error::The repository secret SC_UPDATE_SIGNING_KEY is not set."
+            missing=1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::The repository secret TAURI_SIGNING_PRIVATE_KEY is not set."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Refuse to touch a release that is already published
+        run: |
+          if state=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$state" != "true" ]; then
+              echo "::error::A published release for $TAG already exists. Delete it (and re-tag) before releasing this version again."
+              exit 1
+            fi
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build the web UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Create the draft release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+
+      - name: Check that the release id is known
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::The draft release was created but its id was not reported."
+            exit 1
+          fi
+
+  # Windows client: the update artifact the coordinator looks for, signed with
+  # release-tool (Ed25519).
+  client:
+    name: Client (Windows)
+    needs: prepare
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: windows-x86_64
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Check that the web UI is present
+        run: test -f ui/dist/index.html
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release -p client -p release-tool
+
+      - name: Check that the signing secret matches the committed public key
+        env:
+          SC_UPDATE_SIGNING_KEY: ${{ secrets.SC_UPDATE_SIGNING_KEY }}
+        run: |
+          derived=$(./target/release/release-tool.exe public-key | tr -d '[:space:]')
+          committed=$(tr -d '[:space:]' < release-keys/client-update.pub)
+          if [ -z "$derived" ] || [ "$derived" != "$committed" ]; then
+            echo "::error::SC_UPDATE_SIGNING_KEY does not match release-keys/client-update.pub. Devices would reject this update. See release-keys/README.md (Rotate the key)."
+            exit 1
+          fi
+
+      - name: Name the artifact and sign it
+        env:
+          SC_UPDATE_SIGNING_KEY: ${{ secrets.SC_UPDATE_SIGNING_KEY }}
+        run: |
+          mkdir release-assets
+          exe="release-assets/surface-coordinator-client-${VERSION}-${TARGET}.exe"
+          cp target/release/client.exe "$exe"
+          ./target/release/release-tool.exe sign --file "$exe" --version "$VERSION" --target "$TARGET"
+
+      - name: Verify the signature against the committed public key
+        run: |
+          exe="release-assets/surface-coordinator-client-${VERSION}-${TARGET}.exe"
+          ./target/release/release-tool.exe verify \
+            --file "$exe" \
+            --version "$VERSION" \
+            --target "$TARGET" \
+            --signature "$exe.sig" \
+            --public-key release-keys/client-update.pub
+
+      - name: Upload to the draft release
+        run: |
+          exe="release-assets/surface-coordinator-client-${VERSION}-${TARGET}.exe"
+          gh release upload "$TAG" "$exe" "$exe.sig" --clobber
+
+  # Linux coordinator tarball. Built on the older Ubuntu image so the binary
+  # runs on servers with an older glibc.
+  coordinator:
+    name: Coordinator (Linux)
+    needs: prepare
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Check that the web UI is present
+        run: test -f ui/dist/index.html
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release -p coordinator
+
+      - name: Assemble the tarball
+        run: |
+          name="surface-coordinator-coordinator-${VERSION}-linux-x86_64"
+          mkdir -p "release-assets/$name"
+          cp target/release/coordinator "release-assets/$name/coordinator"
+          cp deploy/coordinator.service deploy/coordinator.env.example deploy/Caddyfile.example deploy/README.md "release-assets/$name/"
+          chmod 755 "release-assets/$name/coordinator"
+          tar -czf "release-assets/$name.tar.gz" -C release-assets "$name"
+          tar -tzf "release-assets/$name.tar.gz"
+
+      - name: Upload to the draft release
+        run: |
+          gh release upload "$TAG" "release-assets/surface-coordinator-coordinator-${VERSION}-linux-x86_64.tar.gz" --clobber
+
+  # Manager installers, signature files and latest.json for the Tauri updater.
+  manager:
+    name: Manager (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # The jobs merge their platform into the same latest.json; run them one
+      # at a time so none overwrites another.
+      max-parallel: 1
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Check that the web UI is present
+        shell: bash
+        run: test -f ui/dist/index.html
+
+      - name: Install Tauri system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/manager
+          tauriScript: npx --yes @tauri-apps/cli@2
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  publish:
+    name: Publish release
+    needs: [prepare, client, coordinator, manager]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check that the expected assets are attached
+        run: |
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          printf '%s\n' "$assets"
+          missing=0
+          for name in \
+            "surface-coordinator-client-${VERSION}-windows-x86_64.exe" \
+            "surface-coordinator-client-${VERSION}-windows-x86_64.exe.sig" \
+            "surface-coordinator-coordinator-${VERSION}-linux-x86_64.tar.gz" \
+            "latest.json"; do
+            if ! printf '%s\n' "$assets" | grep -Fxq "$name"; then
+              echo "::error::Release asset $name is missing."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check the updater manifest
+        run: |
+          mkdir manifest
+          gh release download "$TAG" --pattern latest.json --dir manifest
+          jq -e --arg version "$VERSION" '
+            .version == $version
+            and (.platforms | has("windows-x86_64") and has("darwin-aarch64") and has("linux-x86_64"))
+            and ([.platforms[].url] | all(contains("/untagged-") | not))
+          ' manifest/latest.json
+
+      - name: Publish
+        run: gh release edit "$TAG" --draft=false --latest
