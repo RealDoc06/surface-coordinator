@@ -6,6 +6,7 @@ members = [
     "crates/coordinator",
     "crates/client",
     "crates/manager",
+    "crates/release-tool",
 ]
 # The manager needs the desktop (webview) toolchain; build it explicitly
 # with `cargo build -p manager`.
@@ -14,6 +15,7 @@ default-members = [
     "crates/coordinator-core",
     "crates/coordinator",
     "crates/client",
+    "crates/release-tool",
 ]
 
 [workspace.package]
@@ -28,7 +30,9 @@ coordinator-core = { path = "crates/coordinator-core" }
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = "2"
 futures-util = "0.3"
 hex = "0.4"
 hkdf = "0.12"

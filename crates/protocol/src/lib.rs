@@ -7,6 +7,7 @@
 pub mod handshake;
 pub mod hotspot;
 pub mod settings;
+pub mod update;
 
 use serde::{Deserialize, Serialize};
 
