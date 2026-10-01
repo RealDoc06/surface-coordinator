@@ -156,8 +156,7 @@ unknown messages ignored, connection replacement, persistence across restart.
 ## Client (`crates/client`)
 
 ```
-src/lib.rs            Client::run(shutdown)
-src/config.rs         ClientConfig; device id generated once and persisted in the state dir
+src/lib.rs            ClientConfig, Client::run(shutdown); device id generated once and persisted in the state dir
 src/backoff.rs        exponential backoff with jitter, capped at 60 s
 src/ledger.rs         persisted record of started/finished job targets
 src/jobs.rs           job queue, lifecycle, output retention, result reporting
@@ -178,16 +177,16 @@ trait Platform {
 }
 ```
 
-Windows `run_script`: writes the body to a temporary file, runs
-`powershell.exe` or `cmd.exe` with piped output, puts the process in a Job
-Object so a timeout kills the whole process tree, decodes output as UTF-8
-incrementally.
+Windows `run_script`: writes the body to a file in the client state
+directory, runs it with Windows PowerShell or `cmd.exe` with piped output,
+puts the process in a Job Object so a timeout kills the whole process tree,
+and decodes output as UTF-8 incrementally (see Deviations 14).
 
 Core behaviour:
 
 - Connect, handshake (client verifies the coordinator's MAC before sending
   its own), then a session loop. On any failure: back off and reconnect.
-  Backoff resets after a `welcome`.
+  Backoff resets once a connection has stayed up for 30 s.
 - Heartbeat at the interval the coordinator announces in `welcome`; no
   inbound message for 3 intervals → reconnect.
 - Jobs run one at a time in arrival order (see Deviations).
@@ -215,6 +214,10 @@ unknown messages ignored. Windows-only tests run real PowerShell and cmd.
 3. `coordinator` binary.
 4. `client` core (tests first with fakes), then the Windows platform and binary.
 5. End-to-end demo on localhost; README.
+
+Added during the work: an automated end-to-end test of the real client
+against the real coordinator (`crates/client/tests/end_to_end.rs`, Windows
+only) and the demo script `scripts/demo-m1.ps1`.
 
 ## Deviations
 
@@ -264,3 +267,42 @@ work proceeds.
 10. **Enrollment keys are managed from the coordinator CLI** (and the
     `admin` functions in the library). No HTTP endpoint yet; that belongs
     with the milestone 2 UI.
+11. **Every processed `job.result` is acknowledged**, including results for
+    targets the coordinator does not know or that belong to another device
+    (those change nothing). Otherwise a client would replay such a result on
+    every reconnect for ever, for example after a coordinator database was
+    replaced. Milestone 3 has to revisit this for the Wi-Fi handoff, where a
+    result is deliberately reported to a different coordinator.
+12. **The `online` flag in the API comes from the live connection table**,
+    not from the `devices.online` column. The column is still written on
+    every transition and cleared at startup, as the spec's data model has it.
+13. **`welcome` carries the heartbeat interval** (`heartbeat_interval_ms`),
+    so the interval is configured in one place, on the coordinator.
+14. **How scripts are run on Windows.** The shell is started through
+    `cmd.exe /c "chcp 65001 & ..."` so the hidden console is UTF-8 and both
+    shells write UTF-8 to the pipes. PowerShell scripts run with
+    `powershell.exe -File` (Windows PowerShell 5.1, present on every device)
+    and `-ExecutionPolicy Bypass`; the exit code is the script's `exit N`,
+    1 for an uncaught terminating error, otherwise 0. A timeout terminates
+    the whole process tree. A script that finishes normally does not have
+    processes it left running killed. An execution policy enforced by Group
+    Policy overrides `Bypass`.
+15. **Backoff resets only after a connection has been stable for 30 s.**
+    The spec only says "exponential backoff and jitter, capped at 60
+    seconds". Resetting on every successful handshake would let two devices
+    sharing one device id (a cloned image) replace each other about once a
+    second.
+16. **The client stops sending output past the cap.** The coordinator
+    enforces the 1 MiB cap and writes the truncation marker; the client sends
+    the chunk that crosses the cap and then nothing more, which also bounds
+    what it retains for replay.
+17. **TLS.** The Windows client supports `wss://` through the operating
+    system's TLS stack and trust store. The coordinator itself serves plain
+    HTTP/WebSocket; in remote mode it is meant to sit behind a
+    TLS-terminating reverse proxy. Whether the coordinator should terminate
+    TLS itself is a milestone 5 (deployment) decision. `wss://` was not
+    exercised in this milestone.
+18. **Client configuration comes from command-line flags and environment
+    variables**, not from the installer-written configuration file, which
+    arrives with the installer in milestone 5. The device id and the job
+    ledger are persisted in `--state-dir`.
