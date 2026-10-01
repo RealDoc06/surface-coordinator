@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use protocol::update::Version;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 
@@ -107,6 +108,17 @@ const MIGRATIONS: &[&str] = &["
         built_in INTEGER NOT NULL DEFAULT 0,
         created  INTEGER NOT NULL,
         updated  INTEGER NOT NULL
+    );
+", "
+    ALTER TABLE devices ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1;
+    CREATE TABLE client_releases (
+        version TEXT NOT NULL,
+        target  TEXT NOT NULL,
+        size    INTEGER NOT NULL,
+        sha256  TEXT NOT NULL,
+        notes   TEXT,
+        cached  INTEGER NOT NULL,
+        PRIMARY KEY (version, target)
     );
 "];
 
@@ -297,7 +309,15 @@ pub struct Device {
     pub hostname: String,
     pub os: String,
     pub client_version: String,
+    /// The protocol version of its last handshake.
+    pub protocol_version: u32,
     pub online: bool,
+    /// Connected with a protocol version this coordinator does not support,
+    /// so it is only sent `client.update`. Set from the live connection.
+    pub restricted: bool,
+    /// Its client version is older than the newest cached release. Set from
+    /// the release cache.
+    pub update_available: bool,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub network: DeviceNetwork,
@@ -318,6 +338,7 @@ pub struct DeviceInfo<'a> {
     pub hostname: &'a str,
     pub os: &'a str,
     pub client_version: &'a str,
+    pub protocol_version: u32,
     /// Replace what was stored before, so a device that stops reporting its
     /// network does not keep showing an old one.
     pub network_ssid: Option<&'a str>,
@@ -329,8 +350,8 @@ pub fn upsert_device_online(conn: &Connection, device: &DeviceInfo<'_>) -> rusql
     let now = now_ms();
     conn.execute(
         "INSERT INTO devices (id, enrollment_key_id, hostname, os, client_version, first_seen, last_seen, online,
-                              network_ssid, network_ip)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, ?7, ?8)
+                              network_ssid, network_ip, protocol_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
              enrollment_key_id = excluded.enrollment_key_id,
              hostname = excluded.hostname,
@@ -339,7 +360,8 @@ pub fn upsert_device_online(conn: &Connection, device: &DeviceInfo<'_>) -> rusql
              last_seen = excluded.last_seen,
              online = 1,
              network_ssid = excluded.network_ssid,
-             network_ip = excluded.network_ip",
+             network_ip = excluded.network_ip,
+             protocol_version = excluded.protocol_version",
         params![
             device.id,
             device.enrollment_key_id,
@@ -349,6 +371,7 @@ pub fn upsert_device_online(conn: &Connection, device: &DeviceInfo<'_>) -> rusql
             now,
             device.network_ssid,
             device.network_ip,
+            device.protocol_version,
         ],
     )?;
     Ok(())
@@ -375,7 +398,11 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         hostname: row.get(2)?,
         os: row.get(3)?,
         client_version: row.get(4)?,
+        protocol_version: row.get(10)?,
         online: row.get(5)?,
+        // Live state, filled in by `AppState::apply_live_state`.
+        restricted: false,
+        update_available: false,
         first_seen_at: row.get(6)?,
         last_seen_at: row.get(7)?,
         network: DeviceNetwork { ssid: row.get(8)?, ip: row.get(9)? },
@@ -388,7 +415,7 @@ pub fn list_devices(conn: &Connection) -> rusqlite::Result<Vec<Device>> {
     let mut devices: Vec<Device> = conn
         .prepare(
             "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
-                    network_ssid, network_ip
+                    network_ssid, network_ip, protocol_version
              FROM devices ORDER BY hostname, id",
         )?
         .query_map([], device_from_row)?
@@ -409,7 +436,7 @@ pub fn get_device(conn: &Connection, id: &str) -> rusqlite::Result<Option<Device
     let device = conn
         .query_row(
             "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
-                    network_ssid, network_ip
+                    network_ssid, network_ip, protocol_version
              FROM devices WHERE id = ?1",
             [id],
             device_from_row,
@@ -473,12 +500,17 @@ pub enum CreateJobError {
 }
 
 /// Creates a job and one queued target per device, atomically.
+///
+/// With `done_if_on_version` (a `client.update` job), the target of a device
+/// that already reports that client version is created as succeeded instead,
+/// so it is never sent.
 pub fn create_job(
     conn: &mut Connection,
     kind: &str,
     payload: &serde_json::Value,
     created_by: Option<&str>,
     targets: &Targets,
+    done_if_on_version: Option<&Version>,
 ) -> rusqlite::Result<Result<Job, CreateJobError>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let device_ids: Vec<String> = match targets {
@@ -531,10 +563,28 @@ pub fn create_job(
         params![job_id, kind, payload.to_string(), created_by, now],
     )?;
     for device_id in &device_ids {
-        tx.execute(
-            "INSERT INTO job_targets (id, job_id, device_id, state, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![uuid::Uuid::new_v4().to_string(), job_id, device_id, target_state::QUEUED, now],
-        )?;
+        let target_id = uuid::Uuid::new_v4().to_string();
+        let already_on = match done_if_on_version {
+            Some(version) => {
+                let reported: String =
+                    tx.query_row("SELECT client_version FROM devices WHERE id = ?1", [device_id], |row| row.get(0))?;
+                reported.parse::<Version>().is_ok_and(|reported| reported == *version)
+            }
+            None => false,
+        };
+        if already_on {
+            let version = done_if_on_version.expect("checked above");
+            tx.execute(
+                "INSERT INTO job_targets (id, job_id, device_id, state, message, created, finished)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![target_id, job_id, device_id, target_state::SUCCEEDED, format!("already on version {version}"), now],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO job_targets (id, job_id, device_id, state, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![target_id, job_id, device_id, target_state::QUEUED, now],
+            )?;
+        }
     }
     let job = get_job(&tx, &job_id, false)?.expect("job was just inserted");
     tx.commit()?;
@@ -676,11 +726,13 @@ pub struct Dispatch {
 /// queued ones as sent (those are also returned as changes). With
 /// `include_unresolved`, targets already sent or running are returned too
 /// (for re-delivery after a reconnect; the client ignores the ones it
-/// already has).
+/// already has). With `only_kind`, targets of other kinds are left alone
+/// (a restricted connection only takes `client.update`).
 pub fn take_dispatchable(
     conn: &mut Connection,
     device_id: &str,
     include_unresolved: bool,
+    only_kind: Option<&str>,
 ) -> rusqlite::Result<(Vec<Dispatch>, Vec<TargetChange>)> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let states = if include_unresolved { "('queued', 'sent', 'running')" } else { "('queued')" };
@@ -688,10 +740,10 @@ pub fn take_dispatchable(
         .prepare(&format!(
             "SELECT t.id, j.id, j.kind, j.payload, t.state = 'queued'
              FROM job_targets t JOIN jobs j ON j.id = t.job_id
-             WHERE t.device_id = ?1 AND t.state IN {states}
+             WHERE t.device_id = ?1 AND t.state IN {states} AND (?2 IS NULL OR j.kind = ?2)
              ORDER BY t.created, t.rowid"
         ))?
-        .query_map([device_id], |row| {
+        .query_map(params![device_id, only_kind], |row| {
             let payload: String = row.get(3)?;
             Ok((
                 Dispatch {
@@ -704,13 +756,13 @@ pub fn take_dispatchable(
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    tx.execute(
-        "UPDATE job_targets SET state = 'sent' WHERE device_id = ?1 AND state = 'queued'",
-        [device_id],
-    )?;
     let mut changes = Vec::new();
     for (dispatch, was_queued) in &rows {
         if *was_queued {
+            tx.execute(
+                "UPDATE job_targets SET state = 'sent' WHERE id = ?1 AND state = 'queued'",
+                [&dispatch.job_target_id],
+            )?;
             changes.extend(get_target_change(&tx, &dispatch.job_target_id)?);
         }
     }
@@ -886,6 +938,20 @@ pub fn cancel_job(
     Ok(Some(Cancelled { job, changes }))
 }
 
+/// A device's targets that were cancelled since `since`, oldest first. A
+/// target cancelled while its device was offline may still be running there,
+/// so the device is told again when it connects; it ignores ids it does not
+/// know.
+pub fn cancelled_targets_since(conn: &Connection, device_id: &str, since: i64) -> rusqlite::Result<Vec<String>> {
+    conn.prepare(
+        "SELECT id FROM job_targets
+         WHERE device_id = ?1 AND state = 'failed' AND reason = ?2 AND finished >= ?3
+         ORDER BY finished, rowid",
+    )?
+    .query_map(params![device_id, protocol::reason::CANCELLED, since], |row| row.get(0))?
+    .collect()
+}
+
 /// Expires targets that have been queued since before `cutoff`.
 pub fn expire_queued_targets(conn: &mut Connection, cutoff: i64) -> rusqlite::Result<Vec<TargetChange>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1016,6 +1082,71 @@ pub fn delete_device(conn: &mut Connection, device_id: &str) -> rusqlite::Result
     let deleted = tx.execute("DELETE FROM devices WHERE id = ?1", [device_id])?;
     tx.commit()?;
     Ok((deleted > 0).then_some(DeviceDeleted { was_in_group }))
+}
+
+// ---------------------------------------------------------------- client releases
+
+/// A verified client release in the update cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientRelease {
+    pub version: String,
+    pub target: String,
+    pub size: u64,
+    /// Lowercase hex.
+    pub sha256: String,
+    pub cached_at: i64,
+    pub notes: Option<String>,
+}
+
+fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientRelease> {
+    Ok(ClientRelease {
+        version: row.get(0)?,
+        target: row.get(1)?,
+        size: row.get(2)?,
+        sha256: row.get(3)?,
+        cached_at: row.get(4)?,
+        notes: row.get(5)?,
+    })
+}
+
+const RELEASE_COLUMNS: &str = "version, target, size, sha256, cached, notes";
+
+/// Cached releases, newest version first. Rows whose version does not parse
+/// (none are written that way) sort last.
+pub fn list_client_releases(conn: &Connection) -> rusqlite::Result<Vec<ClientRelease>> {
+    let mut releases: Vec<ClientRelease> = conn
+        .prepare(&format!("SELECT {RELEASE_COLUMNS} FROM client_releases"))?
+        .query_map([], release_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    releases.sort_by(|a, b| {
+        let version = |r: &ClientRelease| r.version.parse::<Version>().ok();
+        version(b).cmp(&version(a)).then_with(|| a.target.cmp(&b.target))
+    });
+    Ok(releases)
+}
+
+pub fn get_client_release(conn: &Connection, version: &str, target: &str) -> rusqlite::Result<Option<ClientRelease>> {
+    conn.query_row(
+        &format!("SELECT {RELEASE_COLUMNS} FROM client_releases WHERE version = ?1 AND target = ?2"),
+        params![version, target],
+        release_from_row,
+    )
+    .optional()
+}
+
+/// Records a release whose files are in place; replaces an earlier record.
+pub fn insert_client_release(conn: &Connection, release: &ClientRelease) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO client_releases (version, target, size, sha256, cached, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![release.version, release.target, release.size, release.sha256, release.cached_at, release.notes],
+    )?;
+    Ok(())
+}
+
+pub fn delete_client_release(conn: &Connection, version: &str, target: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM client_releases WHERE version = ?1 AND target = ?2", params![version, target])?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- groups

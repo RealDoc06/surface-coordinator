@@ -49,7 +49,8 @@ fn all_client_messages() -> Vec<ClientMessage> {
 fn all_server_messages() -> Vec<ServerMessage> {
     vec![
         ServerMessage::Challenge { nonce: "01".repeat(32), mac: "02".repeat(32) },
-        ServerMessage::Welcome { heartbeat_interval_ms: 30_000 },
+        ServerMessage::Welcome { heartbeat_interval_ms: 30_000, restricted: false },
+        ServerMessage::Welcome { heartbeat_interval_ms: 30_000, restricted: true },
         ServerMessage::Reject { reason: "bad_mac".into() },
         ServerMessage::HeartbeatAck,
         ServerMessage::Job {
@@ -113,7 +114,7 @@ fn type_tags_on_the_wire() {
     let server: Vec<String> = all_server_messages().iter().map(|m| tag(m.to_json())).collect();
     assert_eq!(
         server,
-        ["challenge", "welcome", "reject", "heartbeat_ack", "job", "job.result_ack", "job.cancel"]
+        ["challenge", "welcome", "welcome", "reject", "heartbeat_ack", "job", "job.result_ack", "job.cancel"]
     );
 }
 
@@ -147,6 +148,37 @@ fn job_output_and_result_wire_shape() {
 }
 
 #[test]
+fn welcome_mentions_the_restricted_state_only_when_it_applies() {
+    // An unrestricted welcome looks exactly like it did before the field
+    // existed, so older clients see no difference.
+    let value: Value =
+        serde_json::from_str(&ServerMessage::Welcome { heartbeat_interval_ms: 30_000, restricted: false }.to_json())
+            .unwrap();
+    assert_eq!(value, json!({"type": "welcome", "heartbeat_interval_ms": 30000}));
+    let value: Value =
+        serde_json::from_str(&ServerMessage::Welcome { heartbeat_interval_ms: 30_000, restricted: true }.to_json())
+            .unwrap();
+    assert_eq!(value, json!({"type": "welcome", "heartbeat_interval_ms": 30000, "restricted": true}));
+    // A welcome from a coordinator that predates the field is unrestricted.
+    assert_eq!(
+        ServerMessage::from_json(r#"{"type":"welcome","heartbeat_interval_ms":5}"#).unwrap(),
+        ServerMessage::Welcome { heartbeat_interval_ms: 5, restricted: false }
+    );
+}
+
+#[test]
+fn the_current_and_previous_protocol_versions_are_supported() {
+    assert!(protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
+    assert!(protocol::SUPPORTED_PROTOCOL_VERSIONS.len() <= 2);
+    if PROTOCOL_VERSION > 1 {
+        assert!(protocol::is_supported(PROTOCOL_VERSION - 1));
+    }
+    assert!(protocol::is_supported(PROTOCOL_VERSION));
+    assert!(!protocol::is_supported(PROTOCOL_VERSION + 1));
+    assert!(!protocol::is_supported(0));
+}
+
+#[test]
 fn unknown_message_types_decode_as_unknown() {
     let client = ClientMessage::from_json(r#"{"type":"telemetry.report","cpu":3}"#).unwrap();
     assert_eq!(client, ClientMessage::Unknown);
@@ -156,10 +188,10 @@ fn unknown_message_types_decode_as_unknown() {
 
 #[test]
 fn unknown_fields_are_ignored() {
-    let json = r#"{"type":"welcome","heartbeat_interval_ms":30000,"restricted":true,"extra":{"x":1}}"#;
+    let json = r#"{"type":"welcome","heartbeat_interval_ms":30000,"extra":{"x":1}}"#;
     assert_eq!(
         ServerMessage::from_json(json).unwrap(),
-        ServerMessage::Welcome { heartbeat_interval_ms: 30_000 }
+        ServerMessage::Welcome { heartbeat_interval_ms: 30_000, restricted: false }
     );
     let json = r#"{"type":"heartbeat","uptime_secs":12}"#;
     assert_eq!(ClientMessage::from_json(json).unwrap(), ClientMessage::Heartbeat);

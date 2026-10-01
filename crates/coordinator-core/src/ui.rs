@@ -55,7 +55,15 @@ async fn load(state: &AppState, path: &str) -> Option<Vec<u8>> {
 /// Fallback for everything that is not an API or client route.
 pub async fn serve(State(state): State<Arc<AppState>>, method: Method, uri: Uri) -> Response {
     let path = uri.path();
-    if path.starts_with("/api/") || path.starts_with("/client/") || path == "/api" {
+    // Not the application: a mistyped API route, client endpoint or update
+    // download must not come back as the UI's index page. (`/updates` itself
+    // is a page of the UI.)
+    if path.starts_with("/api/")
+        || path.starts_with("/client/")
+        || path.starts_with("/updates/client/")
+        || path == "/api"
+        || path == "/updates/client"
+    {
         return ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such route").into_response();
     }
     if method != Method::GET && method != Method::HEAD {

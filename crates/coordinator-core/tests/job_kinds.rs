@@ -55,6 +55,8 @@ async fn app_launch_payloads_are_validated() {
     let invalid = [
         json!({}),
         json!({"path": ""}),
+        json!({"path": "   "}),
+        json!({"path": "\t\n"}),
         json!({"path": "a".repeat(1025)}),
         json!({"path": 5}),
         json!({"path": "a\u{0}b"}),

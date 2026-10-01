@@ -1,8 +1,12 @@
-//! Embeds the built web UI (`ui/dist`) into the library.
+//! Embeds the built web UI (`ui/dist`) and the client update public key
+//! (`release-keys/client-update.pub`) into the library.
 //!
 //! Generates `$OUT_DIR/ui_assets.rs` with one `include_bytes!` per file. If
 //! the UI has not been built, a placeholder page is embedded instead so the
 //! Rust build never depends on Node.
+//!
+//! The key is exported as `SC_CLIENT_UPDATE_PUBKEY`, empty while the owner
+//! has not created the file; such a build disables client updates.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -31,8 +35,26 @@ fn collect(dir: &Path, root: &Path, files: &mut Vec<(String, PathBuf)>) {
     }
 }
 
+fn update_public_key(manifest_dir: &Path) -> String {
+    let keys = manifest_dir.join("..").join("..").join("release-keys");
+    // The directory rather than the file: a missing file would make cargo
+    // rerun this script, and rebuild the crate, on every build.
+    println!("cargo:rerun-if-changed={}", keys.display());
+    let Ok(text) = std::fs::read_to_string(keys.join("client-update.pub")) else {
+        return String::new();
+    };
+    // One base64 line; anything after it would break the variable.
+    let key = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_owned();
+    if key.is_empty() {
+        println!("cargo:warning=release-keys/client-update.pub is empty; client updates are disabled");
+    }
+    key
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let key = update_public_key(&manifest_dir);
+    println!("cargo:rustc-env=SC_CLIENT_UPDATE_PUBKEY={key}");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let dist = manifest_dir.join("..").join("..").join("ui").join("dist");
     println!("cargo:rerun-if-changed={}", dist.display());

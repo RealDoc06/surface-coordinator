@@ -1,4 +1,4 @@
-use protocol::{AppLaunchPayload, PowerAction, PowerPayload, SettingApplyPayload};
+use protocol::{AppLaunchPayload, ClientUpdatePayload, PowerAction, PowerPayload, SettingApplyPayload};
 use serde_json::json;
 
 #[test]
@@ -70,4 +70,41 @@ fn setting_apply_payload_keeps_the_json_value_as_is() {
 fn setting_apply_requires_setting_and_value() {
     assert!(serde_json::from_value::<SettingApplyPayload>(json!({"setting": "audio.mute"})).is_err());
     assert!(serde_json::from_value::<SettingApplyPayload>(json!({"value": true})).is_err());
+}
+
+#[test]
+fn client_update_payload_wire_shape() {
+    let payload = ClientUpdatePayload {
+        version: "1.2.3".into(),
+        target: "windows-x86_64".into(),
+        size: 1234,
+        sha256: "ab".repeat(32),
+        downgrade: false,
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        value,
+        json!({"version": "1.2.3", "target": "windows-x86_64", "size": 1234, "sha256": "ab".repeat(32), "downgrade": false})
+    );
+    assert_eq!(serde_json::from_value::<ClientUpdatePayload>(value).unwrap(), payload);
+}
+
+#[test]
+fn client_update_downgrade_defaults_to_false() {
+    let payload: ClientUpdatePayload = serde_json::from_value(
+        json!({"version": "1.2.3", "target": "windows-x86_64", "size": 1, "sha256": "00".repeat(32)}),
+    )
+    .unwrap();
+    assert!(!payload.downgrade);
+    assert!(serde_json::from_value::<ClientUpdatePayload>(json!({"version": "1.2.3"})).is_err());
+}
+
+#[test]
+fn client_update_kind_and_reasons() {
+    assert_eq!(protocol::job_kind::CLIENT_UPDATE, "client.update");
+    assert_eq!(protocol::reason::BAD_SIGNATURE, "bad_signature");
+    assert_eq!(protocol::reason::BAD_HASH, "bad_hash");
+    assert_eq!(protocol::reason::DOWNGRADE_REFUSED, "downgrade_refused");
+    assert_eq!(protocol::reason::DOWNLOAD_FAILED, "download_failed");
+    assert_eq!(protocol::reason::ROLLED_BACK, "rolled_back");
 }

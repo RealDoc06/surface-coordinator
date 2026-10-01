@@ -6,6 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::{wait_until, FakeClient, TestServer, API_TOKEN};
+use protocol::ServerMessage;
 use serde_json::{json, Value};
 
 fn one_device(id: &str) -> Value {
@@ -64,8 +65,12 @@ async fn a_cancelled_queued_target_is_not_delivered_when_the_device_returns() {
     let job_id = job["id"].as_str().unwrap();
     assert_eq!(server.cancel(job_id).await.0, 200);
 
+    // At most a `job.cancel` for it, which the device ignores because it
+    // never had the target; never the job itself.
     let mut client = FakeClient::connect(&server, &key, "device-a").await;
-    assert!(client.try_recv(Duration::from_millis(200)).await.is_none());
+    while let Some(message) = client.try_recv(Duration::from_millis(200)).await {
+        assert!(matches!(message, ServerMessage::JobCancel { .. }), "unexpected {message:?}");
+    }
     assert_eq!(server.single_target(job_id).await["reason"], "cancelled");
 }
 
@@ -164,7 +169,69 @@ async fn a_running_target_whose_device_is_offline_is_cancelled_at_once() {
     assert_eq!(body["job"]["targets"][0]["reason"], "cancelled");
     assert!(body["job"]["targets"][0]["finished_at"].as_i64().is_some());
 
-    // The target is finished, so the device is not given it again.
+    // The target is finished, so the device is not given it again; it is
+    // told to stop it instead, since it may still be running there.
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, target_id);
+    assert!(client.try_recv(Duration::from_millis(200)).await.is_none());
+}
+
+#[tokio::test]
+async fn a_target_cancelled_while_its_device_was_offline_is_stopped_on_the_device_when_it_returns() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let cancelled = server.create_script_job(one_device("device-a")).await;
+    let finished = server.create_script_job(one_device("device-a")).await;
+    let (cancelled_target, ..) = client.expect_job().await;
+    let (finished_target, ..) = client.expect_job().await;
+    client.started(&cancelled_target).await;
+    client.result(&finished_target, 0).await;
+    client.expect_result_ack(&finished_target).await;
+    server.wait_for_target_state(cancelled["id"].as_str().unwrap(), "running").await;
+    client.disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    assert_eq!(server.cancel(cancelled["id"].as_str().unwrap()).await.0, 200);
+    // Cancelling a job that already finished asks nothing of the device.
+    assert_eq!(server.cancel(finished["id"].as_str().unwrap()).await.0, 200);
+
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, cancelled_target);
+    assert!(client.try_recv(Duration::from_millis(200)).await.is_none());
+
+    // The device stops it and reports; the target stays as it was.
+    client.result_cancelled(&cancelled_target).await;
+    client.expect_result_ack(&cancelled_target).await;
+    let target = server.single_target(cancelled["id"].as_str().unwrap()).await;
+    assert_eq!(target["state"], "failed");
+    assert_eq!(target["reason"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancellations_older_than_a_day_are_not_repeated() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let job = server.create_script_job(one_device("device-a")).await;
+    let job_id = job["id"].as_str().unwrap();
+    let (target_id, ..) = client.expect_job().await;
+    client.started(&target_id).await;
+    server.wait_for_target_state(job_id, "running").await;
+    client.disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    assert_eq!(server.cancel(job_id).await.0, 200);
+
+    // Pretend the cancel happened just over a day ago.
+    let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let a_day_and_a_minute: i64 = (24 * 60 + 1) * 60 * 1000;
+    db.execute(
+        "UPDATE job_targets SET finished = finished - ?2 WHERE id = ?1",
+        rusqlite::params![target_id, a_day_and_a_minute],
+    )
+    .unwrap();
+    drop(db);
+
     let mut client = FakeClient::connect(&server, &key, "device-a").await;
     assert!(client.try_recv(Duration::from_millis(200)).await.is_none());
 }
@@ -185,6 +252,7 @@ async fn a_late_result_does_not_overwrite_a_target_cancelled_while_its_device_wa
 
     // The script kept running on the device and finishes after it reconnects.
     let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, target_id);
     client.output(&target_id, 1, "too late\n").await;
     client.result(&target_id, 0).await;
     client.expect_result_ack(&target_id).await;

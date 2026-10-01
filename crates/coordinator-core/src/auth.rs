@@ -108,12 +108,26 @@ pub fn token_matches(expected: &str, presented: &str) -> bool {
     bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+/// Whether a session opened for `account` (`None`: opened with the token)
+/// counts under `mode`. The same data directory can be served in either
+/// mode, and a session must not outlive a switch: an account's cookie is
+/// meaningless where the token is the only credential, and a token session
+/// is not a login.
+pub fn session_fits_mode(mode: &AuthMode, account: &Option<Account>) -> bool {
+    match mode {
+        AuthMode::Accounts => account.is_some(),
+        AuthMode::Token(_) => account.is_none(),
+    }
+}
+
 /// Works out who sent these headers, if anyone we know.
 pub async fn identify(state: &AppState, headers: &HeaderMap) -> Result<Option<Identity>, crate::Error> {
     if let Some(token) = session_token_from(headers) {
         let hash = hash_token(token);
         if let Some(account) = state.store.call(move |conn| store::get_session(conn, &hash)).await? {
-            return Ok(Some(Identity { account }));
+            if session_fits_mode(&state.config.auth, &account) {
+                return Ok(Some(Identity { account }));
+            }
         }
     }
     if let AuthMode::Token(expected) = &state.config.auth {
@@ -276,6 +290,16 @@ mod tests {
         assert!(!is_same_origin(&headers(Some("https://evil.example"), "c.example")));
         assert!(!is_same_origin(&headers(Some("http://127.0.0.1:9999"), "127.0.0.1:8080")));
         assert!(!is_same_origin(&headers(Some("null"), "c.example")));
+    }
+
+    #[test]
+    fn a_session_only_counts_in_the_mode_it_was_opened_in() {
+        let account = Some(Account { id: "a".into(), username: "operator".into(), created_at: 0 });
+        let token = AuthMode::Token("fixture-token".into());
+        assert!(session_fits_mode(&AuthMode::Accounts, &account));
+        assert!(!session_fits_mode(&AuthMode::Accounts, &None));
+        assert!(session_fits_mode(&token, &None));
+        assert!(!session_fits_mode(&token, &account));
     }
 
     #[test]

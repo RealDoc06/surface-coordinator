@@ -13,6 +13,8 @@ axum.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 rand.workspace = true
+# Fetches client releases from GitHub; rustls so no system TLS library is needed.
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,11 +22,12 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true

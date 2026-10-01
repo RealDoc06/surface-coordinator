@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use protocol::ServerMessage;
+use protocol::{job_kind, ServerMessage};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -12,6 +12,7 @@ use tokio_util::task::TaskTracker;
 use crate::auth::{self, LoginThrottle};
 use crate::events::{Event, EVENT_BUFFER};
 use crate::store::{self, Store};
+use crate::updates::UpdateState;
 use crate::Config;
 
 pub struct AppState {
@@ -32,6 +33,8 @@ pub struct AppState {
     /// Serialises online/offline transitions so the database flag cannot
     /// end up contradicting the connection table.
     pub presence: tokio::sync::Mutex<()>,
+    /// The client release cache and its checks.
+    pub updates: UpdateState,
 }
 
 /// An authenticated client connection.
@@ -43,10 +46,13 @@ pub struct Connection {
     pub last_seen: Arc<AtomicI64>,
     /// Cancelled to make the connection task close the socket.
     pub close: CancellationToken,
+    /// The client spoke a protocol version this coordinator does not
+    /// support: it is only sent `client.update` jobs.
+    pub restricted: bool,
 }
 
 impl AppState {
-    pub fn new(config: Config, store: Store) -> AppState {
+    pub fn new(config: Config, store: Store, updates: UpdateState) -> AppState {
         AppState {
             config,
             store,
@@ -58,6 +64,7 @@ impl AppState {
             connections: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
             presence: tokio::sync::Mutex::new(()),
+            updates,
         }
     }
 
@@ -75,7 +82,7 @@ impl AppState {
         let id = device_id.to_owned();
         match self.store.call(move |conn| store::get_device(conn, &id)).await {
             Ok(Some(mut device)) => {
-                self.apply_presence(&mut device);
+                self.apply_live_state(&mut device);
                 self.publish(Event::DeviceUpdated { device });
             }
             Ok(None) => {}
@@ -88,12 +95,14 @@ impl AppState {
         &self,
         device_id: &str,
         outbound: mpsc::UnboundedSender<ServerMessage>,
+        restricted: bool,
     ) -> Connection {
         let connection = Connection {
             id: self.next_connection_id.fetch_add(1, Ordering::Relaxed),
             outbound,
             last_seen: Arc::new(AtomicI64::new(store::now_ms())),
             close: self.shutdown.child_token(),
+            restricted,
         };
         if let Some(previous) = self.connections().insert(device_id.to_owned(), connection.clone()) {
             previous.close.cancel();
@@ -138,15 +147,18 @@ impl AppState {
     }
 
     /// Sends pending job targets to a device if it is connected. With
-    /// `include_unresolved`, targets it may already have are sent again.
+    /// `include_unresolved`, targets it may already have are sent again. A
+    /// restricted connection is only sent `client.update`; everything else
+    /// stays queued until the device returns on a supported version.
     pub async fn dispatch(&self, device_id: &str, include_unresolved: bool) {
         let Some(connection) = self.connection(device_id) else {
             return;
         };
         let device = device_id.to_owned();
+        let only_kind = connection.restricted.then_some(job_kind::CLIENT_UPDATE);
         let taken = self
             .store
-            .call(move |conn| store::take_dispatchable(conn, &device, include_unresolved))
+            .call(move |conn| store::take_dispatchable(conn, &device, include_unresolved, only_kind))
             .await;
         match taken {
             Ok((dispatches, changes)) => {
@@ -167,5 +179,25 @@ impl AppState {
             }
             Err(error) => tracing::error!(device_id, %error, "failed to load jobs to dispatch"),
         }
+    }
+
+    /// Fills in a device's fields that are not stored: presence from the
+    /// live connection table, and whether an update is available from the
+    /// release cache.
+    pub fn apply_live_state(&self, device: &mut store::Device) {
+        // The connection table is the authority on who is online; heartbeats
+        // refresh last-seen in memory only.
+        match self.connection(&device.id) {
+            Some(connection) => {
+                device.online = true;
+                device.restricted = connection.restricted;
+                device.last_seen_at = connection.last_seen.load(Ordering::Relaxed);
+            }
+            None => {
+                device.online = false;
+                device.restricted = false;
+            }
+        }
+        device.update_available = self.updates.is_newer_than(&device.client_version);
     }
 }

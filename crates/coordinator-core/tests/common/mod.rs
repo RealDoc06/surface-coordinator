@@ -36,6 +36,10 @@ pub fn test_config(data_dir: &std::path::Path) -> Config {
         AuthMode::Token(API_TOKEN.into()),
     );
     config.expiry_sweep_interval = Duration::from_millis(50);
+    // Tests never contact a real release source; the update tests turn
+    // checking on against a local fake server with a throwaway key.
+    config.updates.enabled = false;
+    config.update_public_key = None;
     config
 }
 
@@ -69,6 +73,12 @@ impl TestServer {
     /// Stops the server (if it is running) and starts a new one on the same
     /// data directory.
     pub async fn restart(&mut self) {
+        self.restart_with(|_| {}).await;
+    }
+
+    /// Like [`restart`](Self::restart), with the configuration adjusted
+    /// after the defaults (and the auth mode the server started with).
+    pub async fn restart_with(&mut self, adjust: impl FnOnce(&mut Config)) {
         if let Some(coordinator) = self.coordinator.take() {
             coordinator.stop().await;
         }
@@ -76,6 +86,7 @@ impl TestServer {
         if self.accounts {
             config.auth = AuthMode::Accounts;
         }
+        adjust(&mut config);
         let coordinator = coordinator_core::start(config).await.unwrap();
         self.addr = coordinator.local_addr();
         self.coordinator = Some(coordinator);
@@ -281,6 +292,8 @@ pub struct FakeClient {
     pub socket: Socket,
     pub device_id: String,
     pub heartbeat_interval_ms: u64,
+    /// What the welcome said: only `client.update` jobs will come.
+    pub restricted: bool,
 }
 
 pub struct HandshakeOptions<'a> {
@@ -289,6 +302,8 @@ pub struct HandshakeOptions<'a> {
     pub secret: &'a str,
     pub device_id: &'a str,
     pub protocol_version: u32,
+    /// Reported in hello.
+    pub client_version: &'a str,
     /// Skip verifying the coordinator, as a hostile client would.
     pub skip_verify: bool,
     /// Network reported in hello.
@@ -302,6 +317,7 @@ impl<'a> HandshakeOptions<'a> {
             secret: &key.secret,
             device_id,
             protocol_version: protocol::PROTOCOL_VERSION,
+            client_version: "0.0.0-test",
             skip_verify: false,
             network: None,
         }
@@ -332,7 +348,7 @@ impl FakeClient {
             device_id: options.device_id.to_owned(),
             hostname: format!("host-{}", options.device_id),
             os: "windows".into(),
-            client_version: "0.0.0-test".into(),
+            client_version: options.client_version.to_owned(),
             key_id: options.key_id.to_owned(),
             nonce: client_nonce.clone(),
             network: options.network.clone(),
@@ -355,10 +371,11 @@ impl FakeClient {
         let mac = compute_mac(options.secret, Role::Client, &client_nonce, &server_nonce);
         send_raw(&mut socket, &ClientMessage::Auth { mac }).await;
         match recv_raw(&mut socket).await {
-            Some(ServerMessage::Welcome { heartbeat_interval_ms }) => Ok(FakeClient {
+            Some(ServerMessage::Welcome { heartbeat_interval_ms, restricted }) => Ok(FakeClient {
                 socket,
                 device_id: options.device_id.to_owned(),
                 heartbeat_interval_ms,
+                restricted,
             }),
             Some(ServerMessage::Reject { reason }) => Err(HandshakeError::Rejected(reason)),
             None => Err(HandshakeError::Closed),

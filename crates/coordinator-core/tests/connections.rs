@@ -24,6 +24,9 @@ async fn handshake_brings_device_online_and_disconnect_takes_it_offline() {
     assert_eq!(device["client_version"], "0.0.0-test");
     assert_eq!(device["enrollment_key_id"], key.id.as_str());
     assert!(device["last_seen_at"].as_i64().unwrap() > 0);
+    assert_eq!(device["protocol_version"], protocol::PROTOCOL_VERSION);
+    assert_eq!(device["restricted"], false);
+    assert_eq!(device["update_available"], false, "nothing is cached");
 
     client.disconnect().await;
     assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
@@ -117,17 +120,40 @@ async fn revoked_key_is_rejected() {
 }
 
 #[tokio::test]
-async fn unsupported_protocol_version_is_rejected() {
+async fn an_unsupported_protocol_version_is_accepted_in_a_restricted_state() {
     let server = TestServer::start().await;
     let key = server.new_key();
+    let unsupported = protocol::PROTOCOL_VERSION + 1;
+    assert!(!protocol::is_supported(unsupported));
     let mut options = HandshakeOptions::new(&key, "device-a");
-    options.protocol_version = protocol::PROTOCOL_VERSION + 1;
-    match FakeClient::handshake(server.addr, options).await {
-        Err(HandshakeError::Rejected(reason)) => {
-            assert_eq!(reason, reject_reason::UNSUPPORTED_PROTOCOL)
-        }
-        other => panic!("expected rejection, got {:?}", other.map(|_| "welcome")),
-    }
+    options.protocol_version = unsupported;
+    let mut client = FakeClient::handshake(server.addr, options).await.expect("welcomed");
+    assert!(client.restricted);
+
+    let device = server.device("device-a").await.expect("device listed");
+    assert_eq!(device["online"], true);
+    assert_eq!(device["restricted"], true);
+    assert_eq!(device["protocol_version"], unsupported);
+    let (status, body) = server.get("/api/v1/devices/device-a").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["device"]["restricted"], true);
+    assert_eq!(body["device"]["protocol_version"], unsupported);
+    // Heartbeats work as usual.
+    client.send(ClientMessage::Heartbeat).await;
+    assert_eq!(client.recv().await, Some(ServerMessage::HeartbeatAck));
+
+    // Restricted only while connected that way.
+    client.disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    let device = server.device("device-a").await.unwrap();
+    assert_eq!(device["restricted"], false);
+    assert_eq!(device["protocol_version"], unsupported, "the last version it spoke is kept");
+
+    let client = FakeClient::connect(&server, &key, "device-a").await;
+    assert!(!client.restricted);
+    let device = server.device("device-a").await.unwrap();
+    assert_eq!(device["restricted"], false);
+    assert_eq!(device["protocol_version"], protocol::PROTOCOL_VERSION);
 }
 
 #[tokio::test]

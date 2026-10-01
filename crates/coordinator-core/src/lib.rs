@@ -14,6 +14,7 @@ mod scripts;
 mod state;
 mod store;
 mod ui;
+mod updates;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ use events::Event;
 use state::AppState;
 pub use store::{Account, EnrollmentKey};
 use store::Store;
+pub use updates::{built_in_public_key, UpdateConfig, DEFAULT_SOURCE as DEFAULT_UPDATE_SOURCE};
 
 /// How the HTTP API authenticates callers.
 #[derive(Debug, Clone)]
@@ -82,6 +84,27 @@ pub struct Config {
     /// Routes of the embedding application, served under `/api/v1/manager`
     /// behind the coordinator's authentication.
     pub extra_api_routes: Option<axum::Router>,
+    /// Ed25519 public key (base64) client releases must be signed with
+    /// before they are cached. Defaults to the key built in from
+    /// `release-keys/client-update.pub`; without one, client updates are
+    /// disabled.
+    pub update_public_key: Option<String>,
+    /// Where and how often to look for client releases.
+    pub updates: UpdateConfig,
+}
+
+impl Config {
+    /// Whether this configuration checks for client releases, and if not,
+    /// why: for the operator at start-up.
+    pub fn client_updates(&self) -> Result<(), &'static str> {
+        if self.update_public_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
+            Err("no update key is built into this coordinator")
+        } else if !self.updates.enabled {
+            Err("update checks are turned off")
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Config {
@@ -99,6 +122,8 @@ impl Config {
             secure_cookies: false,
             capabilities: Capabilities::default(),
             extra_api_routes: None,
+            update_public_key: built_in_public_key(),
+            updates: UpdateConfig::default(),
         }
     }
 }
@@ -146,6 +171,7 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
     if config.heartbeat_interval.is_zero() {
         return Err(Error::InvalidConfig("the heartbeat interval must not be zero".into()));
     }
+    updates::validate_config(&config)?;
 
     let data_dir = config.data_dir.clone();
     let store = tokio::task::spawn_blocking(move || Store::open(&data_dir))
@@ -171,11 +197,20 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
         Some(address) => Some(TcpListener::bind(address).await?),
         None => None,
     };
-    let state = Arc::new(tokio::task::spawn_blocking(move || AppState::new(config, store))
+    let state = Arc::new(
+        tokio::task::spawn_blocking(move || -> Result<AppState, Error> {
+            let newest = updates::load_cache(&store, &config.data_dir)?;
+            let update_state = updates::UpdateState::new(&config, newest)?;
+            Ok(AppState::new(config, store, update_state))
+        })
         .await
-        .map_err(|e| Error::Internal(e.to_string()))?);
+        .map_err(|e| Error::Internal(e.to_string()))??,
+    );
 
     state.tasks.spawn(sweep(state.clone()));
+    if updates::enabled(&state.config) {
+        state.tasks.spawn(updates::check_periodically(state.clone()));
+    }
 
     let clients = client_ws::router();
     let app = api::router(state.clone()).fallback(ui::serve);

@@ -58,6 +58,14 @@ enum Command {
         /// Hours a job stays queued for an offline device before it expires.
         #[arg(long, default_value_t = 24)]
         queued_expiry_hours: u64,
+        /// Do not look for new client releases (neither periodically nor
+        /// when asked from the UI). Releases already cached can still be
+        /// pushed to clients.
+        #[arg(long, env = "SC_NO_UPDATE_CHECK")]
+        no_update_check: bool,
+        /// GitHub repository (owner/repo) whose releases provide client updates.
+        #[arg(long, env = "SC_UPDATE_SOURCE", default_value = coordinator_core::DEFAULT_UPDATE_SOURCE)]
+        update_source: String,
         /// Log debug detail.
         #[arg(long)]
         verbose: bool,
@@ -136,6 +144,8 @@ fn main() -> anyhow::Result<()> {
             ui_dir,
             heartbeat_interval_secs,
             queued_expiry_hours,
+            no_update_check,
+            update_source,
             verbose,
         } => {
             let level = if verbose { tracing::Level::DEBUG } else { tracing::Level::INFO };
@@ -166,6 +176,8 @@ fn main() -> anyhow::Result<()> {
             config.secure_cookies = secure_cookies;
             config.heartbeat_interval = Duration::from_secs(heartbeat_interval_secs);
             config.queued_expiry = Duration::from_secs(queued_expiry_hours * 60 * 60);
+            config.updates.enabled = !no_update_check;
+            config.updates.source = update_source;
             serve(config)
         }
         Command::Key { command } => key(command),
@@ -175,9 +187,14 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn serve(config: Config) -> anyhow::Result<()> {
+    let updates = match config.client_updates() {
+        Ok(()) => format!("enabled, checking the releases of {}", config.updates.source),
+        Err(why) => format!("disabled ({why})"),
+    };
     let coordinator = coordinator_core::start(config).await.context("failed to start")?;
     println!("Clients connect to {}", coordinator.local_addr());
     println!("Web UI and API on http://{}", coordinator.ui_addr());
+    println!("Client updates: {updates}");
     shutdown_signal().await;
     coordinator.stop().await;
     Ok(())

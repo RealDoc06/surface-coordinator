@@ -3,7 +3,7 @@
 mod common;
 
 use common::{FakeClient, TestServer, API_TOKEN};
-use coordinator_core::admin;
+use coordinator_core::{admin, AuthMode};
 use serde_json::{json, Value};
 
 const USER: &str = "operator";
@@ -155,6 +155,44 @@ async fn account_sessions_survive_a_restart() {
     assert_eq!(login(&server, USER, PASSWORD).await.status(), 200);
     server.restart().await;
     assert_eq!(session(&server).await["authenticated"], true);
+}
+
+#[tokio::test]
+async fn an_account_session_does_not_authenticate_after_a_restart_in_token_mode() {
+    let mut server = TestServer::start_accounts(USER, PASSWORD).await;
+    assert_eq!(login(&server, USER, PASSWORD).await.status(), 200);
+    assert_eq!(session(&server).await["authenticated"], true);
+
+    server.restart_with(|c| c.auth = AuthMode::Token(API_TOKEN.into())).await;
+    // The browser still sends the cookie; it belongs to the other mode.
+    let info = session(&server).await;
+    assert_eq!(info["auth_mode"], "token");
+    assert_eq!(info["authenticated"], false);
+    assert!(info["account"].is_null());
+    assert_eq!(server.http.get(server.url("/api/v1/devices")).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn a_token_session_does_not_authenticate_after_a_restart_in_accounts_mode() {
+    // Token sessions are only cleared when a token-mode server starts, so
+    // one is still stored when the data directory is next served with
+    // accounts.
+    let mut server = TestServer::start().await;
+    let response = server
+        .http
+        .post(server.url("/api/v1/auth/token"))
+        .json(&json!({"token": API_TOKEN}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(session(&server).await["authenticated"], true);
+
+    server.restart_with(|c| c.auth = AuthMode::Accounts).await;
+    let info = session(&server).await;
+    assert_eq!(info["auth_mode"], "accounts");
+    assert_eq!(info["authenticated"], false);
+    assert_eq!(server.http.get(server.url("/api/v1/devices")).send().await.unwrap().status(), 401);
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
-//! The client WebSocket endpoint: handshake, heartbeats and job messages.
+//! The client listener: the WebSocket endpoint (handshake, heartbeats and
+//! job messages) and the update downloads.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -21,6 +22,7 @@ use tokio::time::Instant;
 use crate::events::Event;
 use crate::state::AppState;
 use crate::store::{self, DeviceInfo, TargetResult};
+use crate::updates;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest message accepted from a client. Output chunks are far smaller.
@@ -28,9 +30,15 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_ID_LEN: usize = 64;
 const MAX_FIELD_LEN: usize = 255;
 const MAX_RESULT_TEXT_LEN: usize = 4096;
+/// How long a cancellation is repeated to a device that reconnects.
+const REPEAT_CANCELS_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route(protocol::CLIENT_WS_PATH, get(upgrade))
+    Router::new()
+        .route(protocol::CLIENT_WS_PATH, get(upgrade))
+        // Clients download updates from where they connect, without the
+        // UI's authentication: the artifact is signed and public anyway.
+        .route("/updates/client/{version}/{file}", get(updates::download))
 }
 
 async fn upgrade(
@@ -65,6 +73,8 @@ async fn next_text(stream: &mut Stream) -> Option<String> {
 
 struct Authenticated {
     hello: Hello,
+    /// The hello's protocol version is not supported.
+    restricted: bool,
 }
 
 async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
@@ -80,8 +90,8 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
             handshake(&state, &mut sink, &mut stream, &mut claimed),
         ) => outcome,
     };
-    let hello = match outcome {
-        Ok(Ok(Authenticated { hello })) => hello,
+    let (hello, restricted) = match outcome {
+        Ok(Ok(Authenticated { hello, restricted })) => (hello, restricted),
         Ok(Err(failure)) => {
             tracing::warn!(%peer, device_id = failure.device_id.as_deref().unwrap_or("-"),
                 reason = %failure.reason, "client handshake failed");
@@ -123,6 +133,7 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
                             hostname: &hello.hostname,
                             os: &hello.os,
                             client_version: &hello.client_version,
+                            protocol_version: hello.protocol_version,
                             network_ssid: ssid.as_deref(),
                             network_ip: ip.as_deref(),
                         },
@@ -135,16 +146,23 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
             let _ = sink.close().await;
             return;
         }
-        state.register(&device_id, outbound)
+        state.register(&device_id, outbound, restricted)
     };
-    tracing::info!(%peer, %device_id, hostname = %hello.hostname, "device online");
+    if restricted {
+        tracing::warn!(%peer, %device_id, hostname = %hello.hostname, protocol_version = hello.protocol_version,
+            "device online with an unsupported protocol version; only client updates will be sent to it");
+    } else {
+        tracing::info!(%peer, %device_id, hostname = %hello.hostname, "device online");
+    }
     state.publish_device(&device_id).await;
 
     let interval = state.config.heartbeat_interval;
     let welcome = ServerMessage::Welcome {
         heartbeat_interval_ms: u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+        restricted,
     };
     if send(&mut sink, &welcome).await.is_ok() {
+        repeat_cancels(&state, &device_id, &connection).await;
         // Registered before this query, so a job created from now on is
         // either picked up here or dispatched to this connection directly.
         state.dispatch(&device_id, true).await;
@@ -163,6 +181,22 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
         }
         tracing::info!(%device_id, "device offline");
         state.publish_device(&device_id).await;
+    }
+}
+
+/// Tells a device that just connected to stop targets cancelled recently.
+/// One cancelled while the device was offline may still be running there;
+/// the device ignores ids it does not know or has already finished.
+async fn repeat_cancels(state: &AppState, device_id: &str, connection: &crate::state::Connection) {
+    let device = device_id.to_owned();
+    let since = store::now_ms() - REPEAT_CANCELS_FOR.as_millis() as i64;
+    match state.store.call(move |conn| store::cancelled_targets_since(conn, &device, since)).await {
+        Ok(targets) => {
+            for job_target_id in targets {
+                let _ = connection.outbound.send(ServerMessage::JobCancel { job_target_id });
+            }
+        }
+        Err(error) => tracing::error!(device_id, %error, "failed to load cancelled targets"),
     }
 }
 
@@ -246,15 +280,10 @@ async fn handshake(
             Some(reject_reason::BAD_REQUEST),
         ));
     }
-    // Only the current version exists so far. The restricted state for
-    // other versions arrives together with `client.update`.
-    if hello.protocol_version != protocol::PROTOCOL_VERSION {
-        return Err(HandshakeFailure::new(
-            device,
-            format!("unsupported protocol version {}", hello.protocol_version),
-            Some(reject_reason::UNSUPPORTED_PROTOCOL),
-        ));
-    }
+    // A version this coordinator does not support is still let in, so the
+    // device can be updated: it is restricted to `client.update` jobs. The
+    // handshake itself is the same in every version.
+    let restricted = !protocol::is_supported(hello.protocol_version);
 
     let key_id = hello.key_id.clone();
     let key = state
@@ -308,7 +337,7 @@ async fn handshake(
             Some(reject_reason::BAD_MAC),
         ));
     }
-    Ok(Authenticated { hello })
+    Ok(Authenticated { hello, restricted })
 }
 
 /// Runs an authenticated connection until it ends; returns why.

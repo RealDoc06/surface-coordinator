@@ -14,6 +14,17 @@ use serde::{Deserialize, Serialize};
 /// Protocol version carried in `hello`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Versions a coordinator serves fully: the current and the previous one, so
+/// a fleet can be updated after its coordinator rather than at the same
+/// moment. A client on any other version is accepted in a restricted state in
+/// which it is only sent `client.update`.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
+
+/// Whether a coordinator serves clients on `version` fully.
+pub fn is_supported(version: u32) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
+
 /// Path of the client WebSocket endpoint on the coordinator.
 pub const CLIENT_WS_PATH: &str = "/client/ws";
 
@@ -38,6 +49,7 @@ pub mod job_kind {
     pub const APP_LAUNCH: &str = "app.launch";
     pub const SETTING_APPLY: &str = "setting.apply";
     pub const POWER: &str = "power";
+    pub const CLIENT_UPDATE: &str = "client.update";
 }
 
 /// Machine-readable reasons carried by a failed `job.result`.
@@ -50,6 +62,18 @@ pub mod reason {
     pub const ERROR: &str = "error";
     pub const CANCELLED: &str = "cancelled";
     pub const NO_USER_SESSION: &str = "no_user_session";
+    /// `client.update`: the artifact's signature does not verify.
+    pub const BAD_SIGNATURE: &str = "bad_signature";
+    /// `client.update`: the download's size or SHA-256 is not the announced one.
+    pub const BAD_HASH: &str = "bad_hash";
+    /// `client.update`: the version is older than the running one and the job
+    /// does not allow a downgrade.
+    pub const DOWNGRADE_REFUSED: &str = "downgrade_refused";
+    /// `client.update`: the artifact could not be fetched from the coordinator.
+    pub const DOWNLOAD_FAILED: &str = "download_failed";
+    /// `client.update`: the new version never completed a handshake and the
+    /// previous one was restored.
+    pub const ROLLED_BACK: &str = "rolled_back";
 }
 
 /// Reasons carried by `reject`.
@@ -93,7 +117,14 @@ pub enum ServerMessage {
     #[serde(rename = "challenge")]
     Challenge { nonce: String, mac: String },
     #[serde(rename = "welcome")]
-    Welcome { heartbeat_interval_ms: u64 },
+    Welcome {
+        heartbeat_interval_ms: u64,
+        /// The client's protocol version is not supported: until it updates it
+        /// is only sent `client.update` jobs. Omitted when false, so older
+        /// clients see the welcome they know.
+        #[serde(default, skip_serializing_if = "is_false")]
+        restricted: bool,
+    },
     #[serde(rename = "reject")]
     Reject { reason: String },
     #[serde(rename = "heartbeat_ack")]
@@ -241,6 +272,28 @@ pub enum PowerAction {
 pub struct SettingApplyPayload {
     pub setting: String,
     pub value: serde_json::Value,
+}
+
+/// Payload of a `client.update` job. The coordinator fills in `target`,
+/// `size` and `sha256` from the release it has cached; the client downloads
+/// `/updates/client/<version>/<target>` (and `.sig`, the base64 signature)
+/// from its coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientUpdatePayload {
+    pub version: String,
+    /// An [`update`] target such as [`update::TARGET_WINDOWS_X86_64`].
+    pub target: String,
+    /// Size of the artifact in bytes.
+    pub size: u64,
+    /// SHA-256 of the artifact, lowercase hex.
+    pub sha256: String,
+    /// Install even if `version` is older than the running one.
+    #[serde(default)]
+    pub downgrade: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_timeout_secs() -> u64 {

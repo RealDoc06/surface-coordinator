@@ -1,6 +1,5 @@
 //! The HTTP API used by the UI. The contract is `docs/api.md`.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -18,7 +17,7 @@ use serde_json::{json, Value};
 use crate::auth::{self, Identity};
 use crate::events::{self, Event};
 use crate::state::AppState;
-use crate::{groups, scripts};
+use crate::{groups, scripts, updates};
 use crate::store::{self, CreateJobError, Targets};
 use crate::AuthMode;
 
@@ -62,6 +61,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/accounts", get(list_accounts).post(create_account))
         .route("/accounts/{id}", axum::routing::delete(delete_account))
         .route("/accounts/{id}/password", post(set_password))
+        .route("/updates", get(updates::get_updates))
+        .route("/updates/check", post(updates::check_now))
         .route("/events", get(events::upgrade));
     if let Some(extra) = state.config.extra_api_routes.clone() {
         // Routes supplied by the embedder (the manager), behind the same
@@ -339,7 +340,7 @@ async fn delete_account(
 async fn list_devices(State(state): State<Arc<AppState>>) -> ApiResult {
     let mut devices = state.store.call(|conn| store::list_devices(conn)).await?;
     for device in &mut devices {
-        state.apply_presence(device);
+        state.apply_live_state(device);
     }
     Ok(Json(json!({ "devices": devices })))
 }
@@ -356,7 +357,7 @@ async fn get_device(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     let Some((mut device, targets)) = found else {
         return Err(ApiError::not_found("device"));
     };
-    state.apply_presence(&mut device);
+    state.apply_live_state(&mut device);
     Ok(Json(json!({ "device": device, "targets": targets })))
 }
 
@@ -453,7 +454,8 @@ fn validate_payload(kind: &str, payload: Value) -> Result<Value, ApiError> {
             let launch: AppLaunchPayload = serde_json::from_value(payload)
                 .map_err(|e| ApiError::bad_request("invalid_payload", e.to_string()))?;
             let invalid = |message: String| Err(ApiError::bad_request("invalid_payload", message));
-            if launch.path.is_empty() || launch.path.chars().count() > MAX_APP_PATH_CHARS {
+            // A path of only spaces names nothing the device could start.
+            if launch.path.trim().is_empty() || launch.path.chars().count() > MAX_APP_PATH_CHARS {
                 return invalid(format!("path must be 1 to {MAX_APP_PATH_CHARS} characters"));
             }
             if launch.arguments.len() > MAX_APP_ARGUMENTS {
@@ -493,7 +495,16 @@ async fn create_job(
     Extension(identity): Extension<Identity>,
     Json(request): Json<CreateJob>,
 ) -> ApiResult<Response> {
-    let payload = validate_payload(&request.kind, request.payload)?;
+    // A `client.update` is checked against the release cache; a device
+    // already on its version needs nothing sent.
+    let (payload, done_if_on_version) = match request.kind.as_str() {
+        job_kind::CLIENT_UPDATE => {
+            let update = updates::client_update_payload(&state, request.payload).await?;
+            let version = update.version.parse().ok();
+            (serde_json::to_value(update).expect("payload serialises"), version)
+        }
+        kind => (validate_payload(kind, request.payload)?, None),
+    };
     let targets = match request.targets {
         TargetSelector::All => Targets::All,
         TargetSelector::Devices { device_ids } => Targets::Devices(device_ids),
@@ -503,7 +514,9 @@ async fn create_job(
     let created_by = identity.username().map(str::to_owned);
     let created = state
         .store
-        .call(move |conn| store::create_job(conn, &kind, &payload, created_by.as_deref(), &targets))
+        .call(move |conn| {
+            store::create_job(conn, &kind, &payload, created_by.as_deref(), &targets, done_if_on_version.as_ref())
+        })
         .await?;
     let job = match created {
         Ok(job) => job,
@@ -670,19 +683,4 @@ async fn revoke_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
 async fn list_rejected(State(state): State<Arc<AppState>>) -> ApiResult {
     let rejected = state.store.call(|conn| store::list_rejected(conn)).await?;
     Ok(Json(json!({ "rejected": rejected })))
-}
-
-/// Refreshes a device's presence fields from the live connection table.
-impl AppState {
-    pub fn apply_presence(&self, device: &mut store::Device) {
-        // The connection table is the authority on who is online; heartbeats
-        // refresh last-seen in memory only.
-        match self.connection(&device.id) {
-            Some(connection) => {
-                device.online = true;
-                device.last_seen_at = connection.last_seen.load(Ordering::Relaxed);
-            }
-            None => device.online = false,
-        }
-    }
 }
