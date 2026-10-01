@@ -24,7 +24,9 @@ pub struct TestServer {
     pub coordinator: Option<Coordinator>,
     pub data_dir: TempDir,
     pub addr: SocketAddr,
+    /// Keeps cookies, like a browser.
     pub http: reqwest::Client,
+    accounts: bool,
 }
 
 pub fn test_config(data_dir: &std::path::Path) -> Config {
@@ -46,15 +48,32 @@ impl TestServer {
         let data_dir = tempfile::tempdir().unwrap();
         let mut config = test_config(data_dir.path());
         adjust(&mut config);
+        let accounts = matches!(config.auth, AuthMode::Accounts);
         let coordinator = coordinator_core::start(config).await.unwrap();
         let addr = coordinator.local_addr();
-        TestServer { coordinator: Some(coordinator), data_dir, addr, http: reqwest::Client::new() }
+        TestServer { coordinator: Some(coordinator), data_dir, addr, http: Self::client(), accounts }
+    }
+
+    /// A server in accounts mode with one account. Nobody is logged in.
+    pub async fn start_accounts(username: &str, password: &str) -> Self {
+        let server = Self::start_with(|c| c.auth = AuthMode::Accounts).await;
+        admin::create_account(server.data_dir.path(), username, password).unwrap();
+        server
+    }
+
+    /// An HTTP client with its own cookie jar.
+    pub fn client() -> reqwest::Client {
+        reqwest::Client::builder().cookie_store(true).build().unwrap()
     }
 
     /// Stops the server and starts a new one on the same data directory.
     pub async fn restart(&mut self) {
         self.coordinator.take().unwrap().stop().await;
-        let coordinator = coordinator_core::start(test_config(self.data_dir.path())).await.unwrap();
+        let mut config = test_config(self.data_dir.path());
+        if self.accounts {
+            config.auth = AuthMode::Accounts;
+        }
+        let coordinator = coordinator_core::start(config).await.unwrap();
         self.addr = coordinator.local_addr();
         self.coordinator = Some(coordinator);
     }

@@ -18,6 +18,7 @@ use protocol::{reject_reason, ClientMessage, Hello, JobStatus, ServerMessage};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::events::Event;
 use crate::state::AppState;
 use crate::store::{self, DeviceInfo, TargetResult};
 
@@ -69,15 +70,24 @@ struct Authenticated {
 async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
     let (mut sink, mut stream) = socket.split();
 
+    // The hello as received, kept so a failed attempt can be shown to the
+    // operator with the device that made it.
+    let mut claimed: Option<Hello> = None;
     let outcome = tokio::select! {
         _ = state.shutdown.cancelled() => return,
-        outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&state, &mut sink, &mut stream)) => outcome,
+        outcome = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(&state, &mut sink, &mut stream, &mut claimed),
+        ) => outcome,
     };
     let hello = match outcome {
         Ok(Ok(Authenticated { hello })) => hello,
         Ok(Err(failure)) => {
             tracing::warn!(%peer, device_id = failure.device_id.as_deref().unwrap_or("-"),
                 reason = %failure.reason, "client handshake failed");
+            if let Some(claimed) = claimed {
+                record_rejected(&state, peer, claimed, failure.reason.clone()).await;
+            }
             if let Some(reject) = failure.reject {
                 let _ = send(&mut sink, &ServerMessage::Reject { reason: reject.to_owned() }).await;
             }
@@ -121,6 +131,7 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
         state.register(&device_id, outbound)
     };
     tracing::info!(%peer, %device_id, hostname = %hello.hostname, "device online");
+    state.publish_device(&device_id).await;
 
     let interval = state.config.heartbeat_interval;
     let welcome = ServerMessage::Welcome {
@@ -144,6 +155,32 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
             tracing::error!(%device_id, %error, "failed to mark device offline");
         }
         tracing::info!(%device_id, "device offline");
+        state.publish_device(&device_id).await;
+    }
+}
+
+/// Stores a refused connection attempt and tells the UI about it. Only
+/// attempts that got as far as a readable hello are recorded.
+async fn record_rejected(state: &AppState, peer: SocketAddr, claimed: Hello, reason: String) {
+    let clip = |text: &str| text.chars().take(MAX_FIELD_LEN).collect::<String>();
+    let (device_id, hostname, key_id) =
+        (clip(&claimed.device_id), clip(&claimed.hostname), clip(&claimed.key_id));
+    let recorded = state
+        .store
+        .call(move |conn| {
+            store::record_rejected(
+                conn,
+                &peer.to_string(),
+                Some(&device_id),
+                Some(&hostname),
+                Some(&key_id),
+                &reason,
+            )
+        })
+        .await;
+    match recorded {
+        Ok(rejected) => state.publish(Event::ConnectionRejected { rejected }),
+        Err(error) => tracing::error!(%error, "failed to record a rejected connection"),
     }
 }
 
@@ -171,6 +208,7 @@ async fn handshake(
     state: &AppState,
     sink: &mut Sink,
     stream: &mut Stream,
+    claimed: &mut Option<Hello>,
 ) -> Result<Authenticated, HandshakeFailure> {
     let closed = |device: Option<&str>| HandshakeFailure::new(device, "connection closed", None);
 
@@ -185,6 +223,7 @@ async fn handshake(
             ))
         }
     };
+    *claimed = Some(hello.clone());
     let device = Some(hello.device_id.as_str()).filter(|id| valid_id(id));
 
     if !valid_id(&hello.device_id)
@@ -335,21 +374,39 @@ async fn handle_message(
             .store
             .call(move |conn| store::mark_target_started(conn, &job_target_id, &device))
             .await
-            .map(|()| None),
-        ClientMessage::JobOutput { job_target_id, seq, data, stream: _ } => state
-            .store
-            .call(move |conn| {
-                store::append_target_output(
-                    conn,
-                    &job_target_id,
-                    &device,
-                    seq,
-                    &data,
-                    protocol::MAX_OUTPUT_BYTES,
-                )
-            })
-            .await
-            .map(|()| None),
+            .map(|change| {
+                if let Some(change) = change {
+                    state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+                }
+                None
+            }),
+        ClientMessage::JobOutput { job_target_id, seq, data, stream: _ } => {
+            let target_id = job_target_id.clone();
+            state
+                .store
+                .call(move |conn| {
+                    store::append_target_output(
+                        conn,
+                        &job_target_id,
+                        &device,
+                        seq,
+                        &data,
+                        protocol::MAX_OUTPUT_BYTES,
+                    )
+                })
+                .await
+                .map(|appended| {
+                    if let Some(appended) = appended {
+                        state.publish(Event::JobOutput {
+                            job_id: appended.job_id,
+                            job_target_id: target_id,
+                            data: appended.data,
+                            truncated: appended.truncated,
+                        });
+                    }
+                    None
+                })
+        }
         ClientMessage::JobResult(result) => {
             let target_id = result.job_target_id.clone();
             state
@@ -370,10 +427,15 @@ async fn handle_message(
                     )
                 })
                 .await
-                // Acknowledged even if nothing changed, including for targets
-                // this coordinator does not know: the acknowledgement only
-                // tells the client to stop re-sending the result.
-                .map(|()| Some(ServerMessage::JobResultAck { job_target_id: target_id }))
+                .map(|change| {
+                    if let Some(change) = change {
+                        state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+                    }
+                    // Acknowledged even if nothing changed, including for targets
+                    // this coordinator does not know: the acknowledgement only
+                    // tells the client to stop re-sending the result.
+                    Some(ServerMessage::JobResultAck { job_target_id: target_id })
+                })
         }
         // Handshake messages after the handshake, and types this version
         // does not know, are ignored.

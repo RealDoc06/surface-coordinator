@@ -5,10 +5,12 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use protocol::ServerMessage;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::auth::{self, LoginThrottle};
+use crate::events::{Event, EVENT_BUFFER};
 use crate::store::{self, Store};
 use crate::Config;
 
@@ -19,6 +21,12 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// Connection and background tasks, awaited on stop.
     pub tasks: TaskTracker,
+    /// Live events for the UI.
+    pub events: broadcast::Sender<Event>,
+    pub login_throttle: LoginThrottle,
+    /// Verified against when a login names an unknown account, so that
+    /// attempt takes as long as one for a real account.
+    pub dummy_password_hash: String,
     connections: Mutex<HashMap<String, Connection>>,
     next_connection_id: AtomicU64,
     /// Serialises online/offline transitions so the database flag cannot
@@ -44,6 +52,9 @@ impl AppState {
             store,
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            events: broadcast::channel(EVENT_BUFFER).0,
+            login_throttle: LoginThrottle::default(),
+            dummy_password_hash: auth::hash_password("no account has this password"),
             connections: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
             presence: tokio::sync::Mutex::new(()),
@@ -52,6 +63,24 @@ impl AppState {
 
     fn connections(&self) -> std::sync::MutexGuard<'_, HashMap<String, Connection>> {
         self.connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sends an event to every connected UI. Nobody listening is fine.
+    pub fn publish(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    /// Publishes the current state of a device.
+    pub async fn publish_device(&self, device_id: &str) {
+        let id = device_id.to_owned();
+        match self.store.call(move |conn| store::get_device(conn, &id)).await {
+            Ok(Some(mut device)) => {
+                self.apply_presence(&mut device);
+                self.publish(Event::DeviceUpdated { device });
+            }
+            Ok(None) => {}
+            Err(error) => tracing::error!(device_id, %error, "failed to load device for an event"),
+        }
     }
 
     /// Registers a connection for a device, closing any previous one.
@@ -85,6 +114,13 @@ impl AppState {
         }
     }
 
+    /// Closes and forgets a device's connection, if it has one.
+    pub fn drop_connection(&self, device_id: &str) {
+        if let Some(connection) = self.connections().remove(device_id) {
+            connection.close.cancel();
+        }
+    }
+
     pub fn connection(&self, device_id: &str) -> Option<Connection> {
         self.connections().get(device_id).cloned()
     }
@@ -96,12 +132,12 @@ impl AppState {
             return;
         };
         let device = device_id.to_owned();
-        let dispatches = self
+        let taken = self
             .store
             .call(move |conn| store::take_dispatchable(conn, &device, include_unresolved))
             .await;
-        match dispatches {
-            Ok(dispatches) => {
+        match taken {
+            Ok((dispatches, changes)) => {
                 for dispatch in dispatches {
                     tracing::debug!(device_id, job_target_id = %dispatch.job_target_id, "dispatching job");
                     // If the connection is gone the target stays `sent` and
@@ -112,6 +148,9 @@ impl AppState {
                         kind: dispatch.kind,
                         payload: dispatch.payload,
                     });
+                }
+                for change in changes {
+                    self.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
                 }
             }
             Err(error) => tracing::error!(device_id, %error, "failed to load jobs to dispatch"),
