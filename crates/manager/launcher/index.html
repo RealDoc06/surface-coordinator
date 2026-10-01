@@ -13,6 +13,21 @@
         <p>Choose the coordinator to manage devices through.</p>
       </header>
 
+      <section id="update" class="card update" aria-labelledby="update-title" hidden>
+        <h2 id="update-title"></h2>
+        <div id="update-notes" class="notes" hidden></div>
+        <p id="update-hint" hidden>
+          Installing stops the local coordinator; devices connected to it go offline until it is
+          started again.
+        </p>
+        <p id="update-progress" class="status" aria-live="polite" hidden></p>
+        <p id="update-error" class="error" role="alert" hidden></p>
+        <div class="actions">
+          <button id="update-install" type="button">Install and restart</button>
+          <button id="update-later" type="button" class="secondary">Later</button>
+        </div>
+      </section>
+
       <section class="choices">
         <form id="remote" class="card">
           <h2>Remote coordinator</h2>
@@ -42,7 +57,12 @@
         </div>
       </section>
 
-      <footer id="version"></footer>
+      <footer>
+        <span id="version"></span>
+        <span aria-hidden="true">·</span>
+        <button id="update-check" type="button" class="link">Check for updates</button>
+        <span id="update-message" aria-live="polite"></span>
+      </footer>
     </main>
     <script src="launcher.js"></script>
   </body>

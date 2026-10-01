@@ -14,13 +14,38 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "app", "dmg", "appimage", "deb"],
+    "createUpdaterArtifacts": true,
+    "publisher": "RealDoc06",
+    "homepage": "https://github.com/RealDoc06/surface-coordinator",
+    "category": "Utility",
+    "shortDescription": "Manage fleets of Windows Surface devices",
+    "longDescription": "The operator's desktop app for Surface Coordinator: opens the web UI of a remote coordinator, or runs a coordinator on this computer, with its own Wi-Fi hotspot, for places without a network to rely on.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/RealDoc06/surface-coordinator/releases/latest/download/latest.json"
+      ],
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

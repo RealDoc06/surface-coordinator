@@ -22,6 +22,9 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+# Self-update from the repository's GitHub releases; only registered when
+# the build has an updater public key (see build.rs).
+tauri-plugin-updater = "2"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
