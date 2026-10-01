@@ -168,7 +168,7 @@ function GroupDetail({ id }: { id: string }) {
           }}
         >
           <p>
-            The group is removed; its {plural(group.device_ids.length, 'device')} stay enrolled. Jobs that already ran
+            The group is removed; its {plural(group.device_ids.length, 'device stays', 'devices stay')} enrolled. Jobs that already ran
             on the group are not affected.
           </p>
         </ConfirmDialog>

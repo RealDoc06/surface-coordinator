@@ -160,33 +160,64 @@ during the failure tests.
 
 ## 4. Client service (Windows)
 
-Use a throwaway Windows machine or VM. The installer needs an elevated prompt.
-Use the install and uninstall flags documented by `client.exe --help`; give it
-the enrollment key id and secret (and optionally the coordinator URL).
+Use a throwaway Windows machine or VM. `install` and `uninstall` need an
+elevated prompt. The command lines (from `client.exe --help`), with a key
+created in the UI under **Enrollment keys**:
 
-- [ ] `client.exe install` from a **non-elevated** prompt. Expected: refused
-  with a clear message; nothing was installed.
-- [ ] `client.exe install` from an elevated prompt. Expected:
+```
+$env:SC_KEY_SECRET = '<key secret>'
+.\client.exe install --key-id <key id> --coordinator-url wss://<host>
+.\client.exe uninstall
+.\client.exe uninstall --purge
+```
+
+`install` also takes `--state-dir` (default `%ProgramData%\Surface
+Coordinator`) and `--install-dir` (default `%ProgramFiles%\Surface
+Coordinator`); `uninstall` takes the same two, which must match what `install`
+was given. The service is called `SurfaceCoordinatorClient` and runs
+`client.exe service --state-dir <state dir>`. Without `--coordinator-url` the
+client looks for the manager's hotspot (group 2).
+
+- [ ] `client.exe install --key-id <key id>` from a **non-elevated** prompt.
+  Expected: refused with "needs administrator rights"; nothing was installed.
+- [ ] `install` from an elevated prompt with `SC_KEY_SECRET` unset. Expected:
+  "set the enrollment secret in the environment variable SC_KEY_SECRET",
+  nothing installed.
+- [ ] `install` from an elevated prompt, as above. Expected:
   - `%ProgramFiles%\Surface Coordinator\client.exe` exists;
-  - `%ProgramData%\Surface Coordinator\` holds the configuration, and its
-    permissions (`icacls`) allow only SYSTEM and Administrators;
+  - `%ProgramData%\Surface Coordinator\` holds `config.json`, and its
+    permissions (`icacls`) allow only SYSTEM and Administrators (the `scripts`
+    subfolder is also readable by Users);
   - the service is registered with start type Automatic, runs as LocalSystem
-    (`sc.exe qc <name>`), and is running; recovery actions restart it on failure;
+    (`sc.exe qc SurfaceCoordinatorClient`), and is running; the recovery
+    actions (`sc.exe qfailure SurfaceCoordinatorClient`) restart it after 5 s,
+    5 s and then 60 s;
   - the device appears online in the UI.
+- [ ] `install` with `--install-dir` and `--state-dir` pointing at other
+  folders, then `uninstall` with the same two. Expected: works the same there,
+  and nothing is left in the default folders.
 - [ ] Kill the client process in Task Manager. Expected: the service manager
   restarts it and the device comes back online.
 - [ ] Reboot with nobody logged in. Expected: the device comes online at the
   sign-in screen.
-- [ ] A log file exists in the state directory and stays below its size cap after
-  a few thousand lines (use `--verbose`-level traffic or repeated jobs);
-  rotated files are replaced rather than growing without limit.
-- [ ] Run `client.exe install` a second time. Expected: a clean error or an
-  in-place reinstall, never a half-installed state.
+- [ ] `client.log` exists in the state directory and stays near its 5 MiB cap
+  after many thousands of lines (repeated jobs, or `--verbose` added to the
+  service's command line); rotation replaces the old file rather than growing
+  without limit.
+- [ ] Run `install` a second time (same or another key). Expected: it stops the
+  service, replaces the executable and the configuration, starts it again, and
+  the device keeps its device id (same row in the UI). Never a half-installed
+  state.
 - [ ] `client.exe uninstall` from an elevated prompt. Expected: the service is
-  stopped and removed (`sc.exe query` no longer finds it), the installed
-  executable is gone as the command's output describes, the device goes
-  offline in the UI. The configuration is removed or kept as the command says.
-- [ ] `client.exe uninstall` when not installed. Expected: a clean message.
+  stopped and removed (`sc.exe query SurfaceCoordinatorClient` no longer finds
+  it), the install folder is removed (or, when run from inside it, at the next
+  restart of Windows, as the output says), the device goes offline in the UI.
+  The state folder is kept, as the output says.
+- [ ] `client.exe uninstall --purge`. Expected: the state folder (configuration,
+  device id, log) is removed too; installing again enrolls a new device.
+- [ ] `client.exe uninstall` when not installed. Expected: "is not installed",
+  no error.
+- [ ] `client.exe uninstall` from a non-elevated prompt. Expected: refused.
 
 ### 4.1 Identity and user session
 
@@ -280,8 +311,8 @@ with a client that carries the matching public key.
   service on an older version). Expected, in order: the job goes `running`
   with a "restarting" note; the device goes offline briefly; it returns
   reporting the new version; the job ends `succeeded` with the new version;
-  `client.old.exe` and the pending-update marker are gone from the
-  installation directory; the service is still LocalSystem and automatic.
+  `client.old.exe` is gone from the install directory and `update-pending.json`
+  from the state directory; the service is still LocalSystem and automatic.
 - [ ] Update a group and then **all** devices. Expected: every online device ends
   `succeeded`; offline devices stay `queued` and update when they return.
 - [ ] Update a device that is already on that version. Expected: `succeeded` with
@@ -302,10 +333,11 @@ with a client that carries the matching public key.
   `download_failed`; the device keeps working on the old version.
 - [ ] **Rollback after three failed starts.** Release a deliberately broken
   version (a throwaway build that exits at start-up, signed with the test
-  key). Update a device to it. Expected: the service restarts the new
-  executable three times without a handshake, then restores
-  `client.old.exe`, restarts, the old version comes online and the job ends
-  `failed` with reason `rolled_back`.
+  key). Update a device to it. Expected: the service manager restarts the new
+  executable three times without a handshake (watch `client.log`), then the
+  next start restores `client.old.exe` and restarts, the old version comes
+  online and the job ends `failed` with reason `rolled_back`. The service's
+  recovery delays (5 s, 5 s, 60 s) make this take a couple of minutes.
 - [ ] Interrupt the update by powering the device off right after the swap.
   Expected: on the next boot the new version starts and either completes
   (handshake) or rolls back after three tries; never a device that is
@@ -463,3 +495,35 @@ Follow `deploy/README.md` on a fresh Linux server.
   there.
 - [ ] With the server's outbound HTTPS blocked, the coordinator keeps serving; only
   the update check reports an error.
+
+## 11. Gaps left by the scripted checks
+
+The final verification ran the coordinator and two console-mode clients (not
+the service), drove the web UI with headless Chrome, and drove the manager
+window on Windows through its debugging port. These parts were not covered;
+do them by hand.
+
+- [ ] Use the web UI in a real browser window (the checks used headless
+  Chrome): a small window size, keyboard use of the dialogs, and the banner
+  "Live updates paused, reconnecting..." when the coordinator is restarted.
+- [ ] In the manager window, click **Coordinator > Change coordinator...** and
+  **Exit** with the mouse (the checks sent the menu commands to the window).
+  On macOS and Linux the menu is built differently; check both.
+- [ ] Manager on Windows: start the local coordinator, then close the window.
+  Expected: the coordinator stops, port 47800 is free, no `manager.exe` is left
+  in Task Manager.
+- [ ] Windows may show a firewall prompt the first time the local coordinator
+  listens on port 47800. Expected: allowing the private network is enough for
+  devices on the hotspot to connect; record what happens when it is denied.
+- [ ] Revoke an enrollment key while its device is connected. Expected (as
+  documented in `docs/api.md`): the device stays connected until its next
+  handshake; then it shows under **Rejected connections** as revoked. Restart
+  the client to see it.
+- [ ] Run a script as **Logged-in user** and **Launch app** against a client
+  started in a console by a logged-in user (not the service). Record whether
+  they succeed or fail with a clear reason; the service case is group 4.1.
+- [ ] Apply `audio.mute`, `display.brightness` and `desktop.wallpaper` from the
+  UI and restore them (the scripted pass applied only `audio.volume`).
+- [ ] The Updates page of a build that has the update key (group 7). The
+  scripted pass only saw the "Update checking is off" state, where **Check
+  now** and **Update all outdated devices...** are disabled and nothing errors.

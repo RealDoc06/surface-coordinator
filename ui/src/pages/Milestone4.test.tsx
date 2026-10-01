@@ -128,6 +128,14 @@ describe('Groups page', () => {
     ])
   })
 
+  it('words the delete warning for a group with one device in the singular', async () => {
+    fakeCoordinator({ groups: [group('g1', 'Lab', ['a'])] })
+    const user = start('/groups')
+    await user.click(await screen.findByRole('button', { name: 'Delete Lab' }))
+    const dialog = screen.getByRole('dialog', { name: 'Delete group “Lab”?' })
+    expect(within(dialog).getByText(/its 1 device stays enrolled/)).toBeInTheDocument()
+  })
+
   it('asks before deleting a group, and deletes it when confirmed', async () => {
     const server = fakeCoordinator({ groups: [group('g1', 'Lab', ['a', 'b'])] })
     const user = start('/groups')

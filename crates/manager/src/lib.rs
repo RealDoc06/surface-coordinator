@@ -36,12 +36,27 @@ pub fn is_launcher(url: &Url) -> bool {
     }
 }
 
+/// The launcher page proper, as opposed to the blank page a window shows
+/// before its first navigation finishes. This is the address "Change
+/// coordinator" has to return to, so it must be a page that can be shown.
+pub fn is_launcher_page(url: &Url) -> bool {
+    is_launcher(url) && url.scheme() != "about"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn url(text: &str) -> Url {
         Url::parse(text).unwrap()
+    }
+
+    #[test]
+    fn the_blank_page_is_not_a_page_to_return_to() {
+        assert!(is_launcher_page(&url("http://tauri.localhost/index.html")));
+        assert!(is_launcher_page(&url("tauri://localhost/index.html")));
+        assert!(!is_launcher_page(&url("about:blank")));
+        assert!(!is_launcher_page(&url("http://127.0.0.1:51234/")));
     }
 
     #[test]

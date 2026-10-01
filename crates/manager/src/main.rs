@@ -9,7 +9,7 @@ use std::time::Duration;
 use manager::embedded::{Embedded, Options};
 use manager::settings::Settings;
 use manager::update::{self, DownloadProgress, UpdateStatus};
-use manager::{navigation_allowed, remote};
+use manager::{is_launcher_page, navigation_allowed, remote};
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -32,8 +32,10 @@ struct AppState {
     embedded: tokio::sync::Mutex<Option<Embedded>>,
     /// Origins the window may navigate to besides the launcher.
     allowed_origins: Arc<Mutex<Vec<String>>>,
-    /// Address of the bundled launcher page, to return to it.
-    launcher: Mutex<Option<Url>>,
+    /// Address of the bundled launcher page, to return to it. Remembered
+    /// when the window first navigates to it: the window's own address is
+    /// still the blank page while the app is being set up.
+    launcher: Arc<Mutex<Option<Url>>>,
     /// The update found by the last check, installed when the operator
     /// confirms.
     pending_update: tokio::sync::Mutex<Option<Update>>,
@@ -259,19 +261,23 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let allowed_origins = Arc::new(Mutex::new(Vec::new()));
+            let launcher = Arc::new(Mutex::new(None));
             app.manage(AppState {
                 data_dir,
                 embedded: tokio::sync::Mutex::new(None),
                 allowed_origins: allowed_origins.clone(),
-                launcher: Mutex::new(None),
+                launcher: launcher.clone(),
                 pending_update: tokio::sync::Mutex::new(None),
             });
 
-            let window = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
+            WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("Surface Coordinator")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(1000.0, 640.0)
                 .on_navigation(move |url| {
+                    if is_launcher_page(url) {
+                        *launcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+                    }
                     let allowed = allowed_origins.lock().unwrap_or_else(|e| e.into_inner());
                     let permitted = navigation_allowed(url, &allowed);
                     if !permitted {
@@ -280,8 +286,6 @@ fn main() {
                     permitted
                 })
                 .build()?;
-            *app.state::<AppState>().launcher.lock().unwrap_or_else(|e| e.into_inner()) =
-                window.url().ok();
 
             let change = MenuItemBuilder::with_id("change-coordinator", "Change coordinator…").build(app)?;
             let coordinator = SubmenuBuilder::new(app, "Coordinator").item(&change).separator().quit().build()?;

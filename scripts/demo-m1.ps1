@@ -9,7 +9,7 @@
   queued while the client is offline is delivered when it reconnects.
 
   The enrollment key and the API token are generated on every run. All
-  state goes to demo-data/ (ignored by git), which is wiped at the start.
+  state goes to demo-data/m1/ (ignored by git), which is wiped at the start.
 #>
 param(
     [int]$Port = 18080
@@ -17,7 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$data = Join-Path $root 'demo-data'
+$data = Join-Path $root 'demo-data\m1'
 $coordinatorExe = Join-Path $root 'target\debug\coordinator.exe'
 $clientExe = Join-Path $root 'target\debug\client.exe'
 $processes = @()
@@ -116,7 +116,7 @@ exit 3
     Start-Sleep -Seconds 3
     Stop-Process -Id $wrong.Id -Force
     Write-Host 'client log:'
-    Show-Log $wrongLog 'not connected' | Select-Object -First 2 | Write-Host
+    Show-Log $wrongLog 'cannot reach coordinator' | Select-Object -First 2 | Write-Host
     Write-Host 'coordinator log:'
     Show-Log $coordinatorLog 'handshake failed' | Select-Object -First 2 | Write-Host
 
@@ -128,7 +128,7 @@ exit 3
     Start-Sleep -Seconds 3
     Stop-Process -Id $unknown.Id -Force
     Write-Host 'client log:'
-    Show-Log $unknownLog 'not connected' | Select-Object -First 2 | Write-Host
+    Show-Log $unknownLog 'cannot reach coordinator' | Select-Object -First 2 | Write-Host
     Write-Host 'coordinator log:'
     Show-Log $coordinatorLog 'unknown enrollment key' | Select-Object -First 2 | Write-Host
     $devices = (Invoke-RestMethod "$api/devices" -Headers $headers).devices
