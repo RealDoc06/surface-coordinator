@@ -123,3 +123,41 @@ and joining the hotspot, Wi-Fi handoff success and failure paths.
 3. **The client reports its network in `hello`** rather than in a separate
    message; a network change always breaks the connection, so every change
    is followed by a new `hello`.
+4. **A handoff holds the search.** While a `wifi.join` handoff is in
+   progress the connection loop does not search for the hotspot. With the
+   default of 60 s for both the search threshold and the handoff timeout, the
+   loop could otherwise scan, see the hotspot from the new network and rejoin
+   it before the handoff had timed out.
+5. **The connection generation is read after the platform join.** A session
+   that came up on the old network while the join was under way would
+   otherwise count as the handoff's success. Only sessions established after
+   the join returned do.
+6. **A Wi-Fi lock serialises the loop's scan and join with a job's join.**
+   Without it the loop could scan or rejoin the hotspot in the middle of a
+   `wifi.join` and undo it.
+7. **Only the override URL is persisted** (`network.json`), and only once the
+   join has succeeded, not when the job starts as step 1 above has it. The
+   previous override is kept in memory. A client restarted during the wait
+   therefore keeps the new URL, and reports the job as `interrupted` to
+   whichever coordinator it reaches.
+8. **The Windows client supports WPA2-PSK with AES and open networks only.**
+   The profile it writes is WPA2-Personal (AES) when the job has a password
+   and open otherwise. The hotspot is set to WPA2 for the same reason.
+   Networks that need WPA3 only, 802.1X or WEP are not supported.
+9. **The Windows hotspot tries every connection profile**, the internet one
+   first. Windows ties Mobile Hotspot to a connection profile whose traffic it
+   would share, and a computer in a place without internet has no internet
+   profile; any profile will do, and the hotspot then has nothing to share. A
+   hotspot that is already running with the same SSID and passphrase is left
+   alone, since restarting it would drop the connected devices.
+10. **The idle timeout is switched off while the hotspot runs.** Windows turns
+    Mobile Hotspot off when no devices are connected, but devices may come
+    looking for it much later. The manager disables that timeout when it
+    starts the hotspot and restores it on stop, if it was on before. Stop
+    does nothing when the manager did not start the hotspot (its state is
+    `off`), so a Mobile Hotspot the operator uses for something else is not
+    turned off.
+11. **With manual control (macOS), start and stop only keep records.** There
+    is no supported API for Internet Sharing. Start records the key and shows
+    the SSID, passphrase and instructions; stop forgets the key. The
+    operator turns the hotspot on and off.

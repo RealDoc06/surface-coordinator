@@ -116,3 +116,12 @@ start/stop path as an integration test without a window.
    coordinator.
 4. **stdout and stderr stay interleaved** in one `output` column, as in the
    spec's data model.
+5. **Login throttling is per username only**, not per address. In remote mode
+   the coordinator sits behind a TLS-terminating reverse proxy, so the peer
+   address is the proxy's, not the caller's. The count is kept in memory,
+   compares usernames ignoring ASCII case, and also covers names that do not
+   exist, so a lockout does not reveal which accounts there are.
+6. **UI assets are embedded by `crates/coordinator-core/build.rs`.** The
+   script lists `ui/dist` as `include_bytes!` entries. When `ui/dist` is
+   absent it embeds a placeholder page that says how to build the UI, so the
+   Rust build never depends on Node.

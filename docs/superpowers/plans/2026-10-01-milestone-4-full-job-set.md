@@ -3,7 +3,8 @@
 Date: 2026-10-01
 Spec: `docs/superpowers/specs/2026-10-01-surface-coordinator-design.md`
 (sections "Jobs", "Settings catalogue", "Client", "Data model")
-API contract: `docs/api.md`, section "Milestone 4 additions"
+API contract: `docs/api.md`, sections "Jobs", "Groups", "Scripts" and
+"Settings catalogue"
 
 ## Goal
 
@@ -89,3 +90,47 @@ job page.
 3. **Jobs copy the script body.** A job created from a library script does
    not reference it, so editing or deleting a library script never changes
    what an existing job did.
+4. **`taskbar.locked` and `start.layout_locked` are written by the client
+   itself** to the logged-in user's hive under `HKEY_USERS\<SID>`, not run as
+   the user. These are per-user policy keys, which the user can read but not
+   write. The client runs the snippet as LocalSystem with the SID in
+   `SC_USER_SID`. Explorer reads the policy at sign-in, so the change shows
+   from the next sign-in.
+5. **The time zone is set with `Set-TimeZone`** rather than `tzutil`. Windows
+   PowerShell's quoting of arguments to programs mangles some values; a
+   cmdlet parameter does not.
+6. **Sleep calls `SetSuspendState` directly.** Going through
+   `rundll32 powrprof.dll,SetSuspendState` passes its arguments wrongly and
+   hibernates where hibernation is enabled. The client enables
+   `SeShutdownPrivilege` first, which even LocalSystem holds only disabled.
+   Behaviour on Modern Standby hardware is unverified.
+7. **Unsupported power is detected before success is reported**
+   (`check_power`). The result of a `power` job is sent before the action
+   runs, so afterwards a failure can only be logged. A platform without power
+   support fails the job as `unsupported`. On Windows the check confirms that
+   `shutdown.exe` exists; sleep has no such check, so a failure of
+   `SetSuspendState` is only logged.
+8. **Cancellation has a point of no return per job kind.** A script has none:
+   a cancel stops it wherever it is, with its process tree. `app.launch`,
+   `setting.apply` and `power` commit just before they act (starting the
+   process, applying the setting, reporting success), and `wifi.join` commits
+   once it holds the Wi-Fi lock, before it joins the network. A cancel that
+   arrives before that point stops the job; one that arrives later is
+   ignored and the job reports its own result. Stopping a setting half way
+   could leave it half applied, and a network change is not undone.
+9. **A cancel for a target the client never received is recorded and reported
+   as cancelled.** If a `job` message was lost, the coordinator would
+   otherwise wait for ever for a device that has nothing to stop. The client
+   stores the cancel like any result, so the job does not run if it arrives
+   later. The coordinator also repeats `job.cancel` to a device that
+   reconnects, for its targets cancelled in the last 24 hours; the device
+   ignores ids it has finished and settles the rest.
+10. **Built-in scripts are upserted by fixed id at start.** A newer
+    coordinator refreshes the name and body of the stored copy, and
+    `updated_at` moves only when something changed. A built-in whose name a
+    user script already holds (names compare ignoring ASCII case) is skipped
+    with a warning rather than failing the start.
+11. **Only the physical console session counts as "the logged-in user".**
+    Remote Desktop sessions are ignored: the device is used at its own screen.
+    With nobody logged in at the console, user jobs fail as
+    `no_user_session`.

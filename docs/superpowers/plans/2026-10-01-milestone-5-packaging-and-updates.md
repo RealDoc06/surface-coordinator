@@ -3,7 +3,7 @@
 Date: 2026-10-01
 Spec: `docs/superpowers/specs/2026-10-01-surface-coordinator-design.md`
 (sections "Client", "Releases and self-update", "Error handling")
-API contract: `docs/api.md`, section "Milestone 5 additions"
+API contract: `docs/api.md`, sections "Updates" and "Downloads for clients"
 
 ## Goal
 
@@ -111,3 +111,30 @@ macOS and Linux builds and installers. These go on the manual checklist in
    spec only says artifacts are signed.
 3. **The coordinator verifies signatures too**, before caching an artifact,
    although only the client's check is required by the spec.
+4. **Unsupported protocol versions are now accepted in the restricted state.**
+   This supersedes deviation 4 of milestone 1, which rejected them with
+   `unsupported_protocol` until `client.update` existed. A client on an
+   unsupported version completes the handshake, and the coordinator sends it
+   only `client.update` jobs; its other jobs stay queued. Only the
+   coordinator changed, as predicted there. Until a second protocol version
+   exists the supported set holds only version 1, so no device is restricted
+   yet.
+5. **The manager's updater key comes from `crates/manager/updater.pub` at
+   build time.** Without the file the build works but self-update is
+   disabled: the updater plugin is not registered. The WebView2 bootstrapper
+   is embedded in the installer, so a machine without WebView2 does not
+   download it first. The launcher's JavaScript has no updater permission; it
+   only calls the manager's own `check_update` and `install_update`
+   commands, and coordinator pages get no access at all.
+6. **Release workflow details.** The release is built as a draft and
+   published only when every job has succeeded. The client and coordinator
+   jobs attach their files with `gh release upload`; the manager jobs go
+   through `tauri-action`, which uploads the bundles and merges each
+   platform into `latest.json`. The manager matrix therefore runs one OS at a
+   time, so that no job overwrites another's entry. The coordinator is built
+   on ubuntu-22.04 so that it runs on servers with glibc 2.35. macOS builds
+   are Apple Silicon only.
+7. **The coordinator never prunes cached releases.** A version can then be
+   pushed later from a coordinator without internet, including as a
+   downgrade. The only entries removed are ones whose files have gone
+   missing, which are forgotten at start.
