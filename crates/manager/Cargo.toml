@@ -1,0 +1,32 @@
+[package]
+name = "manager"
+description = "Surface Coordinator Manager: the operator's desktop app"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lib]
+name = "manager"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+coordinator-core.workspace = true
+protocol.workspace = true
+
+axum.workspace = true
+hex.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

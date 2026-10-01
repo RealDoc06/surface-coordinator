@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Surface Coordinator</title>
+    <link rel="stylesheet" href="launcher.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Surface Coordinator</h1>
+        <p>Choose the coordinator to manage devices through.</p>
+      </header>
+
+      <section class="choices">
+        <form id="remote" class="card">
+          <h2>Remote coordinator</h2>
+          <p>
+            The central server for your organisation. Devices are reached wherever they are, as
+            long as they have a network.
+          </p>
+          <label for="address">Address</label>
+          <input id="address" name="address" type="text" inputmode="url" autocomplete="off"
+                 spellcheck="false" placeholder="https://coordinator.example.org" />
+          <p id="remote-error" class="error" role="alert" hidden></p>
+          <button id="remote-open" type="submit">Connect</button>
+        </form>
+
+        <div class="card">
+          <h2>This computer</h2>
+          <p>
+            Runs a coordinator inside this app, for when there is no network to rely on. Devices
+            connect directly to this computer.
+          </p>
+          <p id="local-status" class="status"></p>
+          <p id="local-error" class="error" role="alert" hidden></p>
+          <div class="actions">
+            <button id="local-open" type="button">Start local coordinator</button>
+            <button id="local-stop" type="button" class="secondary" hidden>Stop</button>
+          </div>
+        </div>
+      </section>
+
+      <footer id="version"></footer>
+    </main>
+    <script src="launcher.js"></script>
+  </body>
+</html>

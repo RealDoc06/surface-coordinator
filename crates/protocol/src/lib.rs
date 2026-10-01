@@ -14,6 +14,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Path of the client WebSocket endpoint on the coordinator.
 pub const CLIENT_WS_PATH: &str = "/client/ws";
 
+/// Port on which a coordinator embedded in the manager accepts clients. Fixed,
+/// so that a client on the manager's hotspot knows where to connect.
+pub const EMBEDDED_CLIENT_PORT: u16 = 47800;
+
 /// Heartbeat interval a coordinator announces unless configured otherwise.
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 

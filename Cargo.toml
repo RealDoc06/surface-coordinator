@@ -5,6 +5,15 @@ members = [
     "crates/coordinator-core",
     "crates/coordinator",
     "crates/client",
+    "crates/manager",
+]
+# The manager needs the desktop (webview) toolchain; build it explicitly
+# with `cargo build -p manager`.
+default-members = [
+    "crates/protocol",
+    "crates/coordinator-core",
+    "crates/coordinator",
+    "crates/client",
 ]
 
 [workspace.package]
