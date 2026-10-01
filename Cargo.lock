@@ -220,8 +220,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "coordinator-core",
  "futures-util",
  "rand",
+ "reqwest",
  "serde",
  "serde_json",
  "surface-coordinator-protocol",

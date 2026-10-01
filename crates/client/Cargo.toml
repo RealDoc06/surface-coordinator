@@ -32,4 +32,6 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+coordinator-core.workspace = true
+reqwest.workspace = true
 tempfile.workspace = true
