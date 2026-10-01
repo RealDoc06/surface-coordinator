@@ -203,6 +203,85 @@ client never abandons a working coordinator connection to join a hotspot.
 4. Otherwise it returns to Searching, rejoins the hotspot if present, and
    reports the job as failed with the reason.
 
+## Releases and self-update
+
+The source lives in the public GitHub repository
+`RealDoc06/surface-coordinator`. Releases are the single source of updates.
+
+### Releases
+
+- A version tag (`vX.Y.Z`) triggers a GitHub Actions workflow that builds the
+  client (Windows), the manager (Windows, macOS, Linux) and the coordinator
+  (Linux), and attaches them to a GitHub Release.
+- All components share one version number.
+- Every update artifact is signed in CI. The private keys are GitHub Actions
+  secrets; the public keys are compiled into the client and manager. An
+  artifact whose signature does not verify is never installed. This matters
+  because the client runs as LocalSystem and the repository is public.
+
+### Manager self-update
+
+- Uses the Tauri updater against the repository's latest release.
+- The manager checks at startup and on demand, shows the new version and
+  release notes, and installs when the operator confirms.
+- No update check is attempted without internet (hotspot mode); the manager
+  keeps working on its current version.
+
+### Client update
+
+Client updates are started by the operator from the UI; clients never update
+on their own.
+
+- The coordinator checks GitHub for the latest release periodically and on
+  demand, downloads the client artifact and its signature, and caches them in
+  its data directory. The embedded coordinator does the same while the manager
+  has internet, so a cached version can be pushed later on the hotspot.
+- The device list shows each client's version and marks those older than the
+  newest cached version.
+- The operator updates selected devices, a group, or all, using a new job
+  kind:
+
+| Kind | Payload | Client behaviour |
+|---|---|---|
+| `client.update` | version, size, SHA-256 | Downloads, verifies, installs and restarts; see below. |
+
+- The client always downloads from its coordinator
+  (`/updates/client/<version>/<target>`), never from GitHub directly. One code
+  path covers both internet and hotspot, and devices need no outbound access
+  beyond the coordinator.
+
+Install steps on the client:
+
+1. Download to a temporary file next to the executable; check size and
+   SHA-256; verify the signature against the built-in public key.
+2. Rename the running executable to `client.old.exe`, move the new one into
+   place, and write a pending-update marker with the previous version.
+3. Report the job as `running` with a "restarting" note and exit; the service
+   manager restarts the service on the new executable.
+4. On start, the new version sees the marker. Once it completes a handshake
+   with a coordinator it deletes the marker and the old executable and reports
+   the job as succeeded with the new version.
+5. If the new version starts three times without completing a handshake, it
+   restores `client.old.exe`, restarts, and the old version reports the job as
+   failed.
+
+A client refuses to install a version older than its own unless the job sets
+an explicit downgrade flag.
+
+### Coordinator update
+
+The remote coordinator is updated by the server administrator from the same
+releases; it does not update itself. The embedded coordinator is updated with
+the manager.
+
+### Version compatibility
+
+The handshake carries the protocol version. A coordinator accepts clients on
+the current and previous protocol version, so a fleet can be updated after the
+coordinator rather than at the same moment. A client on an unsupported
+protocol version is still allowed to connect in a restricted state where the
+only job it accepts is `client.update`.
+
 ## Embedded versus remote coordinator
 
 They run the same code with separate databases. Data is not synchronised
@@ -233,6 +312,9 @@ and import keys.
   only on Windows.
 - Hotspot and Wi-Fi handoff: manual test checklist on real hardware.
 - `ui`: component tests for job creation and device selection.
+- Client update: tests for signature and hash rejection, the downgrade guard,
+  and the pending-marker rollback logic against a fake platform; the real
+  executable swap is on the manual checklist.
 
 ## Milestones
 
@@ -247,8 +329,9 @@ Each milestone gets its own implementation plan.
    `wifi.join` handoff.
 4. **Full job set**: settings catalogue, `app.launch`, `power`, script
    library, groups.
-5. **Packaging**: client installer and service registration, coordinator
-   deployment for Linux, manager installers for Windows, macOS and Linux.
+5. **Packaging and updates**: client installer and service registration,
+   coordinator deployment for Linux, manager installers for Windows, macOS and
+   Linux, the signed release workflow, manager self-update and `client.update`.
 
 ## Out of scope
 
@@ -257,4 +340,4 @@ Each milestone gets its own implementation plan.
 - Multi-tenant isolation; one coordinator serves one organisation.
 - Roles and permissions; all accounts have full access.
 - Remote screen viewing, file transfer and software inventory.
-- Client self-update.
+- Automatic (unattended) client updates and coordinator self-update.
