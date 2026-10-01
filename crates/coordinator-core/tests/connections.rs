@@ -74,6 +74,7 @@ async fn replaying_the_coordinator_mac_is_rejected() {
         client_version: "0".into(),
         key_id: key.id.clone(),
         nonce: protocol::handshake::generate_nonce(),
+        network: None,
     });
     socket.send(Message::text(hello.to_json())).await.unwrap();
     let challenge = socket.next().await.unwrap().unwrap();
@@ -220,4 +221,56 @@ async fn devices_survive_a_restart_and_come_back_offline() {
     // The same key still works against the restarted server.
     let _client = FakeClient::connect(&server, &key, "device-a").await;
     assert!(server.is_online("device-a").await);
+}
+
+fn network(ssid: &str, ip: &str) -> Option<protocol::NetworkInfo> {
+    Some(protocol::NetworkInfo { ssid: Some(ssid.into()), ip: Some(ip.into()) })
+}
+
+#[tokio::test]
+async fn the_network_a_device_reports_is_shown_in_the_list_and_on_the_device() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut options = HandshakeOptions::new(&key, "device-a");
+    options.network = network("SC-ad74046f", "192.168.137.23");
+    let _reporting = FakeClient::handshake(server.addr, options).await.unwrap();
+    let _silent = FakeClient::connect(&server, &key, "device-b").await;
+
+    let listed = server.device("device-a").await.unwrap();
+    assert_eq!(listed["network"], serde_json::json!({"ssid": "SC-ad74046f", "ip": "192.168.137.23"}));
+    let (status, body) = server.get("/api/v1/devices/device-a").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["device"]["network"], listed["network"]);
+
+    // Nothing reported: both fields are present and null.
+    let silent = server.device("device-b").await.unwrap();
+    assert_eq!(silent["network"], serde_json::json!({"ssid": null, "ip": null}));
+}
+
+#[tokio::test]
+async fn reconnecting_without_network_information_clears_it() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut options = HandshakeOptions::new(&key, "device-a");
+    options.network = network("SC-ad74046f", "192.168.137.23");
+    FakeClient::handshake(server.addr, options).await.unwrap().disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    // Still shown while offline: it is where the device was last seen.
+    assert_eq!(server.device("device-a").await.unwrap()["network"]["ssid"], "SC-ad74046f");
+
+    let _client = FakeClient::connect(&server, &key, "device-a").await;
+    let device = server.device("device-a").await.unwrap();
+    assert_eq!(device["network"], serde_json::json!({"ssid": null, "ip": null}));
+}
+
+#[tokio::test]
+async fn reported_network_fields_are_clipped_to_255_characters() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut options = HandshakeOptions::new(&key, "device-a");
+    options.network = network(&"é".repeat(400), &"1".repeat(400));
+    let _client = FakeClient::handshake(server.addr, options).await.unwrap();
+    let device = server.device("device-a").await.unwrap();
+    assert_eq!(device["network"]["ssid"].as_str().unwrap().chars().count(), 255);
+    assert_eq!(device["network"]["ip"].as_str().unwrap().chars().count(), 255);
 }

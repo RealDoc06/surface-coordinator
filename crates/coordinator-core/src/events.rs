@@ -30,7 +30,7 @@ pub enum Event {
     #[serde(rename = "job.target.updated")]
     JobTargetUpdated { job_id: String, target: JobTarget },
     #[serde(rename = "job.output")]
-    JobOutput { job_id: String, job_target_id: String, data: String, truncated: bool },
+    JobOutput { job_id: String, job_target_id: String, data: String, truncated: bool, offset: u64 },
     #[serde(rename = "connection.rejected")]
     ConnectionRejected { rejected: Rejected },
     /// Events were dropped; the UI should refetch what it shows.

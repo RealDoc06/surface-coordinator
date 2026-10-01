@@ -215,6 +215,8 @@ pub struct HandshakeOptions<'a> {
     pub protocol_version: u32,
     /// Skip verifying the coordinator, as a hostile client would.
     pub skip_verify: bool,
+    /// Network reported in hello.
+    pub network: Option<protocol::NetworkInfo>,
 }
 
 impl<'a> HandshakeOptions<'a> {
@@ -225,6 +227,7 @@ impl<'a> HandshakeOptions<'a> {
             device_id,
             protocol_version: protocol::PROTOCOL_VERSION,
             skip_verify: false,
+            network: None,
         }
     }
 }
@@ -256,6 +259,7 @@ impl FakeClient {
             client_version: "0.0.0-test".into(),
             key_id: options.key_id.to_owned(),
             nonce: client_nonce.clone(),
+            network: options.network.clone(),
         });
         send_raw(&mut socket, &hello).await;
 

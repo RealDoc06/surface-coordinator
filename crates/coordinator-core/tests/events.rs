@@ -105,6 +105,20 @@ async fn devices_coming_and_going_are_announced() {
 }
 
 #[tokio::test]
+async fn device_updates_carry_the_reported_network() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut events = Events::open(&server).await;
+
+    let mut options = HandshakeOptions::new(&key, "device-a");
+    options.network =
+        Some(protocol::NetworkInfo { ssid: Some("SC-ad74046f".into()), ip: Some("192.168.137.23".into()) });
+    let _client = FakeClient::handshake(server.addr, options).await.unwrap();
+    let event = events.next_of("device.updated").await;
+    assert_eq!(event["device"]["network"], json!({"ssid": "SC-ad74046f", "ip": "192.168.137.23"}));
+}
+
+#[tokio::test]
 async fn a_job_is_followed_from_creation_to_result_and_output_events_rebuild_the_stored_output() {
     let server = TestServer::start().await;
     let key = server.new_key();
@@ -137,10 +151,12 @@ async fn a_job_is_followed_from_creation_to_result_and_output_events_rebuild_the
     client.output(&target_id, 1, "first\n").await;
     client.output(&target_id, 1, "first\n").await;
     client.output(&target_id, 2, "second\n").await;
-    let big = "x".repeat(600 * 1024);
-    client.output(&target_id, 3, &big).await;
+    // Multi-byte characters: offsets count code points, not bytes.
+    client.output(&target_id, 3, "caf\u{e9} \u{1f600}\n").await;
+    let big = "x\u{e9}".repeat(300 * 1024);
     client.output(&target_id, 4, &big).await;
-    client.output(&target_id, 5, "dropped\n").await;
+    client.output(&target_id, 5, &big).await;
+    client.output(&target_id, 6, "dropped\n").await;
     client.result(&target_id, 0).await;
 
     let mut truncated = false;
@@ -151,6 +167,11 @@ async fn a_job_is_followed_from_creation_to_result_and_output_events_rebuild_the
                 assert_eq!(event["job_id"], job_id);
                 assert_eq!(event["job_target_id"], target_id.as_str());
                 assert!(!truncated, "no output events after the truncating one");
+                assert_eq!(
+                    event["offset"].as_u64().unwrap(),
+                    rebuilt.chars().count() as u64,
+                    "offset is the number of code points stored before this chunk"
+                );
                 rebuilt.push_str(event["data"].as_str().unwrap());
                 truncated = event["truncated"].as_bool().unwrap();
             }
@@ -192,4 +213,64 @@ async fn expiry_and_rejected_connections_are_announced() {
     let event = events.next_of("connection.rejected").await;
     assert_eq!(event["rejected"]["device_id"], "device-b");
     assert_eq!(event["rejected"]["key_id"], "no-such-key");
+}
+
+#[tokio::test]
+async fn the_wifi_password_is_masked_in_job_events() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let mut events = Events::open(&server).await;
+
+    let (status, body) = server
+        .post(
+            "/api/v1/jobs",
+            json!({
+                "kind": "wifi.join",
+                "payload": {"ssid": "fake-office", "password": "fake-passphrase"},
+                "targets": {"type": "all"},
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let event = events.next_of("job.created").await;
+    assert_eq!(event["job"]["payload"], json!({"ssid": "fake-office", "password": "********"}));
+    assert!(!event.to_string().contains("fake-passphrase"));
+    assert_eq!(client.expect_job().await.3["password"], "fake-passphrase");
+}
+
+#[tokio::test]
+async fn a_presumed_handoff_is_announced() {
+    let server = TestServer::start_with(|c| c.handoff_grace = Duration::from_millis(200)).await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let mut events = Events::open(&server).await;
+
+    let (status, body) = server
+        .post(
+            "/api/v1/jobs",
+            json!({"kind": "wifi.join", "payload": {"ssid": "fake-office"}, "targets": {"type": "all"}}),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (target_id, ..) = client.expect_job().await;
+    client.started(&target_id).await;
+    loop {
+        let event = events.next_of("job.target.updated").await;
+        if event["target"]["state"] == "running" {
+            break;
+        }
+    }
+
+    client.disconnect().await;
+    let event = loop {
+        let event = events.next_of("job.target.updated").await;
+        if event["target"]["state"] == "succeeded" {
+            break event;
+        }
+    };
+    assert_eq!(event["job_id"], body["job"]["id"]);
+    assert_eq!(event["target"]["id"], target_id.as_str());
+    assert!(event["target"]["exit_code"].is_null());
+    assert!(event["target"]["message"].as_str().unwrap().contains("presumed to have joined"));
 }

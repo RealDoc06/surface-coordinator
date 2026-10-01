@@ -62,8 +62,13 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// How long a job may stay queued for an offline device.
     pub queued_expiry: Duration,
-    /// How often queued targets are checked for expiry.
+    /// How often queued targets are checked for expiry and `wifi.join`
+    /// targets for a presumed handoff.
     pub expiry_sweep_interval: Duration,
+    /// How long a device with a running `wifi.join` job may stay offline
+    /// before the job is presumed to have succeeded (the device joined a
+    /// network from which it reports to another coordinator).
+    pub handoff_grace: Duration,
     /// Serve the web UI from this directory instead of the copy built into
     /// the library.
     pub ui_dir: Option<PathBuf>,
@@ -86,6 +91,7 @@ impl Config {
             heartbeat_interval: Duration::from_secs(protocol::DEFAULT_HEARTBEAT_INTERVAL_SECS),
             queued_expiry: Duration::from_secs(24 * 60 * 60),
             expiry_sweep_interval: Duration::from_secs(60),
+            handoff_grace: Duration::from_secs(120),
             ui_dir: None,
             secure_cookies: false,
             capabilities: Capabilities::default(),
@@ -165,7 +171,7 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
         .await
         .map_err(|e| Error::Internal(e.to_string()))?);
 
-    state.tasks.spawn(expiry_sweep(state.clone()));
+    state.tasks.spawn(sweep(state.clone()));
 
     let clients = client_ws::router();
     let app = api::router(state.clone()).fallback(ui::serve);
@@ -212,7 +218,12 @@ impl Coordinator {
     }
 }
 
-async fn expiry_sweep(state: Arc<AppState>) {
+/// Periodic housekeeping: expires targets that stayed queued too long and
+/// settles `wifi.join` targets whose device has left for good.
+async fn sweep(state: Arc<AppState>) {
+    // After a restart devices get a full grace period to reconnect: the time
+    // this coordinator was not running says nothing about them.
+    let started = store::now_ms();
     let mut ticker = tokio::time::interval(state.config.expiry_sweep_interval);
     loop {
         tokio::select! {
@@ -230,6 +241,33 @@ async fn expiry_sweep(state: Arc<AppState>) {
                 }
             }
             Err(error) => tracing::error!(%error, "expiry sweep failed"),
+        }
+
+        let gone_since = store::now_ms() - state.config.handoff_grace.as_millis() as i64;
+        if gone_since <= started {
+            continue;
+        }
+        // Held so that a device going offline is never seen between leaving
+        // the connection table and having its last-seen time stored.
+        let presence = state.presence.lock().await;
+        let live = state.clone();
+        let presumed = state
+            .store
+            .call(move |conn| {
+                store::presume_wifi_joins_succeeded(conn, gone_since, |id| live.connection(id).is_some())
+            })
+            .await;
+        drop(presence);
+        match presumed {
+            Ok(presumed) => {
+                if !presumed.is_empty() {
+                    tracing::info!(presumed = presumed.len(), "wifi.join targets presumed to have joined");
+                }
+                for change in presumed {
+                    state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+                }
+            }
+            Err(error) => tracing::error!(%error, "wifi.join handoff sweep failed"),
         }
     }
 }

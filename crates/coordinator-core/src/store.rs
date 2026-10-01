@@ -84,6 +84,9 @@ const MIGRATIONS: &[&str] = &["
         key_id    TEXT,
         reason    TEXT NOT NULL
     );
+", "
+    ALTER TABLE devices ADD COLUMN network_ssid TEXT;
+    ALTER TABLE devices ADD COLUMN network_ip TEXT;
 "];
 
 /// Current time as Unix milliseconds.
@@ -276,6 +279,14 @@ pub struct Device {
     pub online: bool,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
+    pub network: DeviceNetwork,
+}
+
+/// What the device reported about its network in its last handshake.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeviceNetwork {
+    pub ssid: Option<String>,
+    pub ip: Option<String>,
 }
 
 pub struct DeviceInfo<'a> {
@@ -284,22 +295,38 @@ pub struct DeviceInfo<'a> {
     pub hostname: &'a str,
     pub os: &'a str,
     pub client_version: &'a str,
+    /// Replace what was stored before, so a device that stops reporting its
+    /// network does not keep showing an old one.
+    pub network_ssid: Option<&'a str>,
+    pub network_ip: Option<&'a str>,
 }
 
 /// Records a device that completed the handshake and marks it online.
 pub fn upsert_device_online(conn: &Connection, device: &DeviceInfo<'_>) -> rusqlite::Result<()> {
     let now = now_ms();
     conn.execute(
-        "INSERT INTO devices (id, enrollment_key_id, hostname, os, client_version, first_seen, last_seen, online)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
+        "INSERT INTO devices (id, enrollment_key_id, hostname, os, client_version, first_seen, last_seen, online,
+                              network_ssid, network_ip)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
              enrollment_key_id = excluded.enrollment_key_id,
              hostname = excluded.hostname,
              os = excluded.os,
              client_version = excluded.client_version,
              last_seen = excluded.last_seen,
-             online = 1",
-        params![device.id, device.enrollment_key_id, device.hostname, device.os, device.client_version, now],
+             online = 1,
+             network_ssid = excluded.network_ssid,
+             network_ip = excluded.network_ip",
+        params![
+            device.id,
+            device.enrollment_key_id,
+            device.hostname,
+            device.os,
+            device.client_version,
+            now,
+            device.network_ssid,
+            device.network_ip,
+        ],
     )?;
     Ok(())
 }
@@ -328,12 +355,14 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         online: row.get(5)?,
         first_seen_at: row.get(6)?,
         last_seen_at: row.get(7)?,
+        network: DeviceNetwork { ssid: row.get(8)?, ip: row.get(9)? },
     })
 }
 
 pub fn list_devices(conn: &Connection) -> rusqlite::Result<Vec<Device>> {
     conn.prepare(
-        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen
+        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
+                network_ssid, network_ip
          FROM devices ORDER BY hostname, id",
     )?
     .query_map([], device_from_row)?
@@ -342,7 +371,8 @@ pub fn list_devices(conn: &Connection) -> rusqlite::Result<Vec<Device>> {
 
 pub fn get_device(conn: &Connection, id: &str) -> rusqlite::Result<Option<Device>> {
     conn.query_row(
-        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen
+        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
+                network_ssid, network_ip
          FROM devices WHERE id = ?1",
         [id],
         device_from_row,
@@ -473,12 +503,30 @@ fn job_targets(conn: &Connection, job_id: &str, with_output: bool) -> rusqlite::
     .collect()
 }
 
+/// Shown in place of a Wi-Fi password.
+pub const REDACTED_PASSWORD: &str = "********";
+
+/// The payload as the API and the event stream show it, with secrets masked.
+/// Every [`Job`] is built from a row here, so no view of a job can carry a
+/// secret. Dispatch reads the stored payload through [`Dispatch`] instead,
+/// because the device needs the real value.
+fn redacted_payload(kind: &str, mut payload: serde_json::Value) -> serde_json::Value {
+    if kind == protocol::job_kind::WIFI_JOIN {
+        if let Some(password) = payload.get_mut("password").filter(|p| !p.is_null()) {
+            *password = serde_json::Value::String(REDACTED_PASSWORD.to_owned());
+        }
+    }
+    payload
+}
+
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    let kind: String = row.get(1)?;
     let payload: String = row.get(2)?;
+    let payload = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
     Ok(Job {
         id: row.get(0)?,
-        kind: row.get(1)?,
-        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        payload: redacted_payload(&kind, payload),
+        kind,
         created_by: row.get(3)?,
         created_at: row.get(4)?,
         targets: Vec::new(),
@@ -632,6 +680,8 @@ pub struct OutputAppended {
     /// Exactly the text appended, including the marker if it was cut.
     pub data: String,
     pub truncated: bool,
+    /// Length in code points of the stored output before this append.
+    pub offset: u64,
 }
 
 /// Appends an output chunk unless it is a repeat or the target is finished.
@@ -645,17 +695,20 @@ pub fn append_target_output(
     max_bytes: usize,
 ) -> rusqlite::Result<Option<OutputAppended>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current: Option<(i64, i64, bool, String)> = tx
+    // `length` of TEXT counts characters, of a BLOB bytes.
+    let current: Option<(i64, i64, i64, bool, String)> = tx
         .query_row(
-            "SELECT last_seq, length(CAST(output AS BLOB)), output_truncated, job_id FROM job_targets
+            "SELECT last_seq, length(CAST(output AS BLOB)), length(output), output_truncated, job_id
+             FROM job_targets
              WHERE id = ?1 AND device_id = ?2 AND state IN ('sent', 'running')",
             params![target_id, device_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let Some((last_seq, stored_bytes, truncated, job_id)) = current else {
+    let Some((last_seq, stored_bytes, stored_chars, truncated, job_id)) = current else {
         return Ok(None);
     };
+    let offset = u64::try_from(stored_chars).unwrap_or(0);
     let seq = i64::try_from(seq).unwrap_or(i64::MAX);
     if seq <= last_seq {
         return Ok(None);
@@ -670,7 +723,7 @@ pub fn append_target_output(
                 "UPDATE job_targets SET output = output || ?2, last_seq = ?3 WHERE id = ?1",
                 params![target_id, data, seq],
             )?;
-            Some(OutputAppended { job_id, data: data.to_owned(), truncated: false })
+            Some(OutputAppended { job_id, data: data.to_owned(), truncated: false, offset })
         } else {
             let mut cut = remaining;
             while !data.is_char_boundary(cut) {
@@ -682,7 +735,7 @@ pub fn append_target_output(
                  WHERE id = ?1",
                 params![target_id, kept, seq],
             )?;
-            Some(OutputAppended { job_id, data: kept, truncated: true })
+            Some(OutputAppended { job_id, data: kept, truncated: true, offset })
         }
     };
     tx.commit()?;
@@ -732,6 +785,52 @@ pub fn expire_queued_targets(conn: &mut Connection, cutoff: i64) -> rusqlite::Re
             params![id, now_ms()],
         )?;
         changes.extend(get_target_change(&tx, id)?);
+    }
+    tx.commit()?;
+    Ok(changes)
+}
+
+/// Recorded on a `wifi.join` target presumed to have succeeded.
+pub const PRESUMED_JOINED_MESSAGE: &str = "The device left this coordinator's network and did not \
+return. It is presumed to have joined the new network and may be reporting to another coordinator.";
+
+/// Marks `wifi.join` targets that are still running as succeeded when their
+/// device has been gone since before `cutoff`. A device that joined the new
+/// network reports to whichever coordinator it reached, so this one never
+/// hears the result.
+///
+/// `is_online` must come from the live connection table; the stored flag can
+/// lag behind it. The caller holds the presence lock so that the stored
+/// `last_seen` and the table agree.
+pub fn presume_wifi_joins_succeeded(
+    conn: &mut Connection,
+    cutoff: i64,
+    is_online: impl Fn(&str) -> bool,
+) -> rusqlite::Result<Vec<TargetChange>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let candidates: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT t.id, t.device_id
+             FROM job_targets t
+             JOIN jobs j ON j.id = t.job_id
+             JOIN devices d ON d.id = t.device_id
+             WHERE j.kind = ?1 AND t.state = 'running' AND d.last_seen < ?2
+             ORDER BY t.rowid",
+        )?
+        .query_map(params![protocol::job_kind::WIFI_JOIN, cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut changes = Vec::new();
+    for (target_id, device_id) in candidates {
+        if is_online(&device_id) {
+            continue;
+        }
+        tx.execute(
+            "UPDATE job_targets
+             SET state = 'succeeded', exit_code = NULL, reason = NULL, message = ?2, finished = ?3
+             WHERE id = ?1 AND state = 'running'",
+            params![target_id, PRESUMED_JOINED_MESSAGE, now_ms()],
+        )?;
+        changes.extend(get_target_change(&tx, &target_id)?);
     }
     tx.commit()?;
     Ok(changes)

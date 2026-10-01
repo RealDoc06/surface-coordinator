@@ -9,7 +9,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use protocol::{job_kind, ScriptRunPayload};
+use protocol::{job_kind, ScriptRunPayload, WifiJoinPayload};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,6 +24,10 @@ const MAX_LISTED_JOBS: u32 = 200;
 const DEVICE_TARGETS: u32 = 50;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_LABEL_LEN: usize = 100;
+const MAX_SSID_BYTES: usize = 32;
+const MIN_WIFI_PASSWORD_CHARS: usize = 8;
+const MAX_WIFI_PASSWORD_CHARS: usize = 63;
+const MAX_COORDINATOR_URL_BYTES: usize = 2048;
 
 pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let open = Router::new()
@@ -389,6 +393,44 @@ fn validate_payload(kind: &str, payload: Value) -> Result<Value, ApiError> {
                 ));
             }
             Ok(serde_json::to_value(script).expect("payload serialises"))
+        }
+        job_kind::WIFI_JOIN => {
+            let wifi: WifiJoinPayload = serde_json::from_value(payload)
+                .map_err(|e| ApiError::bad_request("invalid_payload", e.to_string()))?;
+            // The 802.11 limits: an SSID is up to 32 bytes, a WPA passphrase
+            // 8 to 63 characters.
+            if wifi.ssid.is_empty() || wifi.ssid.len() > MAX_SSID_BYTES {
+                return Err(ApiError::bad_request(
+                    "invalid_payload",
+                    format!("ssid must be 1 to {MAX_SSID_BYTES} bytes"),
+                ));
+            }
+            if let Some(password) = &wifi.password {
+                if !(MIN_WIFI_PASSWORD_CHARS..=MAX_WIFI_PASSWORD_CHARS).contains(&password.chars().count()) {
+                    return Err(ApiError::bad_request(
+                        "invalid_payload",
+                        format!(
+                            "password must be {MIN_WIFI_PASSWORD_CHARS} to {MAX_WIFI_PASSWORD_CHARS} \
+                             characters; omit it for an open network"
+                        ),
+                    ));
+                }
+            }
+            if let Some(url) = &wifi.coordinator_url {
+                if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+                    return Err(ApiError::bad_request(
+                        "invalid_payload",
+                        "coordinator_url must start with ws:// or wss://",
+                    ));
+                }
+                if url.len() > MAX_COORDINATOR_URL_BYTES {
+                    return Err(ApiError::bad_request(
+                        "invalid_payload",
+                        format!("coordinator_url must be at most {MAX_COORDINATOR_URL_BYTES} bytes"),
+                    ));
+                }
+            }
+            Ok(serde_json::to_value(wifi).expect("payload serialises"))
         }
         other => Err(ApiError::bad_request(
             "unsupported_kind",

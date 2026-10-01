@@ -110,6 +110,11 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
             state
                 .store
                 .call(move |conn| {
+                    // Not part of the handshake validation: a device with an
+                    // odd network name still connects, the text is just cut.
+                    let network = hello.network.clone().unwrap_or_default();
+                    let ssid = clip_chars(network.ssid, MAX_FIELD_LEN);
+                    let ip = clip_chars(network.ip, MAX_FIELD_LEN);
                     store::upsert_device_online(
                         conn,
                         &DeviceInfo {
@@ -118,6 +123,8 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
                             hostname: &hello.hostname,
                             os: &hello.os,
                             client_version: &hello.client_version,
+                            network_ssid: ssid.as_deref(),
+                            network_ip: ip.as_deref(),
                         },
                     )
                 })
@@ -361,6 +368,14 @@ fn clip(text: Option<String>, max: usize) -> Option<String> {
     })
 }
 
+/// Cuts text to at most `max` characters.
+fn clip_chars(text: Option<String>, max: usize) -> Option<String> {
+    text.map(|text| match text.char_indices().nth(max) {
+        Some((end, _)) => text[..end].to_owned(),
+        None => text,
+    })
+}
+
 /// Applies one message from an authenticated client; returns the reply.
 async fn handle_message(
     state: &AppState,
@@ -402,6 +417,7 @@ async fn handle_message(
                             job_target_id: target_id,
                             data: appended.data,
                             truncated: appended.truncated,
+                            offset: appended.offset,
                         });
                     }
                     None
