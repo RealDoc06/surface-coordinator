@@ -1,0 +1,17 @@
+[package]
+name = "coordinator"
+description = "Surface Coordinator server"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+coordinator-core.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
