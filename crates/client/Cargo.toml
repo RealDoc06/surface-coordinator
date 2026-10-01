@@ -12,8 +12,13 @@ anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 rand.workspace = true
+# Downloads `client.update` artifacts from the coordinator. Declared here
+# rather than through the workspace so that no TLS stack or cookie store is
+# pulled in by default; Windows adds the system TLS below.
+reqwest = { version = "0.12", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
@@ -25,6 +30,9 @@ uuid.workspace = true
 # TLS for wss:// through the operating system's stack and trust store.
 [target.'cfg(windows)'.dependencies]
 tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+# Running under, and registering with, the service control manager.
+windows-service = "0.8"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -33,6 +41,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Environment",
     "Win32_System_JobObjects",
     "Win32_System_Power",
@@ -42,6 +51,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+axum.workspace = true
+base64.workspace = true
 coordinator-core.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true

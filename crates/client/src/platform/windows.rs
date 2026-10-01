@@ -3,11 +3,13 @@
 use std::ffi::{c_void, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::{OutputStream, PowerAction, RunAs, Shell};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
@@ -15,10 +17,13 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 
 use super::{
-    OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo, Utf8Decoder,
-    WifiConnection, WifiJoinRequest,
+    executable, OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo,
+    Utf8Decoder, WifiConnection, WifiJoinRequest,
 };
 use session::{Spec, Window};
+#[cfg(test)]
+pub(crate) use session::command_line_to_argv;
+pub(crate) use session::{quote_arguments, quote_program};
 
 mod power;
 mod session;
@@ -41,6 +46,14 @@ const CMD_COMMAND_LINE: &str = r#"/d /s /c ""%SC_CHCP%" 65001 >nul & call "%SC_S
 
 pub struct WindowsPlatform {
     work_dir: PathBuf,
+    restart: Option<Restart>,
+}
+
+/// How [`Platform::request_restart`] stops the client: by cancelling the
+/// token the client runs with, after noting that a restart was asked for.
+struct Restart {
+    shutdown: CancellationToken,
+    requested: Arc<AtomicBool>,
 }
 
 impl WindowsPlatform {
@@ -49,8 +62,38 @@ impl WindowsPlatform {
     /// Scripts run as the logged-in user are read from there by that user,
     /// so it must be readable by them.
     pub fn new(work_dir: impl Into<PathBuf>) -> WindowsPlatform {
-        WindowsPlatform { work_dir: work_dir.into() }
+        WindowsPlatform { work_dir: work_dir.into(), restart: None }
     }
+
+    /// Lets `client.update` restart the client: a restart request cancels
+    /// `shutdown`, and [`WindowsPlatform::restart_requested`] then tells the
+    /// caller to exit with [`crate::RESTART_EXIT_CODE`] so that the service
+    /// manager starts the client again.
+    pub fn with_restart(mut self, shutdown: CancellationToken) -> WindowsPlatform {
+        self.restart = Some(Restart { shutdown, requested: Arc::new(AtomicBool::new(false)) });
+        self
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart.as_ref().is_some_and(|restart| restart.requested.load(Ordering::SeqCst))
+    }
+}
+
+fn running_exe() -> Result<PathBuf, PlatformError> {
+    std::env::current_exe()
+        .map_err(|error| PlatformError::Failed(format!("cannot find the client's executable: {error}")))
+}
+
+/// Runs a file operation on the executable off the async worker threads.
+async fn exe_operation(
+    what: &'static str,
+    operation: impl FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+) -> Result<(), PlatformError> {
+    let exe = running_exe()?;
+    tokio::task::spawn_blocking(move || operation(&exe))
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())))
+        .map_err(|error| PlatformError::Failed(format!("{what} failed: {error}")))
 }
 
 fn system32() -> PathBuf {
@@ -360,6 +403,31 @@ impl Platform for WindowsPlatform {
 
     async fn power(&self, action: PowerAction) -> Result<(), PlatformError> {
         power::carry_out(action).await
+    }
+
+    fn current_exe(&self) -> Result<PathBuf, PlatformError> {
+        running_exe()
+    }
+
+    async fn swap_executable(&self, new: PathBuf) -> Result<(), PlatformError> {
+        exe_operation("replacing the executable", move |exe| executable::swap(exe, &new)).await
+    }
+
+    async fn restore_executable(&self) -> Result<(), PlatformError> {
+        exe_operation("restoring the previous executable", executable::restore).await
+    }
+
+    async fn remove_old_executable(&self) -> Result<(), PlatformError> {
+        exe_operation("removing the previous executable", executable::remove_leftovers).await
+    }
+
+    fn request_restart(&self) -> Result<(), PlatformError> {
+        let restart = self.restart.as_ref().ok_or_else(|| {
+            PlatformError::Unsupported("this client was started without a way to restart it".into())
+        })?;
+        restart.requested.store(true, Ordering::SeqCst);
+        restart.shutdown.cancel();
+        Ok(())
     }
 }
 

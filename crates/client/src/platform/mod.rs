@@ -7,11 +7,13 @@
 
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use protocol::{OutputStream, PowerAction, RunAs, Shell};
 use tokio::sync::mpsc;
 
+pub mod executable;
 #[cfg(windows)]
 pub mod windows;
 
@@ -157,6 +159,37 @@ pub trait Platform: Send + Sync + 'static {
             let _ = action;
             unsupported("power actions")
         }
+    }
+
+    /// The client's executable. `client.update` downloads beside it.
+    fn current_exe(&self) -> Result<PathBuf, PlatformError> {
+        unsupported("updating the client")
+    }
+
+    /// Replaces the executable with `new`: the running one becomes
+    /// `client.old.exe` beside it (see [`executable`]).
+    fn swap_executable(&self, new: PathBuf) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async move {
+            let _ = new;
+            unsupported("updating the client")
+        }
+    }
+
+    /// Undoes [`Platform::swap_executable`]: `client.old.exe` goes back.
+    fn restore_executable(&self) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async { unsupported("updating the client") }
+    }
+
+    /// Deletes what an update or a rollback left beside the executable.
+    fn remove_old_executable(&self) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async { unsupported("updating the client") }
+    }
+
+    /// Asks for the client to be stopped and started again, on whatever
+    /// executable is in place by then. The client is expected to stop soon
+    /// after: this is how an update takes effect.
+    fn request_restart(&self) -> Result<(), PlatformError> {
+        unsupported("restarting the client")
     }
 }
 

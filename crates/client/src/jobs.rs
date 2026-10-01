@@ -9,9 +9,13 @@
 //! its point of no return (see [`JobManager::commit`]). A running job is
 //! cancelled by dropping its future, which for a script stops the script's
 //! process tree.
+//!
+//! `client.update` is the one job that does not finish in the process that
+//! ran it: once it has replaced the executable it stays unfinished, the
+//! worker stops and the client restarts; the next start finishes it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -181,14 +185,23 @@ impl JobManager {
     /// The coordinator asks to stop a job. A waiting job is taken out of the
     /// queue and reported cancelled at once; a running job that has not
     /// passed its point of no return is stopped by the worker, which then
-    /// reports it cancelled. Anything else (unknown, finished, committed) is
-    /// ignored: its result is, or will be, reported as usual.
+    /// reports it cancelled. A job never received (its `job` message was
+    /// lost) is reported cancelled too, so the coordinator can settle it, and
+    /// will not run if it arrives later. Anything else (finished, committed)
+    /// is ignored: its result is, or will be, reported as usual.
     pub fn cancel(&self, job_target_id: &str) {
         let mut inner = self.lock();
-        if inner.waiting.remove(job_target_id) {
-            tracing::info!(job_target_id, "job cancelled before it started");
-            let result =
-                failed(job_target_id, reason::CANCELLED, Some("cancelled before it started".into()));
+        let waiting = inner.waiting.remove(job_target_id);
+        let never_received = !waiting && !inner.ledger.contains(job_target_id);
+        if waiting || never_received {
+            let message = if waiting {
+                tracing::info!(job_target_id, "job cancelled before it started");
+                "cancelled before it started"
+            } else {
+                tracing::info!(job_target_id, "job cancelled before it was received");
+                "cancelled before it was received"
+            };
+            let result = failed(job_target_id, reason::CANCELLED, Some(message.into()));
             // Through the ledger like any result: replayed until
             // acknowledged, and the id is a duplicate from now on, so the
             // job never runs, not even when the coordinator sends it again.
@@ -204,7 +217,7 @@ impl JobManager {
             Some(running) if running.id == job_target_id => {
                 tracing::info!(job_target_id, "job is past the point where it can be cancelled");
             }
-            _ => tracing::debug!(job_target_id, "ignoring job.cancel for a job that is neither waiting nor running"),
+            _ => tracing::debug!(job_target_id, "ignoring job.cancel for a job that has finished"),
         }
     }
 
@@ -212,7 +225,7 @@ impl JobManager {
     /// process or changing the network: from here on a cancel is ignored.
     /// Returns `false` if the job was cancelled before it got here; it must
     /// then stop without doing anything.
-    fn commit(&self, job_target_id: &str) -> bool {
+    pub(crate) fn commit(&self, job_target_id: &str) -> bool {
         let mut inner = self.lock();
         match &mut inner.running {
             Some(running) if running.id == job_target_id => {
@@ -243,7 +256,7 @@ impl JobManager {
         Some(cancel)
     }
 
-    fn output(&self, job_target_id: &str, chunk: OutputChunk) {
+    pub(crate) fn output(&self, job_target_id: &str, chunk: OutputChunk) {
         let mut inner = self.lock();
         let retained = inner.retained.entry(job_target_id.to_owned()).or_default();
         // The coordinator stores at most this much. The chunk that crosses
@@ -263,7 +276,9 @@ impl JobManager {
         inner.send(message);
     }
 
-    fn finish(&self, result: JobResult) {
+    /// Records and reports a result. Also used for a `client.update`
+    /// finished by the start after the restart, which the worker never ran.
+    pub(crate) fn finish(&self, result: JobResult) {
         let mut inner = self.lock();
         tracing::info!(
             job_target_id = %result.job_target_id,
@@ -278,6 +293,25 @@ impl JobManager {
         inner.ledger.finish(result.clone());
         inner.send(ClientMessage::JobResult(result));
     }
+
+    /// The running job completes after a restart of the client: it stays
+    /// unfinished, and the restart does not make it `interrupted`.
+    pub(crate) fn await_restart(&self, job_target_id: &str) {
+        self.lock().ledger.await_restart(job_target_id);
+    }
+
+    /// The running job is no longer the worker's to finish.
+    fn release(&self, job_target_id: &str) {
+        let mut inner = self.lock();
+        if inner.running.as_ref().is_some_and(|running| running.id == job_target_id) {
+            inner.running = None;
+        }
+    }
+
+    /// Jobs left waiting for a restart of the client.
+    pub(crate) fn awaiting_restart(&self) -> Vec<String> {
+        self.lock().ledger.awaiting_restart()
+    }
 }
 
 /// What jobs need beyond the platform.
@@ -289,18 +323,37 @@ pub struct WorkerContext {
     /// How long a `power` job waits for the coordinator to acknowledge its
     /// result before carrying out the action anyway.
     pub power_ack_timeout: Duration,
+    pub update: UpdateContext,
+}
+
+/// What `client.update` needs.
+#[derive(Clone)]
+pub struct UpdateContext {
+    pub client_version: String,
+    /// Base64 Ed25519 key that update signatures must verify against; empty
+    /// if this build has none, which refuses every update.
+    pub public_key: String,
+    /// Where the pending-update marker goes. Without one there is no update.
+    pub state_dir: Option<PathBuf>,
+    /// Longest silence while downloading before the download fails.
+    pub download_timeout: Duration,
 }
 
 /// What running a job came to.
-struct Outcome {
-    result: JobResult,
-    /// A power action to carry out once the result is out.
-    then: Option<PowerAction>,
+pub(crate) enum Outcome {
+    Finished {
+        result: JobResult,
+        /// A power action to carry out once the result is out.
+        then: Option<PowerAction>,
+    },
+    /// `client.update` has replaced the executable: the job is finished by
+    /// the next start, and the client has to restart now.
+    Restart,
 }
 
 impl From<JobResult> for Outcome {
     fn from(result: JobResult) -> Outcome {
-        Outcome { result, then: None }
+        Outcome::Finished { result, then: None }
     }
 }
 
@@ -339,9 +392,27 @@ pub async fn run_worker<P: Platform>(
             }
             Err(error) => failed(&id, reason::ERROR, Some(format!("job task failed: {error}"))).into(),
         };
-        jobs.finish(outcome.result);
-        if let Some(action) = outcome.then {
-            carry_out_power(&jobs, platform.as_ref(), &context, &id, action).await;
+        match outcome {
+            Outcome::Finished { result, then } => {
+                jobs.finish(result);
+                if let Some(action) = then {
+                    carry_out_power(&jobs, platform.as_ref(), &context, &id, action).await;
+                }
+            }
+            Outcome::Restart => {
+                jobs.release(&id);
+                match platform.request_restart() {
+                    // No further job starts on the executable being
+                    // replaced; those still queued never started, so the
+                    // coordinator sends them again after the restart.
+                    Ok(()) => return,
+                    Err(error) => tracing::error!(
+                        job_target_id = %id,
+                        %error,
+                        "cannot restart the client; the update completes when it is next started"
+                    ),
+                }
+            }
         }
     }
 }
@@ -374,7 +445,7 @@ async fn carry_out_power<P: Platform>(
     }
 }
 
-fn failed(job_target_id: &str, reason: &str, message: Option<String>) -> JobResult {
+pub(crate) fn failed(job_target_id: &str, reason: &str, message: Option<String>) -> JobResult {
     JobResult {
         job_target_id: job_target_id.to_owned(),
         status: JobStatus::Failed,
@@ -384,7 +455,7 @@ fn failed(job_target_id: &str, reason: &str, message: Option<String>) -> JobResu
     }
 }
 
-fn succeeded(job_target_id: &str, message: String) -> JobResult {
+pub(crate) fn succeeded(job_target_id: &str, message: String) -> JobResult {
     JobResult {
         job_target_id: job_target_id.to_owned(),
         status: JobStatus::Succeeded,
@@ -395,7 +466,7 @@ fn succeeded(job_target_id: &str, message: String) -> JobResult {
 }
 
 /// A platform error as a job result.
-fn platform_failure(job_target_id: &str, error: PlatformError) -> JobResult {
+pub(crate) fn platform_failure(job_target_id: &str, error: PlatformError) -> JobResult {
     let (reason, message) = match error {
         PlatformError::Unsupported(message) => (reason::UNSUPPORTED, message),
         PlatformError::NoUserSession(message) => (reason::NO_USER_SESSION, message),
@@ -406,7 +477,7 @@ fn platform_failure(job_target_id: &str, error: PlatformError) -> JobResult {
 
 /// What a job reports when it finds at its point of no return that it was
 /// cancelled on the way there. Normally the worker has already dropped it.
-fn cancelled(job_target_id: &str) -> JobResult {
+pub(crate) fn cancelled(job_target_id: &str) -> JobResult {
     failed(job_target_id, reason::CANCELLED, Some("cancelled while running".into()))
 }
 
@@ -451,6 +522,10 @@ async fn execute<P: Platform>(
         },
         job_kind::POWER => match parse::<PowerPayload>(id, payload) {
             Ok(payload) => return power(&jobs, platform, id, payload.action),
+            Err(result) => result,
+        },
+        job_kind::CLIENT_UPDATE => match parse(id, payload) {
+            Ok(payload) => return crate::update::install(&jobs, platform, &context, id, payload).await,
             Err(result) => result,
         },
         other => failed(
@@ -575,7 +650,7 @@ fn power<P: Platform>(jobs: &JobManager, platform: &P, id: &str, action: PowerAc
         PowerAction::Shutdown => "shutting down",
         PowerAction::Sleep => "going to sleep",
     };
-    Outcome { result: succeeded(id, message.into()), then: Some(action) }
+    Outcome::Finished { result: succeeded(id, message.into()), then: Some(action) }
 }
 
 fn validate_wifi_join(payload: &WifiJoinPayload) -> Result<(), String> {

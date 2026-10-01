@@ -32,6 +32,9 @@ pub struct Network {
     configured_url: Option<String>,
     path: Option<PathBuf>,
     override_url: Mutex<Option<String>>,
+    /// Base URL of the coordinator of the latest session, which may be the
+    /// hotspot's gateway rather than any configured URL.
+    session_url: Mutex<Option<String>>,
     status: watch::Sender<Status>,
     /// Wakes the connection loop for the two requests below.
     wake: Notify,
@@ -59,6 +62,7 @@ impl Network {
             configured_url,
             path,
             override_url: Mutex::new(file.coordinator_url),
+            session_url: Mutex::new(None),
             status: watch::Sender::new(Status { generation: 0, connected: false }),
             wake: Notify::new(),
             reconnect: AtomicBool::new(false),
@@ -99,8 +103,10 @@ impl Network {
         }
     }
 
-    /// A session has been established (`welcome` received).
-    pub fn mark_connected(&self) {
+    /// A session has been established (`welcome` received) with the
+    /// coordinator at `url`.
+    pub fn mark_connected(&self, url: &str) {
+        *self.session_url.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url.to_owned());
         // A coordinator was reached; an earlier request to search is moot.
         self.search.store(false, Ordering::SeqCst);
         self.status.send_modify(|status| {
@@ -111,6 +117,12 @@ impl Network {
 
     pub fn mark_disconnected(&self) {
         self.status.send_modify(|status| status.connected = false);
+    }
+
+    /// Base URL of the coordinator of the latest session, kept after the
+    /// session ends: `client.update` downloads from there.
+    pub fn session_url(&self) -> Option<String> {
+        self.session_url.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     /// Increases with every session established.
@@ -274,9 +286,11 @@ mod tests {
     #[tokio::test]
     async fn waiting_for_a_connection_needs_a_newer_session() {
         let network = Arc::new(Network::load(None, None).unwrap());
-        network.mark_connected();
+        assert_eq!(network.session_url(), None);
+        network.mark_connected(CONFIGURED);
         let before = network.generation();
         assert!(network.is_connected());
+        assert_eq!(network.session_url().as_deref(), Some(CONFIGURED));
         // The session that is already up does not count.
         let wait = tokio::time::timeout(Duration::from_millis(100), network.wait_for_connection_after(before));
         assert!(wait.await.is_err());
@@ -287,10 +301,12 @@ mod tests {
         });
         network.mark_disconnected();
         assert!(!network.is_connected());
-        network.mark_connected();
+        network.mark_connected(STORED);
         // Even a session that ended before the waiter looked counts.
         network.mark_disconnected();
         tokio::time::timeout(SOON, waiter).await.unwrap().unwrap();
+        // The latest session's coordinator, even after it ended.
+        assert_eq!(network.session_url().as_deref(), Some(STORED));
     }
 
     #[tokio::test]
@@ -329,7 +345,7 @@ mod tests {
 
         // A coordinator reached in the meantime makes the request moot.
         network.search_now();
-        network.mark_connected();
+        network.mark_connected(CONFIGURED);
         assert!(!network.start_round());
     }
 

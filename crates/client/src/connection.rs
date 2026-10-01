@@ -75,8 +75,8 @@ pub struct Attempt<'a> {
 
 /// Connects, authenticates and serves one session.
 pub async fn run(config: &ClientConfig, attempt: Attempt<'_>, shutdown: &CancellationToken) -> Ended {
-    let Attempt { url, network_info, system, jobs, network } = attempt;
-    let url = format!("{}{}", url.trim_end_matches('/'), protocol::CLIENT_WS_PATH);
+    let Attempt { url: base_url, network_info, system, jobs, network } = attempt;
+    let url = format!("{}{}", base_url.trim_end_matches('/'), protocol::CLIENT_WS_PATH);
     let handshake = async {
         let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
             .await
@@ -96,7 +96,7 @@ pub async fn run(config: &ClientConfig, attempt: Attempt<'_>, shutdown: &Cancell
     tracing::info!(%url, "connected to coordinator");
 
     let since = Instant::now();
-    network.mark_connected();
+    network.mark_connected(base_url);
     let ended = session(socket, heartbeat, jobs, network, shutdown).await;
     jobs.detach();
     network.mark_disconnected();
@@ -192,7 +192,18 @@ async fn session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                let _ = socket.close(None).await;
+                // What is already queued goes out first, such as the note of
+                // a `client.update` that is restarting the client; it is not
+                // replayed after the restart.
+                let flush = async {
+                    while let Ok(message) = outbound_rx.try_recv() {
+                        if send(&mut socket, &message).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = socket.close(None).await;
+                };
+                let _ = tokio::time::timeout(CLOSE_GRACE, flush).await;
                 return Ended::Shutdown;
             }
             // The device has moved to another network (or coordinator); this

@@ -680,6 +680,30 @@ pub(crate) fn quote_program(program: &Path) -> Result<String, PlatformError> {
     Ok(format!("\"{text}\""))
 }
 
+/// The shell's parser, which follows the same rules as the C runtime; for
+/// tests of command lines.
+#[cfg(test)]
+pub(crate) fn command_line_to_argv(line: &str) -> Vec<String> {
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+    let wide_line = wide(OsStr::new(line));
+    let mut count = 0;
+    // SAFETY: the returned array of `count` NUL-terminated strings is
+    // read and then freed with `LocalFree`, as documented.
+    unsafe {
+        let argv = CommandLineToArgvW(wide_line.as_ptr(), &mut count);
+        assert!(!argv.is_null());
+        let parsed = (0..count as usize)
+            .map(|i| {
+                let arg = *argv.add(i);
+                let length = (0..).take_while(|&j| *arg.add(j) != 0).count();
+                String::from_utf16(std::slice::from_raw_parts(arg, length)).unwrap()
+            })
+            .collect();
+        LocalFree(argv.cast());
+        parsed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,28 +752,6 @@ mod tests {
         let parsed = command_line_to_argv(&line);
         assert_eq!(parsed[0], r"C:\Fake\program.exe");
         assert_eq!(&parsed[1..], &arguments.map(String::from)[..], "command line {line}");
-    }
-
-    /// The shell's parser, which follows the same rules as the C runtime.
-    fn command_line_to_argv(line: &str) -> Vec<String> {
-        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
-        let wide_line = wide(OsStr::new(line));
-        let mut count = 0;
-        // SAFETY: the returned array of `count` NUL-terminated strings is
-        // read and then freed with `LocalFree`, as documented.
-        unsafe {
-            let argv = CommandLineToArgvW(wide_line.as_ptr(), &mut count);
-            assert!(!argv.is_null());
-            let parsed = (0..count as usize)
-                .map(|i| {
-                    let arg = *argv.add(i);
-                    let length = (0..).take_while(|&j| *arg.add(j) != 0).count();
-                    String::from_utf16(std::slice::from_raw_parts(arg, length)).unwrap()
-                })
-                .collect();
-            LocalFree(argv.cast());
-            parsed
-        }
     }
 
     #[test]

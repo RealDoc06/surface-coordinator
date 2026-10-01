@@ -7,11 +7,18 @@
 //! [`platform::Platform`].
 
 mod backoff;
+pub mod config;
 mod connection;
+#[cfg(windows)]
+pub mod install;
 mod jobs;
 mod ledger;
+pub mod logfile;
 mod network;
 pub mod platform;
+#[cfg(windows)]
+pub mod service;
+pub mod update;
 
 use std::future::Future;
 use std::io;
@@ -28,9 +35,19 @@ use tokio_util::sync::CancellationToken;
 pub use backoff::BackoffConfig;
 use backoff::Backoff;
 use connection::{Attempt, Ended};
-use jobs::{Job, JobManager, WorkerContext};
+use jobs::{Job, JobManager, UpdateContext, WorkerContext};
 use network::Network;
 use platform::{Platform, PlatformError, SystemInfo, WifiConnection, WifiJoinRequest};
+
+/// Exit code of a client stopping to be restarted, after `client.update`
+/// replaced its executable or put the previous one back. Not zero, so that
+/// the service manager's restart-on-failure starts it again.
+pub const RESTART_EXIT_CODE: i32 = 3;
+
+/// The public key client updates are verified against, from
+/// `release-keys/client-update.pub` at build time. Empty if the build had
+/// none: such a client refuses every update.
+pub const BUILT_IN_UPDATE_KEY: &str = env!("SC_CLIENT_UPDATE_PUBKEY");
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -62,6 +79,11 @@ pub struct ClientConfig {
     /// How long a `power` job waits for the coordinator to acknowledge its
     /// result before restarting, shutting down or suspending the device.
     pub power_ack_timeout: Duration,
+    /// Key that `client.update` signatures must verify against; normally
+    /// [`BUILT_IN_UPDATE_KEY`]. Empty refuses every update.
+    pub update_public_key: String,
+    /// Longest silence while downloading an update before giving up.
+    pub download_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -85,7 +107,17 @@ impl ClientConfig {
             handoff_timeout: Duration::from_secs(60),
             hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
             power_ack_timeout: Duration::from_secs(5),
+            update_public_key: BUILT_IN_UPDATE_KEY.to_owned(),
+            download_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// The configuration of a client keeping its state in `state_dir`.
+    pub fn from_settings(settings: config::Settings, state_dir: &Path) -> ClientConfig {
+        let config::Settings { coordinator_url, key_id, key_secret, device_id } = settings;
+        let mut config = ClientConfig::new(coordinator_url, key_id, key_secret, device_id);
+        config.state_dir = Some(state_dir.to_owned());
+        config
     }
 }
 
@@ -126,15 +158,38 @@ impl<P: Platform> Client<P> {
 
     /// Runs until `shutdown` is cancelled, reconnecting whenever the
     /// connection is lost and falling back to the hotspot when no
-    /// coordinator can be reached.
+    /// coordinator can be reached. Also returns, without connecting, when
+    /// an update is rolled back and the platform has been asked to restart
+    /// the client.
     pub async fn run(self, shutdown: CancellationToken) {
         let Client { config, platform, jobs, queue, network } = self;
+        let state_dir = config.state_dir.as_deref();
+        let completion =
+            match update::on_start(platform.as_ref(), &jobs, &config.client_version, state_dir).await {
+                update::Startup::Restart => return,
+                update::Startup::Continue(completion) => completion,
+            };
+        // An update in progress completes with the first handshake.
+        let completion = completion.map(|completion| {
+            let (platform, jobs, network) = (platform.clone(), jobs.clone(), network.clone());
+            tokio::spawn(async move {
+                network.wait_for_connection_after(0).await;
+                completion.complete(platform.as_ref(), &jobs).await;
+            })
+        });
+
         let system = platform.system_info();
         // Jobs keep running while the connection is down.
         let context = WorkerContext {
             network: network.clone(),
             handoff_timeout: config.handoff_timeout,
             power_ack_timeout: config.power_ack_timeout,
+            update: UpdateContext {
+                client_version: config.client_version.clone(),
+                public_key: config.update_public_key.clone(),
+                state_dir: config.state_dir.clone(),
+                download_timeout: config.download_timeout,
+            },
         };
         let worker = tokio::spawn(jobs::run_worker(jobs.clone(), platform.clone(), context, queue));
 
@@ -160,6 +215,9 @@ impl<P: Platform> Client<P> {
         // A job still running is cut short here; it is recorded as started,
         // so the next run reports it as interrupted.
         worker.abort();
+        if let Some(completion) = completion {
+            completion.abort();
+        }
     }
 }
 

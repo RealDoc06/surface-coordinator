@@ -1,5 +1,6 @@
 //! `job.cancel` against a fake coordinator and a fake platform: a waiting
-//! job never runs, a running script is stopped, anything else is ignored.
+//! job never runs, a running script is stopped, a job never received is
+//! settled as cancelled, anything else is ignored.
 
 mod common;
 
@@ -110,18 +111,43 @@ async fn a_running_script_is_stopped_and_reported_cancelled() {
 }
 
 #[tokio::test]
-async fn cancelling_an_unknown_or_finished_job_is_ignored() {
+async fn cancelling_a_job_never_received_reports_it_cancelled_and_it_never_runs() {
     let coordinator = FakeCoordinator::start().await;
     let platform = FakePlatform::new();
     let client = start_client(client_config(coordinator.addr), platform.clone());
     let (mut connection, _) = coordinator.accept().await;
 
-    connection.cancel("never-heard-of-it").await;
+    // The `job` message was lost; the coordinator still thinks it is out.
+    connection.cancel("lost-job").await;
+    let result = connection.expect_result("lost-job").await;
+    assert_cancelled(&result);
+    assert_eq!(result.message.as_deref(), Some("cancelled before it was received"));
+
+    // The copy sent later is a duplicate, also after a reconnect.
+    connection.send_script("lost-job", "out must never run").await;
     assert_eq!(connection.try_recv(QUIET).await, None);
+    connection.drop_abruptly();
+    let (mut again, _) = coordinator.accept().await;
+    // Replayed until acknowledged, without `job.started`.
+    assert_cancelled(&again.expect_result("lost-job").await);
+    again.ack("lost-job").await;
+    again.send_script("lost-job", "out must never run").await;
+    assert_eq!(again.try_recv(QUIET).await, None);
+    assert!(platform.runs().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_job_is_ignored() {
+    let coordinator = FakeCoordinator::start().await;
+    let platform = FakePlatform::new();
+    let client = start_client(client_config(coordinator.addr), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
 
     connection.send_script("t1", "out done").await;
     connection.expect_started("t1").await;
-    connection.expect_output("t1", 1, OutputStream::Stdout, "done\n").await;
+    connection.expect_output("t1", 1, OutputStream::Stdout, "done
+").await;
     assert_eq!(connection.expect_result("t1").await.status, JobStatus::Succeeded);
     // Finished but not yet acknowledged, then acknowledged.
     connection.cancel("t1").await;
