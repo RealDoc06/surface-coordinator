@@ -13,6 +13,7 @@ fn hello() -> Hello {
         client_version: "0.1.0".into(),
         key_id: "key-1".into(),
         nonce: "ab".repeat(32),
+        network: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn all_server_messages() -> Vec<ServerMessage> {
             payload: json!({"shell": "powershell", "body": "Get-Date", "timeout_secs": 60, "run_as": "system"}),
         },
         ServerMessage::JobResultAck { job_target_id: "t1".into() },
+        ServerMessage::JobCancel { job_target_id: "t1".into() },
     ]
 }
 
@@ -111,7 +113,7 @@ fn type_tags_on_the_wire() {
     let server: Vec<String> = all_server_messages().iter().map(|m| tag(m.to_json())).collect();
     assert_eq!(
         server,
-        ["challenge", "welcome", "reject", "heartbeat_ack", "job", "job.result_ack"]
+        ["challenge", "welcome", "reject", "heartbeat_ack", "job", "job.result_ack", "job.cancel"]
     );
 }
 
@@ -211,4 +213,25 @@ fn script_run_payload_defaults_and_shape() {
     assert_eq!(serde_json::from_value::<ScriptRunPayload>(value).unwrap(), full);
     // A shell this version does not know is a payload error.
     assert!(serde_json::from_value::<ScriptRunPayload>(json!({"shell": "bash", "body": "ls"})).is_err());
+}
+
+#[test]
+fn job_cancel_wire_shape() {
+    let value: Value =
+        serde_json::from_str(&ServerMessage::JobCancel { job_target_id: "t1".into() }.to_json()).unwrap();
+    assert_eq!(value, json!({"type": "job.cancel", "job_target_id": "t1"}));
+    assert_eq!(
+        ServerMessage::from_json(r#"{"type":"job.cancel","job_target_id":"t5","why":"operator"}"#).unwrap(),
+        ServerMessage::JobCancel { job_target_id: "t5".into() }
+    );
+    assert!(ServerMessage::from_json(r#"{"type":"job.cancel"}"#).is_err());
+}
+
+#[test]
+fn milestone_4_job_kinds_and_reasons_have_their_wire_names() {
+    assert_eq!(job_kind::APP_LAUNCH, "app.launch");
+    assert_eq!(job_kind::SETTING_APPLY, "setting.apply");
+    assert_eq!(job_kind::POWER, "power");
+    assert_eq!(protocol::reason::CANCELLED, "cancelled");
+    assert_eq!(protocol::reason::NO_USER_SESSION, "no_user_session");
 }

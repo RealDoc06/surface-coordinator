@@ -5,6 +5,8 @@
 //! unknown fields are ignored, so either side can be newer than the other.
 
 pub mod handshake;
+pub mod hotspot;
+pub mod settings;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,10 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// protocol change; a client reports kinds it does not know as `unsupported`.
 pub mod job_kind {
     pub const SCRIPT_RUN: &str = "script.run";
+    pub const WIFI_JOIN: &str = "wifi.join";
+    pub const APP_LAUNCH: &str = "app.launch";
+    pub const SETTING_APPLY: &str = "setting.apply";
+    pub const POWER: &str = "power";
 }
 
 /// Machine-readable reasons carried by a failed `job.result`.
@@ -41,6 +47,8 @@ pub mod reason {
     pub const INVALID_PAYLOAD: &str = "invalid_payload";
     pub const INTERRUPTED: &str = "interrupted";
     pub const ERROR: &str = "error";
+    pub const CANCELLED: &str = "cancelled";
+    pub const NO_USER_SESSION: &str = "no_user_session";
 }
 
 /// Reasons carried by `reject`.
@@ -99,6 +107,9 @@ pub enum ServerMessage {
     },
     #[serde(rename = "job.result_ack")]
     JobResultAck { job_target_id: String },
+    /// Stop this job target if it is still running, and report it cancelled.
+    #[serde(rename = "job.cancel")]
+    JobCancel { job_target_id: String },
     #[serde(other, rename = "unknown")]
     Unknown,
 }
@@ -135,6 +146,18 @@ pub struct Hello {
     /// Selects one of the coordinator's enrollment keys.
     pub key_id: String,
     pub nonce: String,
+    /// The network the device is on, if it knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkInfo>,
+}
+
+/// The Wi-Fi network a device is connected through.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +198,48 @@ pub struct ScriptRunPayload {
     pub timeout_secs: u64,
     #[serde(default)]
     pub run_as: RunAs,
+}
+
+/// Payload of a `wifi.join` job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiJoinPayload {
+    pub ssid: String,
+    /// Absent for an open network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Coordinator to use from now on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_url: Option<String>,
+}
+
+/// Payload of an `app.launch` job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLaunchPayload {
+    pub path: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+}
+
+/// Payload of a `power` job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PowerPayload {
+    pub action: PowerAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerAction {
+    Restart,
+    Shutdown,
+    Sleep,
+}
+
+/// Payload of a `setting.apply` job. `setting` is an id of the
+/// [`settings`] catalogue; `value` is checked with [`settings::validate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingApplyPayload {
+    pub setting: String,
+    pub value: serde_json::Value,
 }
 
 fn default_timeout_secs() -> u64 {

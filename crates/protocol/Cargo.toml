@@ -10,6 +10,7 @@ name = "protocol"
 
 [dependencies]
 hex.workspace = true
+hkdf.workspace = true
 hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
