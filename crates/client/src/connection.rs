@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use protocol::handshake::{self, Role};
-use protocol::{ClientMessage, Hello, ServerMessage};
+use protocol::{ClientMessage, Hello, NetworkInfo, ServerMessage};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -14,10 +14,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::jobs::{Job, JobManager};
+use crate::network::Network;
 use crate::platform::SystemInfo;
 use crate::ClientConfig;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// How a connection attempt ended.
 pub enum Ended {
@@ -59,23 +62,26 @@ async fn receive(socket: &mut Socket) -> Result<ServerMessage, String> {
     }
 }
 
+/// What one connection attempt needs besides the configuration.
+pub struct Attempt<'a> {
+    /// Base URL of the coordinator.
+    pub url: &'a str,
+    /// Reported in `hello`.
+    pub network_info: Option<NetworkInfo>,
+    pub system: &'a SystemInfo,
+    pub jobs: &'a JobManager,
+    pub network: &'a Network,
+}
+
 /// Connects, authenticates and serves one session.
-pub async fn run(
-    config: &ClientConfig,
-    system: &SystemInfo,
-    jobs: &JobManager,
-    shutdown: &CancellationToken,
-) -> Ended {
-    let url = format!(
-        "{}{}",
-        config.coordinator_url.trim_end_matches('/'),
-        protocol::CLIENT_WS_PATH
-    );
+pub async fn run(config: &ClientConfig, attempt: Attempt<'_>, shutdown: &CancellationToken) -> Ended {
+    let Attempt { url, network_info, system, jobs, network } = attempt;
+    let url = format!("{}{}", url.trim_end_matches('/'), protocol::CLIENT_WS_PATH);
     let handshake = async {
         let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
             .await
             .map_err(|error| format!("connect failed: {error}"))?;
-        let heartbeat = authenticate(config, system, &mut socket).await?;
+        let heartbeat = authenticate(config, system, network_info, &mut socket).await?;
         Ok::<_, String>((socket, heartbeat))
     };
     let connected = tokio::select! {
@@ -90,8 +96,10 @@ pub async fn run(
     tracing::info!(%url, "connected to coordinator");
 
     let since = Instant::now();
-    let ended = session(socket, heartbeat, jobs, shutdown).await;
+    network.mark_connected();
+    let ended = session(socket, heartbeat, jobs, network, shutdown).await;
     jobs.detach();
+    network.mark_disconnected();
     match ended {
         Ended::Lost { reason, .. } => Ended::Lost { reason, connected_for: Some(since.elapsed()) },
         Ended::Shutdown => Ended::Shutdown,
@@ -102,6 +110,7 @@ pub async fn run(
 async fn authenticate(
     config: &ClientConfig,
     system: &SystemInfo,
+    network: Option<NetworkInfo>,
     socket: &mut Socket,
 ) -> Result<Duration, String> {
     let client_nonce = handshake::generate_nonce();
@@ -113,6 +122,7 @@ async fn authenticate(
         client_version: config.client_version.clone(),
         key_id: config.key_id.clone(),
         nonce: client_nonce.clone(),
+        network,
     });
     send(socket, &hello).await?;
 
@@ -162,6 +172,7 @@ async fn session(
     mut socket: Socket,
     heartbeat: Duration,
     jobs: &JobManager,
+    network: &Network,
     shutdown: &CancellationToken,
 ) -> Ended {
     // Job messages reach this connection through the channel; attaching
@@ -178,6 +189,13 @@ async fn session(
             _ = shutdown.cancelled() => {
                 let _ = socket.close(None).await;
                 return Ended::Shutdown;
+            }
+            // The device has moved to another network (or coordinator); this
+            // connection may look alive for a while but leads nowhere.
+            _ = network.reconnect_requested() => {
+                // The old network may already be gone; do not hang on it.
+                let _ = tokio::time::timeout(CLOSE_GRACE, socket.close(None)).await;
+                return lost("reconnecting after a network change");
             }
             _ = ticker.tick() => {
                 if last_heard.elapsed() >= silence_limit {
@@ -205,6 +223,11 @@ async fn session(
                     }
                     ServerMessage::JobResultAck { job_target_id } => jobs.acknowledge(&job_target_id),
                     ServerMessage::HeartbeatAck => {}
+                    // Cancellation is not implemented by this client yet;
+                    // the job runs to its end and reports as usual.
+                    ServerMessage::JobCancel { job_target_id } => {
+                        tracing::debug!(%job_target_id, "ignoring job.cancel");
+                    }
                     // Handshake messages have no meaning here.
                     ServerMessage::Challenge { .. }
                     | ServerMessage::Welcome { .. }

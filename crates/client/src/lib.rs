@@ -1,34 +1,43 @@
 //! Surface Coordinator device agent.
 //!
 //! The core here is platform independent: it keeps one outbound WebSocket to
-//! the coordinator, reconnects with backoff, sends heartbeats and runs jobs.
-//! Anything that touches the operating system goes through
+//! the coordinator, reconnects with backoff, falls back to the manager's
+//! hotspot when no coordinator can be reached, sends heartbeats and runs
+//! jobs. Anything that touches the operating system goes through
 //! [`platform::Platform`].
 
 mod backoff;
 mod connection;
 mod jobs;
 mod ledger;
+mod network;
 pub mod platform;
 
+use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use protocol::NetworkInfo;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub use backoff::BackoffConfig;
 use backoff::Backoff;
-use connection::Ended;
-use jobs::{Job, JobManager};
-use platform::Platform;
+use connection::{Attempt, Ended};
+use jobs::{Job, JobManager, WorkerContext};
+use network::Network;
+use platform::{Platform, PlatformError, SystemInfo, WifiConnection, WifiJoinRequest};
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Base URL of the coordinator, `ws://host:port` or `wss://host`.
-    pub coordinator_url: String,
+    /// Without one the client looks for the manager's hotspot straight away.
+    /// A coordinator URL given by a `wifi.join` job takes precedence.
+    pub coordinator_url: Option<String>,
     pub key_id: String,
     /// The enrollment secret. Never sent; only used to compute MACs.
     pub key_secret: String,
@@ -39,17 +48,28 @@ pub struct ClientConfig {
     pub state_dir: Option<PathBuf>,
     pub backoff: BackoffConfig,
     pub handshake_timeout: Duration,
+    /// How long without a coordinator before the client starts searching
+    /// for the hotspot.
+    pub search_after: Duration,
+    /// While searching: time between rounds of trying the coordinator and
+    /// scanning.
+    pub search_interval: Duration,
+    /// How long a `wifi.join` waits for a coordinator on the new network
+    /// before going back.
+    pub handoff_timeout: Duration,
+    /// Port of the coordinator at the hotspot's gateway.
+    pub hotspot_port: u16,
 }
 
 impl ClientConfig {
     pub fn new(
-        coordinator_url: impl Into<String>,
+        coordinator_url: Option<String>,
         key_id: impl Into<String>,
         key_secret: impl Into<String>,
         device_id: impl Into<String>,
     ) -> ClientConfig {
         ClientConfig {
-            coordinator_url: coordinator_url.into(),
+            coordinator_url,
             key_id: key_id.into(),
             key_secret: key_secret.into(),
             device_id: device_id.into(),
@@ -57,6 +77,10 @@ impl ClientConfig {
             state_dir: None,
             backoff: BackoffConfig::default(),
             handshake_timeout: Duration::from_secs(10),
+            search_after: Duration::from_secs(60),
+            search_interval: Duration::from_secs(30),
+            handoff_timeout: Duration::from_secs(60),
+            hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
         }
     }
 }
@@ -85,41 +109,263 @@ pub struct Client<P: Platform> {
     platform: Arc<P>,
     jobs: JobManager,
     queue: mpsc::UnboundedReceiver<Job>,
+    network: Arc<Network>,
 }
 
 impl<P: Platform> Client<P> {
     pub fn new(config: ClientConfig, platform: Arc<P>) -> io::Result<Client<P>> {
-        let (jobs, queue) = JobManager::new(config.state_dir.as_deref())?;
-        Ok(Client { config, platform, jobs, queue })
+        let state_dir = config.state_dir.as_deref();
+        let (jobs, queue) = JobManager::new(state_dir)?;
+        let network = Arc::new(Network::load(config.coordinator_url.clone(), state_dir)?);
+        Ok(Client { config, platform, jobs, queue, network })
     }
 
     /// Runs until `shutdown` is cancelled, reconnecting whenever the
-    /// connection is lost.
+    /// connection is lost and falling back to the hotspot when no
+    /// coordinator can be reached.
     pub async fn run(self, shutdown: CancellationToken) {
-        let Client { config, platform, jobs, queue } = self;
+        let Client { config, platform, jobs, queue, network } = self;
         let system = platform.system_info();
         // Jobs keep running while the connection is down.
-        let worker = tokio::spawn(jobs::run_worker(jobs.clone(), platform, queue));
+        let context =
+            WorkerContext { network: network.clone(), handoff_timeout: config.handoff_timeout };
+        let worker = tokio::spawn(jobs::run_worker(jobs.clone(), platform.clone(), context, queue));
 
-        let mut backoff = Backoff::new(config.backoff.clone());
-        loop {
-            match connection::run(&config, &system, &jobs, &shutdown).await {
-                Ended::Shutdown => break,
-                Ended::Lost { reason, connected_for } => {
-                    if connected_for.is_some_and(|d| d >= config.backoff.stable_after) {
-                        backoff.reset();
-                    }
-                    let delay = backoff.next_delay();
-                    tracing::warn!(%reason, retry_in = ?delay, "not connected to coordinator");
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(delay) => {}
-                    }
-                }
-            }
+        match network.coordinator_url() {
+            Some(url) => tracing::info!(%url, "connecting to the coordinator"),
+            None => tracing::info!("no coordinator configured; looking for the hotspot"),
         }
+        let mut supervisor = Supervisor {
+            hotspot_ssid: protocol::hotspot::ssid(&config.key_id),
+            backoff: Backoff::new(config.backoff.clone()),
+            config: &config,
+            platform: platform.as_ref(),
+            system,
+            jobs: &jobs,
+            network: &network,
+            shutdown: &shutdown,
+            disconnected_since: Instant::now(),
+            search_requested: false,
+            searching: false,
+            wifi_unsupported_noted: false,
+        };
+        supervisor.run().await;
         // A job still running is cut short here; it is recorded as started,
         // so the next run reports it as interrupted.
         worker.abort();
     }
+}
+
+/// How one round of the network state machine ended.
+enum Round {
+    Shutdown,
+    /// A session was established and has ended.
+    HadSession,
+    /// No coordinator could be reached.
+    NotConnected,
+}
+
+/// The network state machine.
+///
+/// Each round tries, in this order and only until a session comes about:
+/// the coordinator (stored override, else configured); the coordinator at
+/// the gateway if the device is on the hotspot; and, while searching, the
+/// hotspot after scanning for and joining it. Nothing is scanned or joined
+/// while a session is up, so a working connection is never given up for the
+/// hotspot.
+struct Supervisor<'a, P: Platform> {
+    config: &'a ClientConfig,
+    platform: &'a P,
+    system: SystemInfo,
+    jobs: &'a JobManager,
+    network: &'a Network,
+    shutdown: &'a CancellationToken,
+    hotspot_ssid: String,
+    backoff: Backoff,
+    /// End of the last session, or the start of the client.
+    disconnected_since: Instant,
+    /// A failed handoff asked for a search; holds until the next session.
+    search_requested: bool,
+    /// Whether the last round was searching, to log changes only.
+    searching: bool,
+    /// Wi-Fi being unsupported is said once, not every round.
+    wifi_unsupported_noted: bool,
+}
+
+impl<P: Platform> Supervisor<'_, P> {
+    async fn run(&mut self) {
+        loop {
+            if self.network.start_round() {
+                self.search_requested = true;
+            }
+            let (round, searching) = self.round().await;
+            let delay = match round {
+                Round::Shutdown => return,
+                Round::NotConnected if searching => self.config.search_interval,
+                Round::HadSession | Round::NotConnected => self.backoff.next_delay(),
+            };
+            tracing::debug!(retry_in = ?delay, "waiting before the next attempt");
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+                // A handoff wants a new connection, or a search, now.
+                _ = self.network.interrupted() => {}
+            }
+        }
+    }
+
+    /// One round; also returns whether it was searching.
+    async fn round(&mut self) -> (Round, bool) {
+        // Asked once per round: for `hello`, and to see whether the device
+        // is on the hotspot.
+        let current = self.wifi_current().await;
+
+        if let Some(url) = self.network.coordinator_url() {
+            if let Some(round) = self.attempt(&url, network_info(current.as_ref())).await {
+                return (round, false);
+            }
+        }
+
+        let searching = self.searching();
+        if searching != self.searching {
+            self.searching = searching;
+            if searching {
+                tracing::info!(ssid = %self.hotspot_ssid, "no coordinator reachable; searching for the hotspot");
+            }
+        }
+
+        if let Some(on_hotspot) = current.filter(|c| c.ssid == self.hotspot_ssid) {
+            // Already there (joined earlier, or by hand): no need to scan.
+            let round = self.try_gateway(&on_hotspot).await;
+            return (round, searching);
+        }
+        if !searching {
+            return (Round::NotConnected, false);
+        }
+        let round = match self.join_hotspot().await {
+            Ok(Some(on_hotspot)) => self.try_gateway(&on_hotspot).await,
+            Ok(None) => Round::NotConnected,
+            Err(round) => round,
+        };
+        (round, true)
+    }
+
+    fn searching(&self) -> bool {
+        // A handoff in progress decides itself when to give up on the new
+        // network; searching meanwhile would pull the device back early.
+        if self.network.handoff_in_progress() {
+            return false;
+        }
+        self.network.coordinator_url().is_none()
+            || self.search_requested
+            || self.disconnected_since.elapsed() >= self.config.search_after
+    }
+
+    /// Connects to `url` and serves the session if one comes about. `None`
+    /// means the coordinator could not be reached.
+    async fn attempt(&mut self, url: &str, network_info: Option<NetworkInfo>) -> Option<Round> {
+        let attempt = Attempt {
+            url,
+            network_info,
+            system: &self.system,
+            jobs: self.jobs,
+            network: self.network,
+        };
+        match connection::run(self.config, attempt, self.shutdown).await {
+            Ended::Shutdown => Some(Round::Shutdown),
+            Ended::Lost { reason, connected_for: Some(lasted) } => {
+                tracing::warn!(%url, %reason, "connection to coordinator lost");
+                self.disconnected_since = Instant::now();
+                self.search_requested = false;
+                self.searching = false;
+                if lasted >= self.config.backoff.stable_after {
+                    self.backoff.reset();
+                }
+                Some(Round::HadSession)
+            }
+            Ended::Lost { reason, connected_for: None } => {
+                tracing::warn!(%url, %reason, "cannot reach coordinator");
+                None
+            }
+        }
+    }
+
+    async fn try_gateway(&mut self, on_hotspot: &WifiConnection) -> Round {
+        let Some(gateway) = on_hotspot.gateway else {
+            tracing::debug!("on the hotspot but without a gateway yet");
+            return Round::NotConnected;
+        };
+        // `SocketAddr` puts brackets around an IPv6 address.
+        let url = format!("ws://{}", SocketAddr::new(gateway, self.config.hotspot_port));
+        self.attempt(&url, network_info(Some(on_hotspot))).await.unwrap_or(Round::NotConnected)
+    }
+
+    /// Scans, and joins the hotspot if it is in range. Returns the
+    /// connection once on it; `Err` only on shutdown.
+    async fn join_hotspot(&mut self) -> Result<Option<WifiConnection>, Round> {
+        let network = self.network;
+        let _wifi = network.wifi_lock().await;
+        let visible = match self.unless_shutdown(self.platform.wifi_scan()).await? {
+            Ok(visible) => visible,
+            Err(error) => {
+                self.note_wifi_error("scanning for the hotspot", error);
+                return Ok(None);
+            }
+        };
+        if !visible.contains(&self.hotspot_ssid) {
+            tracing::debug!(ssid = %self.hotspot_ssid, "hotspot not in range");
+            return Ok(None);
+        }
+        tracing::info!(ssid = %self.hotspot_ssid, "hotspot in range; joining it");
+        let request = WifiJoinRequest {
+            ssid: self.hotspot_ssid.clone(),
+            passphrase: Some(protocol::hotspot::passphrase(&self.config.key_secret)),
+            // Windows must not prefer the hotspot later on its own.
+            auto_connect: false,
+        };
+        if let Err(error) = self.unless_shutdown(self.platform.wifi_join(request)).await? {
+            self.note_wifi_error("joining the hotspot", error);
+            return Ok(None);
+        }
+        let current = self.wifi_current().await;
+        Ok(current.filter(|c| c.ssid == self.hotspot_ssid))
+    }
+
+    /// Platform calls can take seconds; shutdown should not wait for them.
+    async fn unless_shutdown<T>(&self, operation: impl Future<Output = T>) -> Result<T, Round> {
+        tokio::select! {
+            _ = self.shutdown.cancelled() => Err(Round::Shutdown),
+            output = operation => Ok(output),
+        }
+    }
+
+    async fn wifi_current(&mut self) -> Option<WifiConnection> {
+        match self.platform.wifi_current().await {
+            Ok(current) => current,
+            Err(error) => {
+                self.note_wifi_error("querying the Wi-Fi connection", error);
+                None
+            }
+        }
+    }
+
+    fn note_wifi_error(&mut self, what: &str, error: PlatformError) {
+        match error {
+            PlatformError::Unsupported(message) => {
+                if !self.wifi_unsupported_noted {
+                    self.wifi_unsupported_noted = true;
+                    tracing::info!(%message, "Wi-Fi is not available; the client cannot fall back to the hotspot");
+                }
+            }
+            PlatformError::Failed(message) => tracing::warn!(%message, "{what} failed"),
+        }
+    }
+}
+
+/// What `hello` says about the network.
+fn network_info(current: Option<&WifiConnection>) -> Option<NetworkInfo> {
+    current.map(|connection| NetworkInfo {
+        ssid: Some(connection.ssid.clone()),
+        ip: connection.ip.map(|ip| ip.to_string()),
+    })
 }

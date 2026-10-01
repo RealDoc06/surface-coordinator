@@ -109,7 +109,7 @@ impl RunningClient {
     fn start(addr: SocketAddr, key_id: &str, secret: &str, state_dir: &Path) -> RunningClient {
         let device_id = client::load_or_create_device_id(state_dir).unwrap();
         let mut config =
-            ClientConfig::new(format!("ws://{addr}"), key_id, secret, device_id.clone());
+            ClientConfig::new(Some(format!("ws://{addr}")), key_id, secret, device_id.clone());
         config.state_dir = Some(state_dir.to_owned());
         config.backoff = BackoffConfig {
             initial: Duration::from_millis(50),

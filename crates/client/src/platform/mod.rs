@@ -7,6 +7,7 @@
 //! [`PlatformError::Unsupported`].
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use protocol::{OutputStream, RunAs, Shell};
@@ -54,6 +55,29 @@ pub enum PlatformError {
     Failed(String),
 }
 
+/// The Wi-Fi network the device is connected to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiConnection {
+    pub ssid: String,
+    /// The device's address on that network.
+    pub ip: Option<IpAddr>,
+    /// The network's gateway. On a manager's hotspot this is the manager.
+    pub gateway: Option<IpAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiJoinRequest {
+    pub ssid: String,
+    /// `None` for an open network.
+    pub passphrase: Option<String>,
+    /// Whether the device should come back to this network by itself later.
+    pub auto_connect: bool,
+}
+
+fn unsupported<T>(what: &str) -> Result<T, PlatformError> {
+    Err(PlatformError::Unsupported(format!("{what} is not supported on this platform")))
+}
+
 pub trait Platform: Send + Sync + 'static {
     fn system_info(&self) -> SystemInfo;
 
@@ -64,6 +88,30 @@ pub trait Platform: Send + Sync + 'static {
         request: ScriptRequest,
         output: mpsc::Sender<OutputChunk>,
     ) -> impl Future<Output = Result<ScriptOutcome, PlatformError>> + Send;
+
+    /// The SSIDs currently in range.
+    fn wifi_scan(&self) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
+        async { unsupported("scanning for Wi-Fi networks") }
+    }
+
+    /// Stores the network's profile and connects to it. Returns once the
+    /// device is associated, or with an error if it could not connect.
+    fn wifi_join(
+        &self,
+        request: WifiJoinRequest,
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async move {
+            let _ = request;
+            unsupported("joining a Wi-Fi network")
+        }
+    }
+
+    /// The current Wi-Fi connection, or `None` if not connected by Wi-Fi.
+    fn wifi_current(
+        &self,
+    ) -> impl Future<Output = Result<Option<WifiConnection>, PlatformError>> + Send {
+        async { unsupported("querying the Wi-Fi connection") }
+    }
 }
 
 /// Decodes a byte stream as UTF-8 piece by piece, holding back a multi-byte

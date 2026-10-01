@@ -15,8 +15,10 @@ mod console {
     #[command(name = "client", version, about = "Surface Coordinator device agent")]
     struct Cli {
         /// Coordinator base URL, e.g. ws://127.0.0.1:8080 or wss://coordinator.example.
+        /// Without it the client looks for the manager's hotspot. A URL
+        /// given later by a wifi.join job takes precedence.
         #[arg(long, env = "SC_COORDINATOR_URL")]
-        coordinator_url: String,
+        coordinator_url: Option<String>,
         /// Id of the enrollment key.
         #[arg(long, env = "SC_KEY_ID")]
         key_id: String,
@@ -24,7 +26,8 @@ mod console {
         /// keeps it out of the process list.
         #[arg(long, env = "SC_KEY_SECRET", hide_env_values = true)]
         key_secret: String,
-        /// Directory for the device id, the job ledger and running scripts.
+        /// Directory for the device id, the job ledger, the network state
+        /// and running scripts.
         #[arg(long, env = "SC_STATE_DIR")]
         state_dir: PathBuf,
         /// Log debug detail.
@@ -44,7 +47,7 @@ mod console {
             ClientConfig::new(cli.coordinator_url, cli.key_id, cli.key_secret, device_id.clone());
         config.state_dir = Some(cli.state_dir.clone());
         let platform = Arc::new(WindowsPlatform::new(cli.state_dir.join("scripts")));
-        let client = Client::new(config, platform).context("cannot open the job ledger")?;
+        let client = Client::new(config, platform).context("cannot open the client state")?;
 
         tracing::info!(%device_id, "client starting");
         let shutdown = CancellationToken::new();

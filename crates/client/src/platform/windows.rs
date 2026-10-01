@@ -17,7 +17,10 @@ use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, Get
 
 use super::{
     OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo, Utf8Decoder,
+    WifiConnection, WifiJoinRequest,
 };
+
+mod wifi;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// How long output is still collected after the script itself has ended.
@@ -234,6 +237,27 @@ impl Platform for WindowsPlatform {
         }
         outcome
     }
+
+    async fn wifi_scan(&self) -> Result<Vec<String>, PlatformError> {
+        blocking(wifi::scan).await
+    }
+
+    async fn wifi_join(&self, request: WifiJoinRequest) -> Result<(), PlatformError> {
+        blocking(move || wifi::join(request)).await
+    }
+
+    async fn wifi_current(&self) -> Result<Option<WifiConnection>, PlatformError> {
+        blocking(wifi::current).await
+    }
+}
+
+/// Runs a blocking Wi-Fi call off the async worker threads.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, PlatformError> + Send + 'static,
+) -> Result<T, PlatformError> {
+    tokio::task::spawn_blocking(call)
+        .await
+        .unwrap_or_else(|error| Err(PlatformError::Failed(format!("Wi-Fi call failed: {error}"))))
 }
 
 #[cfg(test)]
@@ -382,6 +406,37 @@ mod tests {
         assert_eq!(script.extension().and_then(|e| e.to_str()), Some("ps1"));
         assert!(!script.exists());
         assert_eq!(std::fs::read_dir(run.work_dir.path()).unwrap().count(), 0);
+    }
+
+    // Read-only calls against the real adapter. Whether this machine has
+    // Wi-Fi is unknown, so either a result or `Unsupported` is fine; joining
+    // for real is on the manual checklist and never done here.
+
+    #[tokio::test]
+    async fn wifi_current_answers_on_this_machine() {
+        let platform = WindowsPlatform::new(std::env::temp_dir());
+        match platform.wifi_current().await {
+            Ok(current) => eprintln!("current Wi-Fi connection: {current:?}"),
+            Err(PlatformError::Unsupported(message)) => eprintln!("no Wi-Fi: {message}"),
+            Err(error) => panic!("querying the Wi-Fi connection failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wifi_scan_answers_on_this_machine() {
+        let platform = WindowsPlatform::new(std::env::temp_dir());
+        match platform.wifi_scan().await {
+            Ok(ssids) => {
+                eprintln!("networks in range: {ssids:?}");
+                assert!(ssids.iter().all(|ssid| !ssid.is_empty()));
+                let mut unique = ssids.clone();
+                unique.sort();
+                unique.dedup();
+                assert_eq!(unique.len(), ssids.len(), "duplicates in {ssids:?}");
+            }
+            Err(PlatformError::Unsupported(message)) => eprintln!("no Wi-Fi: {message}"),
+            Err(error) => panic!("scanning failed: {error}"),
+        }
     }
 
     #[test]

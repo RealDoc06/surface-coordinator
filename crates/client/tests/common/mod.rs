@@ -2,13 +2,15 @@
 //! platform whose scripts are controlled by the test.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::platform::{
     OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo,
+    WifiConnection, WifiJoinRequest,
 };
 use client::{BackoffConfig, Client, ClientConfig};
 use futures_util::{SinkExt, StreamExt};
@@ -40,14 +42,77 @@ pub const WAIT: Duration = Duration::from_secs(5);
 /// - `fail <text>`: fail with an error
 ///
 /// A script that runs off its end exits with 0.
+///
+/// Wi-Fi is unsupported unless the platform is made with
+/// [`FakePlatform::with_wifi`]; then the test decides which networks are in
+/// range, which one the device is on and how joining each one turns out.
 pub struct FakePlatform {
     runs: Mutex<Vec<ScriptRequest>>,
     gate: Semaphore,
+    wifi: Mutex<FakeWifi>,
+}
+
+#[derive(Default)]
+struct FakeWifi {
+    supported: bool,
+    visible: Vec<String>,
+    current: Option<WifiConnection>,
+    /// On success the device is then on the given connection.
+    outcomes: HashMap<String, Result<WifiConnection, PlatformError>>,
+    scans: Vec<Instant>,
+    joins: Vec<WifiJoinRequest>,
 }
 
 impl FakePlatform {
     pub fn new() -> Arc<FakePlatform> {
-        Arc::new(FakePlatform { runs: Mutex::new(Vec::new()), gate: Semaphore::new(0) })
+        Arc::new(FakePlatform {
+            runs: Mutex::new(Vec::new()),
+            gate: Semaphore::new(0),
+            wifi: Mutex::new(FakeWifi::default()),
+        })
+    }
+
+    /// A platform with Wi-Fi: nothing in range and not connected until the
+    /// test says otherwise.
+    pub fn with_wifi() -> Arc<FakePlatform> {
+        let platform = FakePlatform::new();
+        platform.wifi.lock().unwrap().supported = true;
+        platform
+    }
+
+    pub fn set_visible(&self, ssids: &[&str]) {
+        self.wifi.lock().unwrap().visible = ssids.iter().map(|s| s.to_string()).collect();
+    }
+
+    pub fn set_current(&self, current: Option<WifiConnection>) {
+        self.wifi.lock().unwrap().current = current;
+    }
+
+    pub fn current(&self) -> Option<WifiConnection> {
+        self.wifi.lock().unwrap().current.clone()
+    }
+
+    /// What joining `ssid` does. Joining a network without an outcome fails.
+    pub fn on_join(&self, ssid: &str, outcome: Result<WifiConnection, PlatformError>) {
+        self.wifi.lock().unwrap().outcomes.insert(ssid.to_owned(), outcome);
+    }
+
+    /// When each scan happened.
+    pub fn scans(&self) -> Vec<Instant> {
+        self.wifi.lock().unwrap().scans.clone()
+    }
+
+    pub fn joins(&self) -> Vec<WifiJoinRequest> {
+        self.wifi.lock().unwrap().joins.clone()
+    }
+
+    fn wifi_supported(&self) -> Result<std::sync::MutexGuard<'_, FakeWifi>, PlatformError> {
+        let wifi = self.wifi.lock().unwrap();
+        if wifi.supported {
+            Ok(wifi)
+        } else {
+            Err(PlatformError::Unsupported("no Wi-Fi on this fake".into()))
+        }
     }
 
     /// Requests seen so far, in order.
@@ -90,6 +155,39 @@ impl Platform for FakePlatform {
         }
         Ok(ScriptOutcome::Exited(0))
     }
+
+    async fn wifi_scan(&self) -> Result<Vec<String>, PlatformError> {
+        let mut wifi = self.wifi_supported()?;
+        wifi.scans.push(Instant::now());
+        Ok(wifi.visible.clone())
+    }
+
+    async fn wifi_join(&self, request: WifiJoinRequest) -> Result<(), PlatformError> {
+        let mut wifi = self.wifi_supported()?;
+        wifi.joins.push(request.clone());
+        match wifi.outcomes.get(&request.ssid).cloned() {
+            Some(Ok(connection)) => {
+                wifi.current = Some(connection);
+                Ok(())
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(PlatformError::Failed(format!("{} is not in range", request.ssid))),
+        }
+    }
+
+    async fn wifi_current(&self) -> Result<Option<WifiConnection>, PlatformError> {
+        Ok(self.wifi_supported()?.current.clone())
+    }
+}
+
+/// A Wi-Fi connection whose gateway is this machine, so that a
+/// [`FakeCoordinator`] can play the coordinator at the gateway.
+pub fn wifi_on(ssid: &str) -> WifiConnection {
+    WifiConnection {
+        ssid: ssid.to_owned(),
+        ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 137, 23))),
+        gateway: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    }
 }
 
 // ------------------------------------------------------------ client
@@ -106,9 +204,12 @@ impl RunningClient {
     }
 }
 
+/// Configuration with short timings. Without Wi-Fi on the platform the
+/// network fallback never gets anywhere, so only the coordinator at `addr`
+/// matters.
 pub fn client_config(addr: SocketAddr) -> ClientConfig {
     ClientConfig {
-        coordinator_url: format!("ws://{addr}"),
+        coordinator_url: Some(format!("ws://{addr}")),
         key_id: KEY_ID.into(),
         key_secret: SECRET.into(),
         device_id: DEVICE_ID.into(),
@@ -120,6 +221,42 @@ pub fn client_config(addr: SocketAddr) -> ClientConfig {
             stable_after: Duration::from_secs(30),
         },
         handshake_timeout: Duration::from_secs(5),
+        search_after: Duration::from_millis(300),
+        search_interval: Duration::from_millis(100),
+        handoff_timeout: Duration::from_millis(700),
+        hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
+    }
+}
+
+/// A coordinator that cannot be reached: it hangs up on every connection
+/// at once. A closed port would do too, but on Windows a refused connection
+/// to localhost takes about two seconds, which would hide the timing under
+/// test.
+pub struct Unreachable {
+    pub addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl Unreachable {
+    pub async fn start() -> Unreachable {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        Unreachable { addr, task }
+    }
+
+    pub fn url(&self) -> String {
+        format!("ws://{}", self.addr)
+    }
+}
+
+impl Drop for Unreachable {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 

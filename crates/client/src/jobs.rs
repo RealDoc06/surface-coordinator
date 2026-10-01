@@ -11,12 +11,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use protocol::{
-    job_kind, reason, ClientMessage, JobResult, JobStatus, ScriptRunPayload, MAX_OUTPUT_BYTES,
+    job_kind, reason, ClientMessage, JobResult, JobStatus, ScriptRunPayload, WifiJoinPayload,
+    MAX_OUTPUT_BYTES,
 };
 use tokio::sync::mpsc;
 
 use crate::ledger::Ledger;
-use crate::platform::{OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest};
+use crate::network::Network;
+use crate::platform::{
+    OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, WifiJoinRequest,
+};
+
+/// Longest SSID 802.11 allows, in bytes.
+const MAX_SSID_BYTES: usize = 32;
 
 /// A job as received from the coordinator.
 #[derive(Debug, Clone)]
@@ -168,10 +175,19 @@ impl JobManager {
     }
 }
 
+/// What jobs need beyond the platform.
+#[derive(Clone)]
+pub struct WorkerContext {
+    pub network: Arc<Network>,
+    /// How long a `wifi.join` waits for a coordinator on the new network.
+    pub handoff_timeout: Duration,
+}
+
 /// Runs queued jobs one at a time until the queue closes.
 pub async fn run_worker<P: Platform>(
     jobs: JobManager,
     platform: Arc<P>,
+    context: WorkerContext,
     mut queue: mpsc::UnboundedReceiver<Job>,
 ) {
     while let Some(job) = queue.recv().await {
@@ -179,7 +195,7 @@ pub async fn run_worker<P: Platform>(
         jobs.begin(&id);
         // In its own task so that a panic in a platform implementation
         // fails the job instead of ending the worker.
-        let task = tokio::spawn(execute(jobs.clone(), platform.clone(), job));
+        let task = tokio::spawn(execute(jobs.clone(), platform.clone(), context.clone(), job));
         let result = match task.await {
             Ok(result) => result,
             Err(error) => failed(&id, reason::ERROR, Some(format!("job task failed: {error}"))),
@@ -198,9 +214,24 @@ fn failed(job_target_id: &str, reason: &str, message: Option<String>) -> JobResu
     }
 }
 
-async fn execute<P: Platform>(jobs: JobManager, platform: Arc<P>, job: Job) -> JobResult {
+async fn execute<P: Platform>(
+    jobs: JobManager,
+    platform: Arc<P>,
+    context: WorkerContext,
+    job: Job,
+) -> JobResult {
     let id = job.job_target_id.as_str();
     match job.kind.as_str() {
+        job_kind::WIFI_JOIN => {
+            let payload: WifiJoinPayload = match serde_json::from_value(job.payload) {
+                Ok(payload) => payload,
+                Err(error) => return failed(id, reason::INVALID_PAYLOAD, Some(error.to_string())),
+            };
+            if let Err(problem) = validate_wifi_join(&payload) {
+                return failed(id, reason::INVALID_PAYLOAD, Some(problem));
+            }
+            wifi_join(platform.as_ref(), &context, id, payload).await
+        }
         job_kind::SCRIPT_RUN => {
             let payload: ScriptRunPayload = match serde_json::from_value(job.payload) {
                 Ok(payload) => payload,
@@ -264,5 +295,98 @@ async fn run_script<P: Platform>(
         }
         Err(PlatformError::Unsupported(message)) => failed(id, reason::UNSUPPORTED, Some(message)),
         Err(PlatformError::Failed(message)) => failed(id, reason::ERROR, Some(message)),
+    }
+}
+
+fn validate_wifi_join(payload: &WifiJoinPayload) -> Result<(), String> {
+    if payload.ssid.is_empty() {
+        return Err("the SSID is empty".into());
+    }
+    if payload.ssid.len() > MAX_SSID_BYTES {
+        return Err(format!("the SSID is longer than {MAX_SSID_BYTES} bytes"));
+    }
+    if let Some(url) = &payload.coordinator_url {
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+            return Err(format!("the coordinator URL {url:?} does not start with ws:// or wss://"));
+        }
+    }
+    Ok(())
+}
+
+/// Wi-Fi handoff: join the network, then reach a coordinator from it within
+/// the handoff timeout, or go back to where the device came from.
+///
+/// The result is not sent on the current session (that is closed on
+/// purpose) but through the ledger, to whichever coordinator the client
+/// reaches next.
+async fn wifi_join<P: Platform>(
+    platform: &P,
+    context: &WorkerContext,
+    id: &str,
+    payload: WifiJoinPayload,
+) -> JobResult {
+    let network = &context.network;
+    let ssid = payload.ssid;
+    let previous = network.override_url();
+    let handoff = network.begin_handoff();
+
+    let request = WifiJoinRequest {
+        ssid: ssid.clone(),
+        passphrase: payload.password,
+        // The operator chose this network for good.
+        auto_connect: true,
+    };
+    let joined = {
+        let _wifi = network.wifi_lock().await;
+        platform.wifi_join(request).await
+    };
+    match joined {
+        Ok(()) => {}
+        // Still on the old network, nothing changed.
+        Err(PlatformError::Unsupported(message)) => return failed(id, reason::UNSUPPORTED, Some(message)),
+        Err(PlatformError::Failed(message)) => return failed(id, reason::ERROR, Some(message)),
+    }
+    tracing::info!(%ssid, "joined Wi-Fi network; reconnecting");
+
+    // Only sessions established after the join count: one that came up
+    // while the join was under way may still be on the old network.
+    let before = network.generation();
+    if let Some(url) = payload.coordinator_url {
+        network.set_override(Some(url));
+    }
+    network.reconnect_now();
+
+    let timeout = context.handoff_timeout;
+    match tokio::time::timeout(timeout, network.wait_for_connection_after(before)).await {
+        Ok(()) => JobResult {
+            job_target_id: id.to_owned(),
+            status: JobStatus::Succeeded,
+            exit_code: None,
+            reason: None,
+            message: Some(format!("joined {ssid}")),
+        },
+        Err(_) => {
+            tracing::warn!(%ssid, "no coordinator reached on the new network; going back");
+            network.set_override(previous);
+            drop(handoff);
+            // Searching rejoins the hotspot if it is still there.
+            network.search_now();
+            failed(
+                id,
+                reason::TIMEOUT,
+                Some(format!(
+                    "no coordinator could be reached on {ssid} within {}",
+                    describe(timeout)
+                )),
+            )
+        }
+    }
+}
+
+fn describe(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{} s", duration.as_secs())
+    } else {
+        format!("{} ms", duration.as_millis())
     }
 }
