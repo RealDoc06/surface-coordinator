@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/RealDoc06/surface-coordinator"
+
+[workspace.dependencies]
+protocol = { package = "surface-coordinator-protocol", path = "crates/protocol" }
+coordinator-core = { path = "crates/coordinator-core" }
+
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "process", "io-util", "fs"] }
+tokio-tungstenite = "0.28"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
