@@ -249,3 +249,92 @@ With `control: 'manual'`, `start` records the key and returns `state: 'on'`
 with the SSID, passphrase and instructions; the operator turns the hotspot on
 themselves. Devices enrolled with that key find the SSID, join it and connect
 to the embedded coordinator on `client_port`.
+
+## Milestone 4 additions
+
+### More job kinds
+
+```ts
+type CreateJob =
+  | { kind: 'script.run'; payload: ScriptRun; targets: Targets }
+  | { kind: 'wifi.join'; payload: WifiJoin; targets: Targets }
+  | { kind: 'app.launch'; payload: { path: string; arguments?: string[] }; targets: Targets }
+  | { kind: 'setting.apply'; payload: { setting: string; value: boolean | number | string }; targets: Targets }
+  | { kind: 'power'; payload: { action: 'restart' | 'shutdown' | 'sleep' }; targets: Targets }
+type Targets =
+  | { type: 'all' }
+  | { type: 'devices'; device_ids: string[] }
+  | { type: 'group'; group_id: string }      // members at the time of creation
+```
+
+`app.launch`: `path` 1..1024 characters, at most 64 arguments of at most 1024
+characters each. `setting.apply`: `setting` must be a catalogue id and `value`
+must satisfy its type. Violations are `400 invalid_payload`; an unknown group
+is `400 unknown_group`; an empty group is `400 no_targets`.
+
+New failure reasons on targets: `cancelled`, `no_user_session`.
+
+### Cancel
+
+`POST /jobs/{id}/cancel` → `200 {job: Job}` (targets without output); `404`.
+Queued targets become `failed` with reason `cancelled` at once. For `sent`
+and `running` targets the device is told to stop; the target becomes
+`failed`/`cancelled` when the device confirms, or at once if the device is
+offline. Finished targets are untouched. Each change is announced with
+`job.target.updated`.
+
+### Settings catalogue
+
+`GET /settings-catalogue` → `{settings: Setting[]}`
+
+```ts
+type Setting = {
+  id: string
+  label: string
+  description: string
+  scope: 'machine' | 'user'           // user: needs someone logged in on the device
+  value:
+    | { type: 'bool' }
+    | { type: 'integer'; min: number; max: number; unit: string }
+    | { type: 'text'; max_len: number }
+}
+```
+
+### Groups
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /groups` | | `{groups: Group[]}` ordered by name |
+| `POST /groups` | `{name}` | `201 {group}`; `400 invalid_name` (1..64 characters after trimming); `409 name_taken` (case-insensitive) |
+| `PATCH /groups/{id}` | `{name}` | `200 {group}`; `400`, `404`, `409` as above |
+| `DELETE /groups/{id}` | | `204`; `404` |
+| `PUT /groups/{id}/members` | `{device_ids: string[]}` | `200 {group}`; replaces the membership; `400 unknown_device`; `404` |
+
+```ts
+type Group = { id: string; name: string; created_at: number; device_ids: string[] }
+```
+
+`Device` gains `group_ids: string[]`. Group changes are announced with
+`{type: 'groups.changed'}` (refetch groups and devices). Forgetting a device
+removes it from its groups.
+
+### Script library
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /scripts` | | `{scripts: Script[]}` ordered by name |
+| `POST /scripts` | `{name, shell, body}` | `201 {script}`; `400 invalid_script` (name 1..100 characters, body non-empty and at most 256 KiB, shell powershell or cmd); `409 name_taken` |
+| `PUT /scripts/{id}` | `{name, shell, body}` | `200 {script}`; `400`, `404`, `409`; `403 built_in` for built-in scripts |
+| `DELETE /scripts/{id}` | | `204`; `404`; `403 built_in` |
+
+```ts
+type Script = {
+  id: string
+  name: string
+  shell: 'powershell' | 'cmd'
+  body: string
+  built_in: boolean
+  created_at: number
+  updated_at: number
+}
+```
