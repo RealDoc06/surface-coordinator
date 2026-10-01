@@ -28,6 +28,11 @@ export function DevicesPage() {
     navigate('/run', { state: request })
   }
 
+  function onMove(targets: TargetSpec) {
+    const request: ComposeRequest = { targets }
+    navigate('/wifi', { state: request })
+  }
+
   return (
     <>
       <div className="page-head">
@@ -45,6 +50,7 @@ export function DevicesPage() {
           now={now}
           initialSelected={initialSelection(location.state)}
           onRun={onRun}
+          onMove={onMove}
         />
       ) : (
         <p className="muted">Loading devices&hellip;</p>

@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import type { JobOutputEvent, Rejected } from '../api/types'
 import { device, job, target } from '../test/helpers'
 import {
+  appendOutput,
   applyEvent,
+  codePointLength,
   initialState,
   listedJobs,
   mergeBuffered,
+  mergeBufferedEvents,
   reducer,
   type Action,
   type State,
@@ -17,6 +20,11 @@ function run(state: State, ...actions: Action[]): State {
 
 function output(targetId: string, data: string, truncated = false): JobOutputEvent {
   return { type: 'job.output', job_id: 'j1', job_target_id: targetId, data, truncated }
+}
+
+/** An event from a coordinator that sends offsets. */
+function outputAt(targetId: string, offset: number, data: string, truncated = false): JobOutputEvent {
+  return { ...output(targetId, data, truncated), offset }
 }
 
 function rejected(id: number): Rejected {
@@ -114,6 +122,94 @@ describe('job output', () => {
   })
 })
 
+describe('job output offsets', () => {
+  it('counts code points, not UTF-16 code units', () => {
+    expect(codePointLength('')).toBe(0)
+    expect(codePointLength('abc')).toBe(3)
+    expect(codePointLength('héllo ✓')).toBe(7)
+    // U+1F600 is one code point but two UTF-16 code units.
+    expect('😀'.length).toBe(2)
+    expect(codePointLength('😀')).toBe(1)
+    expect(codePointLength('a😀𝄞b')).toBe(4)
+    // A lone surrogate is a unit of its own rather than half of a pair.
+    expect(codePointLength('�')).toBe(1)
+    expect(codePointLength('�x')).toBe(2)
+  })
+
+  it('appends an event that starts exactly at the end of the output held', () => {
+    expect(appendOutput('abc', { data: 'd', offset: 3 })).toBe('abcd')
+    expect(appendOutput('', { data: 'a', offset: 0 })).toBe('a')
+  })
+
+  it('ignores an event that starts before the end of the output held', () => {
+    expect(appendOutput('abc', { data: 'c', offset: 2 })).toBeNull()
+    expect(appendOutput('abc', { data: 'abc', offset: 0 })).toBeNull()
+  })
+
+  it('measures the output held in code points when comparing with the offset', () => {
+    const held = '😀😀' // 2 code points, 4 UTF-16 code units
+    expect(appendOutput(held, { data: 'x', offset: 2 })).toBe(held + 'x')
+    expect(appendOutput(held, { data: '😀', offset: 1 })).toBeNull()
+    expect(appendOutput(held, { data: 'y', offset: 2 })).toBe(held + 'y')
+  })
+
+  it('applies live events by offset: duplicates are ignored, the rest appended in order', () => {
+    // The job was loaded with "héllo " (6 code points, one of them non-ASCII).
+    let state = withLoadedJob({ t1: 'héllo ' })
+    state = applyEvent(state, outputAt('t1', 3, 'lo ')) // already in the loaded output
+    state = applyEvent(state, outputAt('t1', 6, '😀')) // new
+    state = applyEvent(state, outputAt('t1', 7, 'w')) // new, after an astral character
+    state = applyEvent(state, outputAt('t1', 6, '😀')) // delivered twice
+    expect(state.outputs.t1?.text).toBe('héllo 😀w')
+  })
+
+  it('does not take truncation from an ignored event', () => {
+    let state = withLoadedJob({ t1: 'abcdef' })
+    state = applyEvent(state, outputAt('t1', 2, 'cdef', true))
+    expect(state.outputs.t1).toEqual({ text: 'abcdef', truncated: false })
+  })
+
+  it('places events that crossed the load by offset, even when the content repeats', () => {
+    // Stored output at the time of the response: "a". The event at offset 1 is
+    // new and has the same content; matching by content would drop it.
+    const state = run(
+      initialState,
+      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'event', event: outputAt('t1', 1, 'a') },
+      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: 'a' })]) },
+    )
+    expect(state.outputs.t1?.text).toBe('aa')
+  })
+
+  it('drops buffered events the response already contains, counting astral characters', () => {
+    const stored = '😀😀b' // 3 code points
+    const state = run(
+      initialState,
+      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'event', event: outputAt('t1', 1, '😀b') }, // included
+      { type: 'event', event: outputAt('t1', 3, 'c') }, // new
+      { type: 'event', event: outputAt('t1', 4, 'd') }, // new
+      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: stored })]) },
+      { type: 'event', event: outputAt('t1', 5, 'e') },
+    )
+    expect(state.outputs.t1?.text).toBe(stored + 'cde')
+  })
+
+  it('merges buffered events by offset only when all of them have one', () => {
+    expect(mergeBufferedEvents('abc', [{ data: 'c', offset: 2 }, { data: 'd', offset: 3 }])).toBe('abcd')
+    // Without offsets the old rule applies: leading chunks the output ends with are included.
+    expect(mergeBufferedEvents('abc', [{ data: 'c' }, { data: 'd' }])).toBe('abcd')
+    expect(mergeBufferedEvents('a', [{ data: 'a' }])).toBe('a')
+  })
+
+  it('still appends events without offsets (a coordinator older than milestone 3)', () => {
+    let state = withLoadedJob({ t1: 'x' })
+    state = applyEvent(state, output('t1', 'y'))
+    state = applyEvent(state, output('t1', 'y'))
+    expect(state.outputs.t1?.text).toBe('xyy')
+  })
+})
+
 describe('mergeBuffered', () => {
   it('appends chunks the stored output does not contain', () => {
     expect(mergeBuffered('abc', ['d', 'e'])).toBe('abcde')
@@ -176,6 +272,17 @@ describe('events', () => {
     })
     state = applyEvent(state, { type: 'device.removed', device_id: 'a' })
     expect(state.jobs.j1?.targets.map((t) => t.id)).toEqual(['t2'])
+  })
+
+  it('removes a job that is left without any device', () => {
+    let state = applyEvent(initialState, {
+      type: 'job.created',
+      job: job('only-a', [target('t1', 'a')]),
+    })
+    state = applyEvent(state, { type: 'job.created', job: job('both', [target('t2', 'a'), target('t3', 'b')]) })
+    state = applyEvent(state, { type: 'device.removed', device_id: 'a' })
+    expect(Object.keys(state.jobs)).toEqual(['both'])
+    expect(state.jobs.both?.targets.map((t) => t.id)).toEqual(['t3'])
   })
 
   it('adds created jobs and updates their targets', () => {

@@ -7,6 +7,7 @@ import type {
   CreateJob,
   Device,
   DeviceTarget,
+  Hotspot,
   Job,
   Key,
   KeyWithSecret,
@@ -128,6 +129,11 @@ export const api = {
     request<{ id: string; secret: string }>('GET', `/enrollment-keys/${seg(id)}/secret`),
   revokeKey: (id: string) => request<void>('POST', `/enrollment-keys/${seg(id)}/revoke`),
 
+  // Hotspot (served by the manager; only when capabilities.hotspot)
+  getHotspot: () => request<Hotspot>('GET', '/manager/hotspot'),
+  startHotspot: (keyId: string) => request<Hotspot>('POST', '/manager/hotspot/start', { key_id: keyId }),
+  stopHotspot: () => request<Hotspot>('POST', '/manager/hotspot/stop'),
+
   // Rejected connection attempts
   listRejected: () => request<{ rejected: Rejected[] }>('GET', '/rejected-connections'),
 }
@@ -147,6 +153,7 @@ const MESSAGES: Record<string, string> = {
   no_targets: 'The job has no target devices.',
   invalid_key: 'The key id or secret is not valid.',
   key_exists: 'An enrollment key with that id already exists.',
+  key_revoked: 'That enrollment key has been revoked. Choose another one.',
   unauthorized: 'You are no longer signed in.',
   network_error: 'Could not reach the coordinator.',
 }

@@ -17,13 +17,14 @@ const devices: Device[] = [
 
 function setup(props: Partial<Parameters<typeof DeviceList>[0]> = {}) {
   const onRun = vi.fn<(targets: TargetSpec) => void>()
+  const onMove = vi.fn<(targets: TargetSpec) => void>()
   const user = userEvent.setup()
   render(
     <MemoryRouter>
-      <DeviceList devices={devices} keyLabels={{ 'key-1': 'Classroom' }} now={NOW} onRun={onRun} {...props} />
+      <DeviceList devices={devices} keyLabels={{ 'key-1': 'Classroom' }} now={NOW} onRun={onRun} onMove={onMove} {...props} />
     </MemoryRouter>,
   )
-  return { onRun, user }
+  return { onRun, onMove, user }
 }
 
 const checkbox = (hostname: string) => screen.getByRole('checkbox', { name: `Select ${hostname}` })
@@ -134,5 +135,55 @@ describe('DeviceList', () => {
     expect(screen.getByRole('link', { name: 'Enrollment keys' })).toHaveAttribute('href', '/keys')
     expect(screen.getByText(/--key-id/)).toBeInTheDocument()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  describe('network column', () => {
+    const networked: Device[] = [
+      device('n1', { hostname: 'WIFI-01', network: { ssid: 'Classroom WiFi', ip: '192.168.4.20' } }),
+      device('n2', { hostname: 'WIRED-01', network: { ssid: null, ip: '10.0.0.7' } }),
+      device('n3', { hostname: 'SILENT-01', network: { ssid: null, ip: null } }),
+      device('n4', { hostname: 'OLD-01' }),
+    ]
+
+    it('shows the SSID with the address beside it and as a tooltip', () => {
+      setup({ devices: networked })
+      expect(screen.getByRole('columnheader', { name: 'Network' })).toBeInTheDocument()
+      const row = screen.getByRole('row', { name: /WIFI-01/ })
+      expect(within(row).getByText('Classroom WiFi')).toBeInTheDocument()
+      expect(within(row).getByText('192.168.4.20')).toBeInTheDocument()
+      expect(within(row).getByTitle('Classroom WiFi (192.168.4.20)')).toBeInTheDocument()
+    })
+
+    it('shows just the address when there is no SSID', () => {
+      setup({ devices: networked })
+      const row = screen.getByRole('row', { name: /WIRED-01/ })
+      expect(within(row).getByText('10.0.0.7')).toBeInTheDocument()
+    })
+
+    it('shows a dash when the device reported nothing, or the coordinator does not send it', () => {
+      setup({ devices: networked })
+      for (const name of [/SILENT-01/, /OLD-01/]) {
+        const cells = within(screen.getByRole('row', { name })).getAllByRole('cell')
+        // check, status, hostname, OS, network
+        expect(cells[4]).toHaveTextContent('—')
+      }
+    })
+  })
+
+  describe('moving to Wi-Fi', () => {
+    it('moves exactly the selected devices', async () => {
+      const { onMove, user } = setup()
+      expect(screen.getByRole('button', { name: /^Move to Wi-Fi/ })).toBeDisabled()
+      await user.click(checkbox('LAB-01'))
+      await user.click(checkbox('OFFICE-02'))
+      await user.click(screen.getByRole('button', { name: /^Move to Wi-Fi/ }))
+      expect(onMove).toHaveBeenCalledWith({ type: 'devices', device_ids: ['a1', 'b2'] })
+    })
+
+    it('moves all devices', async () => {
+      const { onMove, user } = setup()
+      await user.click(screen.getByRole('button', { name: /^Move all to Wi-Fi/ }))
+      expect(onMove).toHaveBeenCalledWith({ type: 'all' })
+    })
   })
 })

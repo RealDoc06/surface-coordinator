@@ -9,7 +9,7 @@
 // `eval` awaits promises and prints the JSON result.
 import fs from 'node:fs';
 
-const [port, command, argument] = process.argv.slice(2);
+const [port, command, argument, argument2] = process.argv.slice(2);
 
 async function target() {
   const deadline = Date.now() + 20000;
@@ -48,6 +48,14 @@ const send = (method, params = {}) =>
     socket.send(JSON.stringify({ id, method, params }));
   });
 
+// Emulation only lasts as long as this connection, so to look at a page in the
+// other colour scheme: CDP_MEDIA=light node scripts/cdp.mjs 9444 screenshot x.png
+if (process.env.CDP_MEDIA) {
+  await send('Emulation.setEmulatedMedia', {
+    features: [{ name: 'prefers-color-scheme', value: process.env.CDP_MEDIA }],
+  });
+}
+
 if (command === 'eval') {
   const reply = await send('Runtime.evaluate', {
     expression: argument,
@@ -66,8 +74,77 @@ if (command === 'eval') {
   console.log(`saved ${argument}`);
 } else if (command === 'url') {
   console.log(page.url);
+} else if (command === 'click') {
+  // Real mouse click on the centre of the first element matching a CSS
+  // selector, or (with "text=Some label") the first button/link/label whose
+  // text is exactly that.
+  const found = await send('Runtime.evaluate', {
+    expression: `(() => {
+      const spec = ${JSON.stringify(argument)};
+      let el;
+      if (spec.startsWith('text=')) {
+        const text = spec.slice(5);
+        el = [...document.querySelectorAll('button, a, label, summary, [role=button]')]
+          .find((e) => e.textContent.replace(/\\s+/g, ' ').trim() === text);
+      } else {
+        el = document.querySelector(spec);
+      }
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()`,
+    returnByValue: true,
+  });
+  const at = found.result?.result?.value;
+  if (!at) {
+    console.error(`no element for ${argument}`);
+    process.exitCode = 1;
+  } else {
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: 'left', clickCount: 1 });
+    }
+    console.log('clicked');
+  }
+} else if (command === 'type') {
+  // Focus the element matching the selector, replace its content, type the text.
+  const focused = await send('Runtime.evaluate', {
+    expression: `(() => {
+      const el = document.querySelector(${JSON.stringify(argument)});
+      if (!el) return false;
+      el.focus();
+      el.select?.();
+      return true;
+    })()`,
+    returnByValue: true,
+  });
+  if (!focused.result?.result?.value) {
+    console.error(`no element for ${argument}`);
+    process.exitCode = 1;
+  } else {
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+    await send('Input.insertText', { text: argument2 ?? '' });
+    console.log('typed');
+  }
+} else if (command === 'key') {
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: argument, code: argument, windowsVirtualKeyCode: argument === 'Enter' ? 13 : 0, text: argument === 'Enter' ? '\r' : undefined });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key: argument, code: argument, windowsVirtualKeyCode: argument === 'Enter' ? 13 : 0 });
+  console.log('pressed');
+} else if (command === 'media') {
+  // media light|dark: emulate prefers-color-scheme.
+  await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: argument }] });
+  console.log(`prefers-color-scheme: ${argument}`);
+} else if (command === 'clearcookies') {
+  await send('Network.clearBrowserCookies');
+  console.log('cookies cleared');
+} else if (command === 'goto') {
+  await send('Page.navigate', { url: argument });
+  console.log(`navigated to ${argument}`);
 } else {
-  console.error('usage: cdp.mjs <port> eval <expression> | screenshot <file> | url');
+  console.error(
+    'usage: cdp.mjs <port> eval <expression> | screenshot <file> | url | click <selector|text=Label> | type <selector> <text> | key <Enter|Escape|...> | media <light|dark> | goto <url> | clearcookies',
+  );
   process.exitCode = 1;
 }
 socket.close();

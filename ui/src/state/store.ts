@@ -136,11 +136,58 @@ function storeJob(jobs: Record<string, Job>, job: Job): Job {
 }
 
 /**
+ * Length of a string in Unicode code points. JavaScript counts UTF-16 code
+ * units, so a character outside the Basic Multilingual Plane (an emoji, say)
+ * is 2 there and 1 here, which is how the coordinator counts offsets.
+ */
+export function codePointLength(text: string): number {
+  let count = 0
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i)
+    if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) i++
+    }
+    count++
+  }
+  return count
+}
+
+/**
+ * Appends the data of an output event to output held as `text`, following the
+ * contract: an event whose `offset` (code points of stored output before it)
+ * is below what is already held is ignored, the rest is appended. Returns
+ * null for an ignored event. Events without an offset (a coordinator older
+ * than the offset field) are always appended; callers that can see them
+ * arrive around a load use `mergeBuffered` instead.
+ */
+export function appendOutput(text: string, event: Pick<JobOutputEvent, 'data' | 'offset'>): string | null {
+  if (event.offset !== undefined && event.offset < codePointLength(text)) return null
+  return text + event.data
+}
+
+/**
  * Joins output loaded over HTTP with the output events that arrived while
- * that request was in flight. The events have no offsets, so the ones the
+ * that request was in flight.
+ *
+ * With offsets this is exact: events starting before the end of the loaded
+ * output are already in it. Without them (an older coordinator) the ones the
  * response already contains are recognised by content: the longest run of
  * leading chunks that the stored output ends with is taken as included.
  */
+export function mergeBufferedEvents(stored: string, events: Pick<JobOutputEvent, 'data' | 'offset'>[]): string {
+  if (events.every((e) => e.offset !== undefined)) {
+    let text = stored
+    for (const event of events) text = appendOutput(text, event) ?? text
+    return text
+  }
+  return mergeBuffered(
+    stored,
+    events.map((e) => e.data),
+  )
+}
+
+/** The heuristic for events without offsets; see `mergeBufferedEvents`. */
 export function mergeBuffered(stored: string, chunks: string[]): string {
   for (let k = chunks.length; k > 0; k--) {
     if (stored.endsWith(chunks.slice(0, k).join(''))) {
@@ -195,12 +242,16 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
       delete devices[id]
       const deviceTargets = { ...state.deviceTargets }
       delete deviceTargets[id]
-      // The coordinator forgets the device's job history with it.
+      // The coordinator forgets the device's job history with it, and a job
+      // left without any device is gone from its lists altogether.
       const jobs: Record<string, Job> = {}
       for (const [jobId, job] of Object.entries(state.jobs)) {
-        jobs[jobId] = job.targets.some((t) => t.device_id === id)
-          ? { ...job, targets: job.targets.filter((t) => t.device_id !== id) }
-          : job
+        if (!job.targets.some((t) => t.device_id === id)) {
+          jobs[jobId] = job
+          continue
+        }
+        const targets = job.targets.filter((t) => t.device_id !== id)
+        if (targets.length > 0) jobs[jobId] = { ...job, targets }
       }
       return { ...state, devices, deviceTargets, jobs }
     }
@@ -263,15 +314,16 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
       }
       const current = state.outputs[event.job_target_id]
       if (current) {
-        next = {
-          ...next,
-          outputs: {
-            ...next.outputs,
-            [event.job_target_id]: {
-              text: current.text + event.data,
-              truncated: current.truncated || event.truncated,
+        const text = appendOutput(current.text, event)
+        // An event that starts before the end of what is held is already in it.
+        if (text !== null) {
+          next = {
+            ...next,
+            outputs: {
+              ...next.outputs,
+              [event.job_target_id]: { text, truncated: current.truncated || event.truncated },
             },
-          },
+          }
         }
       }
       return next
@@ -401,10 +453,7 @@ export function reducer(state: State, action: Action): State {
       for (const target of job.targets) {
         const chunks = pending.events.filter((e) => e.job_target_id === target.id)
         outputs[target.id] = {
-          text: mergeBuffered(
-            target.output ?? '',
-            chunks.map((c) => c.data),
-          ),
+          text: mergeBufferedEvents(target.output ?? '', chunks),
           truncated: target.output_truncated || chunks.some((c) => c.truncated),
         }
       }

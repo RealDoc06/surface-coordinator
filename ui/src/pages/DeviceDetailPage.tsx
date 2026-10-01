@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError, errorMessage } from '../api/client'
 import { ErrorNote, StateBadge, StatusDot } from '../components/bits'
+import { NetworkCell } from '../components/DeviceList'
 import { ConfirmDialog } from '../components/Modal'
 import { formatDateTime, relativeTime, useNow } from '../lib/format'
 import { jobKindLabel, jobPreview } from '../lib/jobKinds'
@@ -93,6 +94,9 @@ function DeviceDetail({ id }: { id: string }) {
         <button type="button" className="primary" onClick={() => navigate('/run', { state: runRequest })}>
           Run script on this device
         </button>
+        <button type="button" onClick={() => navigate('/wifi', { state: runRequest })}>
+          Move to Wi-Fi&hellip;
+        </button>
         <button type="button" className="danger" onClick={() => setConfirming(true)}>
           Forget device
         </button>
@@ -112,6 +116,12 @@ function DeviceDetail({ id }: { id: string }) {
           <div>
             <dt>Client version</dt>
             <dd>{device.client_version}</dd>
+          </div>
+          <div>
+            <dt>Network</dt>
+            <dd>
+              <NetworkCell network={device.network} />
+            </dd>
           </div>
           <div>
             <dt>Enrollment key</dt>

@@ -4,10 +4,19 @@
 
 import type { Device, ScriptRun, TargetSpec } from '../api/types'
 
-/** What a page passes to the composer through router state. */
+/** What the Wi-Fi form starts from (`Run again`); the password is never known. */
+export type WifiPrefill = {
+  ssid?: string
+  coordinator_url?: string
+  /** The job being repeated had a password, which the server does not give back. */
+  passwordNeeded?: boolean
+}
+
+/** What a page passes to a job form (composer, Wi-Fi) through router state. */
 export type ComposeRequest = {
   targets?: TargetSpec
   payload?: Partial<ScriptRun>
+  wifi?: WifiPrefill
 }
 
 export type ResolvedTargets = {
@@ -57,7 +66,7 @@ export function parseTargetSpec(value: unknown): TargetSpec | null {
 /** Router state is untyped and survives reloads; read it defensively. */
 export function parseComposeRequest(value: unknown): ComposeRequest {
   if (typeof value !== 'object' || value === null) return {}
-  const raw = value as { targets?: unknown; payload?: unknown }
+  const raw = value as { targets?: unknown; payload?: unknown; wifi?: unknown }
   const request: ComposeRequest = {}
   const targets = parseTargetSpec(raw.targets)
   if (targets) request.targets = targets
@@ -69,6 +78,14 @@ export function parseComposeRequest(value: unknown): ComposeRequest {
     if (typeof p.timeout_secs === 'number') payload.timeout_secs = p.timeout_secs
     if (p.run_as === 'system' || p.run_as === 'user') payload.run_as = p.run_as
     request.payload = payload
+  }
+  if (typeof raw.wifi === 'object' && raw.wifi !== null) {
+    const w = raw.wifi as Record<string, unknown>
+    const wifi: WifiPrefill = {}
+    if (typeof w.ssid === 'string') wifi.ssid = w.ssid
+    if (typeof w.coordinator_url === 'string') wifi.coordinator_url = w.coordinator_url
+    if (w.passwordNeeded === true) wifi.passwordNeeded = true
+    request.wifi = wifi
   }
   return request
 }

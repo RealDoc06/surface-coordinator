@@ -6,9 +6,11 @@ import { DeviceDetailPage } from './pages/DeviceDetailPage'
 import { DevicesPage } from './pages/DevicesPage'
 import { JobDetailPage } from './pages/JobDetailPage'
 import { JobsPage } from './pages/JobsPage'
+import { HotspotPage } from './pages/HotspotPage'
 import { KeysPage } from './pages/KeysPage'
 import { LoginPage, TokenNotice } from './pages/LoginPage'
 import { RejectedPage } from './pages/RejectedPage'
+import { WifiPage } from './pages/WifiPage'
 import { SessionProvider, useSessionContext } from './session/SessionProvider'
 import { StoreProvider } from './state/StoreProvider'
 
@@ -60,9 +62,11 @@ function Gate() {
             <Route path="/" element={<DevicesPage />} />
             <Route path="/devices/:id" element={<DeviceDetailPage />} />
             <Route path="/run" element={<ComposePage />} />
+            <Route path="/wifi" element={<WifiPage />} />
             <Route path="/jobs" element={<JobsPage />} />
             <Route path="/jobs/:id" element={<JobDetailPage />} />
             <Route path="/keys" element={<KeysPage />} />
+            <Route path="/hotspot" element={<HotspotPage />} />
             <Route path="/rejected" element={<RejectedPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
             <Route path="*" element={<NotFound />} />

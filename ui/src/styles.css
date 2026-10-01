@@ -808,3 +808,38 @@ fieldset.choice label {
     transition: background-color 0.1s, filter 0.1s;
   }
 }
+
+/* Wi-Fi form and hotspot page */
+
+.notice.warning {
+  background: var(--red-soft);
+  color: var(--text);
+  border-color: var(--red);
+  margin: 0 0 14px;
+}
+
+.notice.warning p {
+  margin: 6px 0;
+}
+
+.input-wide {
+  width: 100%;
+  max-width: 440px;
+}
+
+.steps {
+  margin: 8px 0 12px;
+  padding-left: 22px;
+}
+
+.steps li {
+  margin-bottom: 4px;
+}
+
+.network-ip {
+  margin-left: 2px;
+}
+
+.panel > .hint {
+  margin: 8px 0;
+}

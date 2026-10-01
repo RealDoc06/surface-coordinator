@@ -266,6 +266,49 @@ describe('live updates', () => {
     expect(pane.textContent).toBe('first\nsecond\nthird\n[truncated]')
   })
 
+  it('places live output by offset, ignoring what the loaded output already holds', async () => {
+    const { server, user, socket } = await start()
+    // Two code points of emoji: 4 UTF-16 code units, but offset 2.
+    server.jobs.j1 = job('j1', [target('t1', 'a', { state: 'running', started_at: 6000, output: '\u{1F600}\u{1F600}' })])
+
+    await user.click(screen.getByRole('link', { name: 'Jobs' }))
+    await user.click(await screen.findByRole('link', { name: 'Get-Date' }))
+    const pane = await screen.findByLabelText('Output of LAB-01')
+    await waitFor(() => expect(pane.textContent).toBe('\u{1F600}\u{1F600}'))
+
+    const event = { type: 'job.output', job_id: 'j1', job_target_id: 't1', truncated: false }
+    act(() => {
+      socket.send({ ...event, offset: 1, data: '\u{1F600}' }) // already shown
+      socket.send({ ...event, offset: 2, data: 'a' })
+      socket.send({ ...event, offset: 2, data: 'a' }) // delivered twice
+      socket.send({ ...event, offset: 3, data: 'b' })
+    })
+    expect(pane.textContent).toBe('\u{1F600}\u{1F600}ab')
+  })
+
+  it('shows a job as gone when its last device is forgotten while it is open', async () => {
+    const { server, user, socket } = await start()
+    server.jobs.j1 = job('j1', [target('t1', 'a', { state: 'succeeded', exit_code: 0, started_at: 6000, finished_at: 7000 })])
+
+    await user.click(screen.getByRole('link', { name: 'Jobs' }))
+    await user.click(await screen.findByRole('link', { name: 'Get-Date' }))
+    await screen.findByLabelText('Output of LAB-01')
+
+    act(() => socket.send({ type: 'device.removed', device_id: 'a' }))
+    expect(await screen.findByText('Job not found')).toBeInTheDocument()
+  })
+
+  it('drops a job from the list when its last device is forgotten', async () => {
+    const { server, user, socket } = await start()
+    server.jobs.j1 = job('j1', [target('t1', 'a')])
+    await user.click(screen.getByRole('link', { name: 'Jobs' }))
+    await screen.findByRole('link', { name: 'Get-Date' })
+
+    act(() => socket.send({ type: 'device.removed', device_id: 'a' }))
+    expect(screen.queryByRole('link', { name: 'Get-Date' })).not.toBeInTheDocument()
+    expect(screen.getByText('No jobs yet')).toBeInTheDocument()
+  })
+
   it('returns to the login form when the session has expired', async () => {
     const { server, socket } = await start()
     server.session = { ...server.session, authenticated: false, account: null }

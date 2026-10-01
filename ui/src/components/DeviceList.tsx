@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { Device, TargetSpec } from '../api/types'
 import { formatDateTime, plural, relativeTime, shortId } from '../lib/format'
+import { describeNetwork } from '../lib/wifi'
 import { StatusDot } from './bits'
 
 type StatusFilter = 'all' | 'online' | 'offline'
@@ -15,6 +16,20 @@ type Props = {
   initialSelected?: string[]
   /** The user asked to run something on these targets. */
   onRun: (targets: TargetSpec) => void
+  /** The user asked to move these targets to another Wi-Fi network. */
+  onMove: (targets: TargetSpec) => void
+}
+
+/** The network a device reported: SSID with its address beside it, or a dash. */
+export function NetworkCell({ network }: { network: Device['network'] }) {
+  const { primary, secondary, title } = describeNetwork(network)
+  if (primary === null) return <span className="muted">&mdash;</span>
+  return (
+    <span title={title}>
+      {primary}
+      {secondary ? <span className="muted mono network-ip"> {secondary}</span> : null}
+    </span>
+  )
 }
 
 export function matchesFilter(device: Device, text: string, status: StatusFilter): boolean {
@@ -26,7 +41,7 @@ export function matchesFilter(device: Device, text: string, status: StatusFilter
 }
 
 /** The device table with its filters and the selection that jobs are run on. */
-export function DeviceList({ devices, keyLabels, now, initialSelected, onRun }: Props) {
+export function DeviceList({ devices, keyLabels, now, initialSelected, onRun, onMove }: Props) {
   const [text, setText] = useState('')
   const [status, setStatus] = useState<StatusFilter>('all')
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set(initialSelected))
@@ -126,8 +141,18 @@ export function DeviceList({ devices, keyLabels, now, initialSelected, onRun }: 
         >
           Run script&hellip;
         </button>
+        <button
+          type="button"
+          disabled={selectedIds.length === 0}
+          onClick={() => onMove({ type: 'devices', device_ids: selectedIds })}
+        >
+          Move to Wi-Fi&hellip;
+        </button>
         <button type="button" onClick={() => onRun({ type: 'all' })}>
           Run on all devices
+        </button>
+        <button type="button" onClick={() => onMove({ type: 'all' })}>
+          Move all to Wi-Fi&hellip;
         </button>
       </div>
 
@@ -147,6 +172,7 @@ export function DeviceList({ devices, keyLabels, now, initialSelected, onRun }: 
             <th className="col-status">Status</th>
             <th>Hostname</th>
             <th>OS</th>
+            <th>Network</th>
             <th>Client</th>
             <th>Last seen</th>
             <th>Enrollment key</th>
@@ -170,6 +196,9 @@ export function DeviceList({ devices, keyLabels, now, initialSelected, onRun }: 
                 <Link to={`/devices/${encodeURIComponent(device.id)}`}>{device.hostname || shortId(device.id)}</Link>
               </td>
               <td>{device.os}</td>
+              <td>
+                <NetworkCell network={device.network} />
+              </td>
               <td>{device.client_version}</td>
               <td title={formatDateTime(device.last_seen_at)}>
                 {device.online ? 'now' : relativeTime(device.last_seen_at, now)}
@@ -185,7 +214,7 @@ export function DeviceList({ devices, keyLabels, now, initialSelected, onRun }: 
           ))}
           {shown.length === 0 ? (
             <tr>
-              <td colSpan={7} className="table-empty">
+              <td colSpan={8} className="table-empty">
                 No devices match the filter ({plural(devices.length, 'device')} in total).
               </td>
             </tr>

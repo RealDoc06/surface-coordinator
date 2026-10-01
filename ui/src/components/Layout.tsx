@@ -29,6 +29,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </NavLink>
           <NavLink to="/jobs">Jobs</NavLink>
           <NavLink to="/keys">Enrollment keys</NavLink>
+          {session.capabilities.hotspot ? <NavLink to="/hotspot">Hotspot</NavLink> : null}
           <NavLink to="/rejected">
             Rejected connections
             {state.rejectedUnseen > 0 ? (

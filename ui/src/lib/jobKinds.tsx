@@ -1,10 +1,10 @@
 // Everything that depends on the kind of a job lives here, behind switches on
-// `job.kind`. A new kind (app.launch, setting.apply, power, wifi.join,
-// client.update) adds a case to each function; unknown kinds already render
+// `job.kind`. A new kind (app.launch, setting.apply, power, client.update) adds a case to each function; unknown kinds already render
 // generically, so an older UI keeps working against a newer coordinator.
 
 import type { ReactNode } from 'react'
 import type { Job, ScriptRun } from '../api/types'
+import { asWifiJoin } from './wifi'
 import type { ComposeRequest } from './targets'
 
 export const DEFAULT_TIMEOUT_SECS = 300
@@ -34,6 +34,8 @@ export function jobKindLabel(kind: string): string {
   switch (kind) {
     case 'script.run':
       return 'Script'
+    case 'wifi.join':
+      return 'Wi-Fi'
     default:
       return kind
   }
@@ -50,6 +52,11 @@ export function jobPreview(job: Pick<Job, 'kind' | 'payload'>): string {
     case 'script.run': {
       const script = asScriptRun(job.payload)
       if (script) return firstLine(script.body)
+      break
+    }
+    case 'wifi.join': {
+      const wifi = asWifiJoin(job.payload)
+      if (wifi) return `Join Wi-Fi ${wifi.ssid}`
       break
     }
   }
@@ -90,6 +97,36 @@ export function JobPayload({ job }: { job: Pick<Job, 'kind' | 'payload'> }): Rea
       }
       break
     }
+    case 'wifi.join': {
+      const wifi = asWifiJoin(job.payload)
+      if (wifi) {
+        return (
+          <dl className="fields">
+            <div>
+              <dt>Network (SSID)</dt>
+              <dd>{wifi.ssid}</dd>
+            </div>
+            <div>
+              <dt>Password</dt>
+              <dd>
+                {wifi.password === undefined ? (
+                  <span className="muted">none (open network)</span>
+                ) : (
+                  <span className="mono" title="The coordinator does not keep the password in readable form.">
+                    {wifi.password}
+                  </span>
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt>Coordinator from then on</dt>
+              <dd>{wifi.coordinator_url ? <span className="mono">{wifi.coordinator_url}</span> : <span className="muted">unchanged</span>}</dd>
+            </div>
+          </dl>
+        )
+      }
+      break
+    }
   }
   return (
     <pre className="code" aria-label="Payload">
@@ -98,19 +135,29 @@ export function JobPayload({ job }: { job: Pick<Job, 'kind' | 'payload'> }): Rea
   )
 }
 
+/** Where "Run again" goes, and what to open that page with. */
+export type Rerun = { path: string; state: ComposeRequest }
+
 /**
- * What to open the composer with to run this job again, or null when the UI
- * has no composer for its kind.
+ * How to run this job again, or null when the UI has no form for its kind.
+ * A wifi.join job comes back with the form filled in except for the password:
+ * the coordinator only returns `********`, so it has to be entered again.
  */
-export function rerunRequest(job: Job): ComposeRequest | null {
+export function rerunRequest(job: Job): Rerun | null {
+  const targets = { type: 'devices' as const, device_ids: [...new Set(job.targets.map((t) => t.device_id))] }
   switch (job.kind) {
     case 'script.run': {
       const payload = asScriptRun(job.payload)
       if (!payload) return null
-      return {
-        payload,
-        targets: { type: 'devices', device_ids: [...new Set(job.targets.map((t) => t.device_id))] },
-      }
+      return { path: '/run', state: { payload, targets } }
+    }
+    case 'wifi.join': {
+      const wifi = asWifiJoin(job.payload)
+      if (!wifi) return null
+      const prefill: NonNullable<ComposeRequest['wifi']> = { ssid: wifi.ssid }
+      if (wifi.coordinator_url) prefill.coordinator_url = wifi.coordinator_url
+      if (wifi.password !== undefined) prefill.passwordNeeded = true
+      return { path: '/wifi', state: { wifi: prefill, targets } }
     }
     default:
       return null

@@ -89,9 +89,10 @@ function JobDetail({ id }: { id: string }) {
   const job = state.jobs[id]
   const finished = job ? job.targets.filter((t) => isTerminal(t.state)).length : 0
 
-  // Output events carry no offsets, so one that crossed a load in flight could
-  // in rare cases be misplaced. When a device finishes, read back what the
-  // coordinator stored so the final output is exactly that.
+  // Events from a coordinator that sends no output offsets are placed by
+  // content when they cross a load in flight, which can rarely misplace one.
+  // When a device finishes, read back what the coordinator stored so the final
+  // output is exactly that (with offsets this is only a cheap confirmation).
   useEffect(() => {
     if (status === 'ready' && finished > finishedSeen.current) {
       finishedSeen.current = finished
@@ -99,7 +100,8 @@ function JobDetail({ id }: { id: string }) {
     }
   }, [finished, status, load])
 
-  if (status === 'missing') {
+  // Also when the job was there and is gone: its last device was forgotten.
+  if (status === 'missing' || (status === 'ready' && !job)) {
     return (
       <div className="empty">
         <h2>Job not found</h2>
@@ -132,7 +134,7 @@ function JobDetail({ id }: { id: string }) {
         <span className="toolbar-spacer" />
         <StateCounts targets={job.targets} />
         {rerun ? (
-          <button type="button" onClick={() => navigate('/run', { state: rerun })}>
+          <button type="button" onClick={() => navigate(rerun.path, { state: rerun.state })}>
             Run again
           </button>
         ) : null}
