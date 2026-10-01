@@ -370,7 +370,10 @@ async fn handle_message(
                     )
                 })
                 .await
-                .map(|known| known.then_some(ServerMessage::JobResultAck { job_target_id: target_id }))
+                // Acknowledged even if nothing changed, including for targets
+                // this coordinator does not know: the acknowledgement only
+                // tells the client to stop re-sending the result.
+                .map(|()| Some(ServerMessage::JobResultAck { job_target_id: target_id }))
         }
         // Handshake messages after the handshake, and types this version
         // does not know, are ignored.

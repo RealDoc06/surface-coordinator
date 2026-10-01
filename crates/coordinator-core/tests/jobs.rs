@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{wait_until, FakeClient, TestServer, API_TOKEN};
-use protocol::{ClientMessage, JobResult, JobStatus, ServerMessage};
+use protocol::{ClientMessage, JobResult, JobStatus};
 use serde_json::json;
 
 #[tokio::test]
@@ -280,13 +280,29 @@ async fn a_device_cannot_report_on_another_devices_target() {
     intruder.started(&target_id).await;
     intruder.output(&target_id, 1, "forged\n").await;
     intruder.result(&target_id, 0).await;
-    // No acknowledgement for a target that is not the sender's.
-    intruder.send(ClientMessage::Heartbeat).await;
-    assert_eq!(intruder.recv().await, Some(ServerMessage::HeartbeatAck));
+    // The result is acknowledged (so the sender stops repeating it) but
+    // nothing about the target changes.
+    intruder.expect_result_ack(&target_id).await;
 
     let target = server.single_target(job_id).await;
     assert_eq!(target["state"], "sent");
     assert_eq!(target["output"], "");
+}
+
+#[tokio::test]
+async fn a_result_for_an_unknown_target_is_acknowledged_and_ignored() {
+    // A client may hold a result from before this coordinator's database
+    // existed; it must be told to stop re-sending it.
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    client.started("no-such-target").await;
+    client.output("no-such-target", 1, "ghost
+").await;
+    client.result("no-such-target", 0).await;
+    client.expect_result_ack("no-such-target").await;
+    let (_, body) = server.get("/api/v1/jobs").await;
+    assert!(body["jobs"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

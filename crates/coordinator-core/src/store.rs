@@ -545,15 +545,15 @@ pub struct TargetResult<'a> {
     pub message: Option<&'a str>,
 }
 
-/// Records the final result of a target that is still unresolved. Returns
-/// whether the target belongs to the device at all (and so should be
-/// acknowledged), regardless of whether this call changed it.
+/// Records the final result of a target that is still unresolved and belongs
+/// to the device. Anything else (a repeat, a target of another device, an
+/// unknown id) changes nothing.
 pub fn finish_target(
     conn: &Connection,
     target_id: &str,
     device_id: &str,
     result: &TargetResult<'_>,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<()> {
     let state = if result.succeeded { target_state::SUCCEEDED } else { target_state::FAILED };
     conn.execute(
         "UPDATE job_targets
@@ -561,11 +561,7 @@ pub fn finish_target(
          WHERE id = ?1 AND device_id = ?2 AND state IN ('sent', 'running')",
         params![target_id, device_id, state, result.exit_code, result.reason, result.message, now_ms()],
     )?;
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM job_targets WHERE id = ?1 AND device_id = ?2)",
-        params![target_id, device_id],
-        |row| row.get(0),
-    )
+    Ok(())
 }
 
 /// Expires targets that have been queued since before `cutoff`.
