@@ -2,11 +2,11 @@
 //! `coordinator-core`.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use coordinator_core::{admin, AuthMode, Config};
 
 #[derive(Parser)]
@@ -16,20 +16,42 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum Auth {
+    /// Username and password accounts (see `coordinator account`).
+    Accounts,
+    /// A single bearer token, for scripts and local use.
+    Token,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the server.
     Serve {
-        /// Address to listen on for clients and the HTTP API.
+        /// Address clients connect to; also serves the API and web UI
+        /// unless --ui-bind is given.
         #[arg(long, env = "SC_BIND", default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
+        /// Serve the API and web UI on this address instead of --bind.
+        #[arg(long, env = "SC_UI_BIND")]
+        ui_bind: Option<SocketAddr>,
         /// Directory for the database.
         #[arg(long, env = "SC_DATA_DIR")]
         data_dir: PathBuf,
-        /// Bearer token for the HTTP API. A random one is generated and
+        /// How the API and web UI authenticate.
+        #[arg(long, env = "SC_AUTH", value_enum, default_value = "accounts")]
+        auth: Auth,
+        /// With --auth token: the token. A random one is generated and
         /// printed for this launch if not given.
         #[arg(long, env = "SC_API_TOKEN", hide_env_values = true)]
         api_token: Option<String>,
+        /// Mark the session cookie Secure. Use when the coordinator is
+        /// reached through HTTPS (a TLS-terminating proxy).
+        #[arg(long, env = "SC_SECURE_COOKIES")]
+        secure_cookies: bool,
+        /// Serve the web UI from this directory instead of the built-in copy.
+        #[arg(long, env = "SC_UI_DIR")]
+        ui_dir: Option<PathBuf>,
         /// Seconds between client heartbeats.
         #[arg(long, default_value_t = 30)]
         heartbeat_interval_secs: u64,
@@ -44,6 +66,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
+    },
+    /// Manage the accounts that can log in to the web UI.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
     },
 }
 
@@ -69,12 +96,44 @@ enum KeyCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// Create an account. The password is read from SC_ACCOUNT_PASSWORD or
+    /// asked for.
+    Create {
+        #[arg(long, env = "SC_DATA_DIR")]
+        data_dir: PathBuf,
+        username: String,
+    },
+    /// List accounts.
+    List {
+        #[arg(long, env = "SC_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+    /// Set a new password and end the account's sessions.
+    SetPassword {
+        #[arg(long, env = "SC_DATA_DIR")]
+        data_dir: PathBuf,
+        username: String,
+    },
+    /// Delete an account.
+    Delete {
+        #[arg(long, env = "SC_DATA_DIR")]
+        data_dir: PathBuf,
+        username: String,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve {
             bind,
+            ui_bind,
             data_dir,
+            auth,
             api_token,
+            secure_cookies,
+            ui_dir,
             heartbeat_interval_secs,
             queued_expiry_hours,
             verbose,
@@ -82,27 +141,43 @@ fn main() -> anyhow::Result<()> {
             let level = if verbose { tracing::Level::DEBUG } else { tracing::Level::INFO };
             tracing_subscriber::fmt().with_max_level(level).with_writer(std::io::stderr).init();
 
-            let token = match api_token.filter(|token| !token.is_empty()) {
-                Some(token) => token,
-                None => {
-                    let token = hex::encode(rand::random::<[u8; 32]>());
-                    println!("API token for this launch: {token}");
-                    token
+            let auth = match auth {
+                Auth::Accounts => {
+                    if admin::list_accounts(&data_dir)?.is_empty() {
+                        println!(
+                            "No accounts exist yet. Create one with:\n  coordinator account create --data-dir {} <username>",
+                            data_dir.display()
+                        );
+                    }
+                    AuthMode::Accounts
                 }
+                Auth::Token => AuthMode::Token(match api_token.filter(|token| !token.is_empty()) {
+                    Some(token) => token,
+                    None => {
+                        let token = hex::encode(rand::random::<[u8; 32]>());
+                        println!("API token for this launch: {token}");
+                        token
+                    }
+                }),
             };
-            let mut config = Config::new(bind, data_dir, AuthMode::Token(token));
+            let mut config = Config::new(bind, data_dir, auth);
+            config.ui_bind = ui_bind;
+            config.ui_dir = ui_dir;
+            config.secure_cookies = secure_cookies;
             config.heartbeat_interval = Duration::from_secs(heartbeat_interval_secs);
             config.queued_expiry = Duration::from_secs(queued_expiry_hours * 60 * 60);
             serve(config)
         }
         Command::Key { command } => key(command),
+        Command::Account { command } => account(command),
     }
 }
 
 #[tokio::main]
 async fn serve(config: Config) -> anyhow::Result<()> {
     let coordinator = coordinator_core::start(config).await.context("failed to start")?;
-    println!("Listening on {}", coordinator.local_addr());
+    println!("Clients connect to {}", coordinator.local_addr());
+    println!("Web UI and API on http://{}", coordinator.ui_addr());
     shutdown_signal().await;
     coordinator.stop().await;
     Ok(())
@@ -142,6 +217,44 @@ fn key(command: KeyCommand) -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("no active key with id {id}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// The password from the environment, or typed twice without echo.
+fn read_password() -> anyhow::Result<String> {
+    if let Ok(password) = std::env::var("SC_ACCOUNT_PASSWORD") {
+        return Ok(password);
+    }
+    let password = rpassword::prompt_password("Password: ")?;
+    let again = rpassword::prompt_password("Repeat password: ")?;
+    if password != again {
+        anyhow::bail!("the passwords do not match");
+    }
+    Ok(password)
+}
+
+fn account(command: AccountCommand) -> anyhow::Result<()> {
+    let list = |data_dir: &Path| -> anyhow::Result<()> {
+        for account in admin::list_accounts(data_dir)? {
+            println!("{}", account.username);
+        }
+        Ok(())
+    };
+    match command {
+        AccountCommand::Create { data_dir, username } => {
+            let account = admin::create_account(&data_dir, &username, &read_password()?)?;
+            println!("created account {}", account.username);
+        }
+        AccountCommand::List { data_dir } => list(&data_dir)?,
+        AccountCommand::SetPassword { data_dir, username } => {
+            admin::set_account_password(&data_dir, &username, &read_password()?)?;
+            println!("password changed for {username}");
+        }
+        AccountCommand::Delete { data_dir, username } => {
+            admin::delete_account(&data_dir, &username)?;
+            println!("deleted account {username}");
         }
     }
     Ok(())

@@ -66,7 +66,7 @@ try {
     $headers = @{ Authorization = "Bearer $token" }
     $env:SC_API_TOKEN = $token
     $coordinatorLog = Join-Path $data 'coordinator.log'
-    $processes += Start-Logged $coordinatorExe @('serve', '--bind', "127.0.0.1:$Port", '--data-dir', $coordinatorData) $coordinatorLog
+    $processes += Start-Logged $coordinatorExe @('serve', '--auth', 'token', '--bind', "127.0.0.1:$Port", '--data-dir', $coordinatorData) $coordinatorLog
     Remove-Item Env:SC_API_TOKEN
     Wait-Until 'coordinator to answer' { try { (Invoke-RestMethod "$api/health").status -eq 'ok' } catch { $false } }
     Invoke-RestMethod "$api/health" | ConvertTo-Json -Compress | Write-Host
