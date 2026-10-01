@@ -59,6 +59,9 @@ pub struct ClientConfig {
     pub handoff_timeout: Duration,
     /// Port of the coordinator at the hotspot's gateway.
     pub hotspot_port: u16,
+    /// How long a `power` job waits for the coordinator to acknowledge its
+    /// result before restarting, shutting down or suspending the device.
+    pub power_ack_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -81,6 +84,7 @@ impl ClientConfig {
             search_interval: Duration::from_secs(30),
             handoff_timeout: Duration::from_secs(60),
             hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
+            power_ack_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -127,8 +131,11 @@ impl<P: Platform> Client<P> {
         let Client { config, platform, jobs, queue, network } = self;
         let system = platform.system_info();
         // Jobs keep running while the connection is down.
-        let context =
-            WorkerContext { network: network.clone(), handoff_timeout: config.handoff_timeout };
+        let context = WorkerContext {
+            network: network.clone(),
+            handoff_timeout: config.handoff_timeout,
+            power_ack_timeout: config.power_ack_timeout,
+        };
         let worker = tokio::spawn(jobs::run_worker(jobs.clone(), platform.clone(), context, queue));
 
         match network.coordinator_url() {
@@ -357,7 +364,9 @@ impl<P: Platform> Supervisor<'_, P> {
                     tracing::info!(%message, "Wi-Fi is not available; the client cannot fall back to the hotspot");
                 }
             }
-            PlatformError::Failed(message) => tracing::warn!(%message, "{what} failed"),
+            PlatformError::Failed(message) | PlatformError::NoUserSession(message) => {
+                tracing::warn!(%message, "{what} failed")
+            }
         }
     }
 }

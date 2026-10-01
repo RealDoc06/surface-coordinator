@@ -154,7 +154,12 @@ async fn authenticate(
     let mac = handshake::compute_mac(&config.key_secret, Role::Client, &client_nonce, &server_nonce);
     send(socket, &ClientMessage::Auth { mac }).await?;
     match receive(socket).await? {
-        ServerMessage::Welcome { heartbeat_interval_ms } => {
+        ServerMessage::Welcome { heartbeat_interval_ms, restricted } => {
+            if restricted {
+                // The coordinator only sends `client.update` jobs to this
+                // client until it is updated; the session works as usual.
+                tracing::warn!("the coordinator does not support this client's protocol version; it will only be offered updates");
+            }
             let interval = match heartbeat_interval_ms {
                 0 => Duration::from_secs(protocol::DEFAULT_HEARTBEAT_INTERVAL_SECS),
                 ms => Duration::from_millis(ms),
@@ -223,11 +228,7 @@ async fn session(
                     }
                     ServerMessage::JobResultAck { job_target_id } => jobs.acknowledge(&job_target_id),
                     ServerMessage::HeartbeatAck => {}
-                    // Cancellation is not implemented by this client yet;
-                    // the job runs to its end and reports as usual.
-                    ServerMessage::JobCancel { job_target_id } => {
-                        tracing::debug!(%job_target_id, "ignoring job.cancel");
-                    }
+                    ServerMessage::JobCancel { job_target_id } => jobs.cancel(&job_target_id),
                     // Handshake messages have no meaning here.
                     ServerMessage::Challenge { .. }
                     | ServerMessage::Welcome { .. }

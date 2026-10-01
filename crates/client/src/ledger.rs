@@ -24,6 +24,14 @@ pub struct Entry {
     /// The coordinator has confirmed it stored the result.
     #[serde(default)]
     pub acked: bool,
+    /// The job was cancelled before it started, so `job.started` is not
+    /// part of what is reported about it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub never_started: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -94,8 +102,23 @@ impl Ledger {
 
     /// Records that a job is about to run.
     pub fn start(&mut self, id: &str) {
-        self.entries.push(Entry { id: id.to_owned(), result: None, acked: false });
+        self.entries.push(Entry { id: id.to_owned(), result: None, acked: false, never_started: false });
         self.save();
+    }
+
+    /// Records the result of a job that never started, such as one
+    /// cancelled while waiting. Like any result it is kept until
+    /// acknowledged, and the id is from now on a known duplicate.
+    pub fn record_not_started(&mut self, result: JobResult) {
+        let id = result.job_target_id.clone();
+        self.entries.push(Entry { id, result: Some(result), acked: false, never_started: true });
+        self.save();
+    }
+
+    /// Whether the coordinator has acknowledged the result for `id`. An id
+    /// that is no longer here was acknowledged long ago and pruned.
+    pub fn is_acked(&self, id: &str) -> bool {
+        self.entries.iter().find(|entry| entry.id == id).is_none_or(|entry| entry.acked)
     }
 
     pub fn finish(&mut self, result: JobResult) {
@@ -211,6 +234,31 @@ mod tests {
             assert_eq!(result.reason.as_deref(), Some(reason::INTERRUPTED));
             assert_eq!(result.job_target_id, "running");
         }
+    }
+
+    #[test]
+    fn a_job_that_never_started_is_recorded_with_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(dir.path()).unwrap();
+        let mut cancelled = succeeded("cancelled");
+        cancelled.status = JobStatus::Failed;
+        cancelled.reason = Some(reason::CANCELLED.into());
+        ledger.record_not_started(cancelled.clone());
+        assert!(ledger.contains("cancelled"));
+        assert!(!ledger.is_acked("cancelled"));
+
+        let mut reloaded = Ledger::load(dir.path()).unwrap();
+        let entry = reloaded.unacked().next().unwrap().clone();
+        assert!(entry.never_started);
+        assert_eq!(entry.result, Some(cancelled));
+        assert!(reloaded.ack("cancelled"));
+        assert!(reloaded.is_acked("cancelled"));
+    }
+
+    #[test]
+    fn an_entry_written_before_never_started_existed_counts_as_started() {
+        let entry: Entry = serde_json::from_str(r#"{"id":"old","result":null,"acked":false}"#).unwrap();
+        assert!(!entry.never_started);
     }
 
     #[test]

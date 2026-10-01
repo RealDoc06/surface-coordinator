@@ -258,7 +258,7 @@ async fn unsupported_job_kind_fails_as_unsupported() {
     let client = start_client(client_config(coordinator.addr), platform.clone());
     let (mut connection, _) = coordinator.accept().await;
 
-    connection.send_job("t1", "power", json!({"action": "restart"})).await;
+    connection.send_job("t1", "example.kind_from_the_future", json!({"anything": true})).await;
     connection.expect_started("t1").await;
     let result = connection.expect_result("t1").await;
     assert_eq!(result.status, JobStatus::Failed);

@@ -1,16 +1,15 @@
 //! Everything operating-system specific sits behind [`Platform`].
 //!
 //! The client core only ever talks to this trait, so it can be tested with a
-//! fake and other operating systems can be added as further modules. Later
-//! milestones extend the trait (launch app, apply setting, Wi-Fi, power);
-//! an operation a platform cannot perform returns
-//! [`PlatformError::Unsupported`].
+//! fake and other operating systems can be added as further modules. An
+//! operation a platform cannot perform returns [`PlatformError::Unsupported`],
+//! which is what every method but the first two does by default.
 
 use std::future::Future;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use protocol::{OutputStream, RunAs, Shell};
+use protocol::{OutputStream, PowerAction, RunAs, Shell};
 use tokio::sync::mpsc;
 
 #[cfg(windows)]
@@ -51,6 +50,10 @@ pub enum PlatformError {
     /// This platform cannot do what was asked.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Nobody is logged in to the device's interactive session, so there is
+    /// no user to act as.
+    #[error("no user session: {0}")]
+    NoUserSession(String),
     #[error("{0}")]
     Failed(String),
 }
@@ -111,6 +114,49 @@ pub trait Platform: Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = Result<Option<WifiConnection>, PlatformError>> + Send {
         async { unsupported("querying the Wi-Fi connection") }
+    }
+
+    /// Starts a program in the logged-in user's interactive session and
+    /// returns its process id without waiting for it.
+    fn launch_app(
+        &self,
+        path: String,
+        arguments: Vec<String>,
+    ) -> impl Future<Output = Result<u32, PlatformError>> + Send {
+        async move {
+            let _ = (path, arguments);
+            unsupported("launching an app")
+        }
+    }
+
+    /// Applies one entry of [`protocol::settings::catalogue`]. The value has
+    /// already been validated against the catalogue.
+    fn apply_setting(
+        &self,
+        setting: String,
+        value: serde_json::Value,
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async move {
+            let _ = (setting, value);
+            unsupported("applying a setting")
+        }
+    }
+
+    /// Whether [`Platform::power`] can carry out `action`, asked before the
+    /// job reports success: once it has, a failure can only be logged.
+    /// Implement it together with `power`.
+    fn check_power(&self, action: PowerAction) -> Result<(), PlatformError> {
+        let _ = action;
+        unsupported("power actions")
+    }
+
+    /// Restarts, shuts down or suspends the device. May return before the
+    /// action takes effect.
+    fn power(&self, action: PowerAction) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async move {
+            let _ = action;
+            unsupported("power actions")
+        }
     }
 }
 

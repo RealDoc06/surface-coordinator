@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use client::platform::{
 use client::{BackoffConfig, Client, ClientConfig};
 use futures_util::{SinkExt, StreamExt};
 use protocol::handshake::{compute_mac, generate_nonce, verify_mac, Role};
-use protocol::{ClientMessage, Hello, JobResult, OutputStream, ServerMessage};
+use protocol::{ClientMessage, Hello, JobResult, OutputStream, PowerAction, ServerMessage};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
@@ -39,17 +40,45 @@ pub const WAIT: Duration = Duration::from_secs(5);
 /// - `exit <code>`: finish with this exit code
 /// - `timeout`: finish as timed out
 /// - `unsupported`: fail as unsupported
+/// - `no-session`: fail because nobody is logged in
 /// - `fail <text>`: fail with an error
 ///
-/// A script that runs off its end exits with 0.
+/// A script that runs off its end exits with 0. A script stopped before its
+/// end, its future dropped, is counted: see [`FakePlatform::scripts_dropped`].
 ///
 /// Wi-Fi is unsupported unless the platform is made with
 /// [`FakePlatform::with_wifi`]; then the test decides which networks are in
 /// range, which one the device is on and how joining each one turns out.
+///
+/// Launching apps, applying settings and power actions succeed and are
+/// recorded unless the test says otherwise. Nothing real happens.
 pub struct FakePlatform {
     runs: Mutex<Vec<ScriptRequest>>,
+    scripts_dropped: AtomicUsize,
     gate: Semaphore,
     wifi: Mutex<FakeWifi>,
+    launches: Mutex<Vec<(String, Vec<String>)>>,
+    launch_outcomes: Mutex<HashMap<String, Result<u32, PlatformError>>>,
+    applied: Mutex<Vec<(String, Value)>>,
+    apply_outcomes: Mutex<HashMap<String, Result<(), PlatformError>>>,
+    /// Applying a setting waits for [`FakePlatform::release`].
+    hold_applies: AtomicBool,
+    power_supported: AtomicBool,
+    power_calls: Mutex<Vec<(PowerAction, Instant)>>,
+}
+
+/// Counts a script whose future is dropped before it finished.
+struct DropWatch<'a> {
+    counter: &'a AtomicUsize,
+    finished: bool,
+}
+
+impl Drop for DropWatch<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,9 +96,56 @@ impl FakePlatform {
     pub fn new() -> Arc<FakePlatform> {
         Arc::new(FakePlatform {
             runs: Mutex::new(Vec::new()),
+            scripts_dropped: AtomicUsize::new(0),
             gate: Semaphore::new(0),
             wifi: Mutex::new(FakeWifi::default()),
+            launches: Mutex::new(Vec::new()),
+            launch_outcomes: Mutex::new(HashMap::new()),
+            applied: Mutex::new(Vec::new()),
+            apply_outcomes: Mutex::new(HashMap::new()),
+            hold_applies: AtomicBool::new(false),
+            power_supported: AtomicBool::new(true),
+            power_calls: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Scripts stopped before their end because their future was dropped.
+    pub fn scripts_dropped(&self) -> usize {
+        self.scripts_dropped.load(Ordering::SeqCst)
+    }
+
+    /// What launching `path` returns. Other paths start with pid 4242.
+    pub fn on_launch(&self, path: &str, outcome: Result<u32, PlatformError>) {
+        self.launch_outcomes.lock().unwrap().insert(path.to_owned(), outcome);
+    }
+
+    pub fn launches(&self) -> Vec<(String, Vec<String>)> {
+        self.launches.lock().unwrap().clone()
+    }
+
+    /// What applying `setting` returns. Other settings apply fine.
+    pub fn on_apply(&self, setting: &str, outcome: Result<(), PlatformError>) {
+        self.apply_outcomes.lock().unwrap().insert(setting.to_owned(), outcome);
+    }
+
+    /// Makes every setting wait for [`FakePlatform::release`] before it is
+    /// applied.
+    pub fn hold_applies(&self) {
+        self.hold_applies.store(true, Ordering::SeqCst);
+    }
+
+    pub fn applied(&self) -> Vec<(String, Value)> {
+        self.applied.lock().unwrap().clone()
+    }
+
+    /// Makes power actions unsupported, as on a platform without them.
+    pub fn without_power(&self) {
+        self.power_supported.store(false, Ordering::SeqCst);
+    }
+
+    /// Power actions carried out, and when.
+    pub fn power_calls(&self) -> Vec<(PowerAction, Instant)> {
+        self.power_calls.lock().unwrap().clone()
     }
 
     /// A platform with Wi-Fi: nothing in range and not connected until the
@@ -137,23 +213,10 @@ impl Platform for FakePlatform {
         output: mpsc::Sender<OutputChunk>,
     ) -> Result<ScriptOutcome, PlatformError> {
         self.runs.lock().unwrap().push(request.clone());
-        for line in request.body.lines() {
-            let (command, argument) = line.split_once(' ').unwrap_or((line, ""));
-            match command {
-                "out" | "err" => {
-                    let stream =
-                        if command == "out" { OutputStream::Stdout } else { OutputStream::Stderr };
-                    let _ = output.send(OutputChunk { stream, data: format!("{argument}\n") }).await;
-                }
-                "wait" => self.gate.acquire().await.unwrap().forget(),
-                "exit" => return Ok(ScriptOutcome::Exited(argument.parse().unwrap())),
-                "timeout" => return Ok(ScriptOutcome::TimedOut),
-                "unsupported" => return Err(PlatformError::Unsupported("not here".into())),
-                "fail" => return Err(PlatformError::Failed(argument.to_owned())),
-                other => panic!("unknown fake script command {other:?}"),
-            }
-        }
-        Ok(ScriptOutcome::Exited(0))
+        let mut watch = DropWatch { counter: &self.scripts_dropped, finished: false };
+        let outcome = self.interpret(&request, &output).await;
+        watch.finished = true;
+        outcome
     }
 
     async fn wifi_scan(&self) -> Result<Vec<String>, PlatformError> {
@@ -177,6 +240,59 @@ impl Platform for FakePlatform {
 
     async fn wifi_current(&self) -> Result<Option<WifiConnection>, PlatformError> {
         Ok(self.wifi_supported()?.current.clone())
+    }
+
+    async fn launch_app(&self, path: String, arguments: Vec<String>) -> Result<u32, PlatformError> {
+        self.launches.lock().unwrap().push((path.clone(), arguments));
+        self.launch_outcomes.lock().unwrap().get(&path).cloned().unwrap_or(Ok(4242))
+    }
+
+    async fn apply_setting(&self, setting: String, value: Value) -> Result<(), PlatformError> {
+        if self.hold_applies.load(Ordering::SeqCst) {
+            self.gate.acquire().await.unwrap().forget();
+        }
+        self.applied.lock().unwrap().push((setting.clone(), value));
+        self.apply_outcomes.lock().unwrap().get(&setting).cloned().unwrap_or(Ok(()))
+    }
+
+    fn check_power(&self, _action: PowerAction) -> Result<(), PlatformError> {
+        if self.power_supported.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(PlatformError::Unsupported("no power actions on this fake".into()))
+        }
+    }
+
+    async fn power(&self, action: PowerAction) -> Result<(), PlatformError> {
+        self.power_calls.lock().unwrap().push((action, Instant::now()));
+        Ok(())
+    }
+}
+
+impl FakePlatform {
+    async fn interpret(
+        &self,
+        request: &ScriptRequest,
+        output: &mpsc::Sender<OutputChunk>,
+    ) -> Result<ScriptOutcome, PlatformError> {
+        for line in request.body.lines() {
+            let (command, argument) = line.split_once(' ').unwrap_or((line, ""));
+            match command {
+                "out" | "err" => {
+                    let stream =
+                        if command == "out" { OutputStream::Stdout } else { OutputStream::Stderr };
+                    let _ = output.send(OutputChunk { stream, data: format!("{argument}\n") }).await;
+                }
+                "wait" => self.gate.acquire().await.unwrap().forget(),
+                "exit" => return Ok(ScriptOutcome::Exited(argument.parse().unwrap())),
+                "timeout" => return Ok(ScriptOutcome::TimedOut),
+                "unsupported" => return Err(PlatformError::Unsupported("not here".into())),
+                "no-session" => return Err(PlatformError::NoUserSession("nobody logged in".into())),
+                "fail" => return Err(PlatformError::Failed(argument.to_owned())),
+                other => panic!("unknown fake script command {other:?}"),
+            }
+        }
+        Ok(ScriptOutcome::Exited(0))
     }
 }
 
@@ -225,6 +341,7 @@ pub fn client_config(addr: SocketAddr) -> ClientConfig {
         search_interval: Duration::from_millis(100),
         handoff_timeout: Duration::from_millis(700),
         hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
+        power_ack_timeout: Duration::from_millis(200),
     }
 }
 
@@ -336,7 +453,10 @@ impl FakeCoordinator {
             other => panic!("expected auth, got {other:?}"),
         }
         connection
-            .send(ServerMessage::Welcome { heartbeat_interval_ms: self.heartbeat_interval_ms })
+            .send(ServerMessage::Welcome {
+                heartbeat_interval_ms: self.heartbeat_interval_ms,
+                restricted: false,
+            })
             .await;
         (connection, hello)
     }
@@ -411,6 +531,10 @@ impl Connection {
             payload,
         })
         .await;
+    }
+
+    pub async fn cancel(&mut self, target_id: &str) {
+        self.send(ServerMessage::JobCancel { job_target_id: target_id.to_owned() }).await;
     }
 
     pub async fn ack(&mut self, target_id: &str) {
