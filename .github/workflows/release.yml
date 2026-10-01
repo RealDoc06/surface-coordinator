@@ -281,9 +281,8 @@ jobs:
       - name: Updater public key for the build
         shell: bash
         run: |
-          key="$(tr -d "
-" < crates/manager/updater.pub)"
-          printf "{\"plugins\":{\"updater\":{\"pubkey\":\"%s\"}}}" "$key" > crates/manager/tauri.release.conf.json
+          key="$(tr -d '\r\n' < crates/manager/updater.pub)"
+          printf '{"plugins":{"updater":{"pubkey":"%s"}}}' "$key" > crates/manager/tauri.release.conf.json
 
       - uses: tauri-apps/tauri-action@v0
         env:
