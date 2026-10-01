@@ -4,6 +4,7 @@
 //! [`Store::call`], which runs the closure on the blocking pool. The query
 //! functions themselves are synchronous and take the connection.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,26 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE devices ADD COLUMN network_ssid TEXT;
     ALTER TABLE devices ADD COLUMN network_ip TEXT;
+", "
+    CREATE TABLE groups (
+        id      TEXT PRIMARY KEY,
+        name    TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        created INTEGER NOT NULL
+    );
+    CREATE TABLE group_members (
+        group_id  TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        PRIMARY KEY (group_id, device_id)
+    );
+    CREATE TABLE scripts (
+        id       TEXT PRIMARY KEY,
+        name     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        shell    TEXT NOT NULL,
+        body     TEXT NOT NULL,
+        built_in INTEGER NOT NULL DEFAULT 0,
+        created  INTEGER NOT NULL,
+        updated  INTEGER NOT NULL
+    );
 "];
 
 /// Current time as Unix milliseconds.
@@ -280,6 +301,8 @@ pub struct Device {
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub network: DeviceNetwork,
+    /// Ids of the groups the device is a member of, sorted.
+    pub group_ids: Vec<String>,
 }
 
 /// What the device reported about its network in its last handshake.
@@ -356,28 +379,48 @@ fn device_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         first_seen_at: row.get(6)?,
         last_seen_at: row.get(7)?,
         network: DeviceNetwork { ssid: row.get(8)?, ip: row.get(9)? },
+        // Filled in by the callers.
+        group_ids: Vec::new(),
     })
 }
 
 pub fn list_devices(conn: &Connection) -> rusqlite::Result<Vec<Device>> {
-    conn.prepare(
-        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
-                network_ssid, network_ip
-         FROM devices ORDER BY hostname, id",
-    )?
-    .query_map([], device_from_row)?
-    .collect()
+    let mut devices: Vec<Device> = conn
+        .prepare(
+            "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
+                    network_ssid, network_ip
+             FROM devices ORDER BY hostname, id",
+        )?
+        .query_map([], device_from_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut memberships: HashMap<String, Vec<String>> = HashMap::new();
+    let mut statement = conn.prepare("SELECT device_id, group_id FROM group_members ORDER BY group_id")?;
+    for row in statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+        let (device_id, group_id) = row?;
+        memberships.entry(device_id).or_default().push(group_id);
+    }
+    for device in &mut devices {
+        device.group_ids = memberships.remove(&device.id).unwrap_or_default();
+    }
+    Ok(devices)
 }
 
 pub fn get_device(conn: &Connection, id: &str) -> rusqlite::Result<Option<Device>> {
-    conn.query_row(
-        "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
-                network_ssid, network_ip
-         FROM devices WHERE id = ?1",
-        [id],
-        device_from_row,
-    )
-    .optional()
+    let device = conn
+        .query_row(
+            "SELECT id, enrollment_key_id, hostname, os, client_version, online, first_seen, last_seen,
+                    network_ssid, network_ip
+             FROM devices WHERE id = ?1",
+            [id],
+            device_from_row,
+        )
+        .optional()?;
+    let Some(mut device) = device else { return Ok(None) };
+    device.group_ids = conn
+        .prepare("SELECT group_id FROM group_members WHERE device_id = ?1 ORDER BY group_id")?
+        .query_map([id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(device))
 }
 
 // ---------------------------------------------------------------- jobs
@@ -419,10 +462,13 @@ pub struct JobTarget {
 pub enum Targets {
     All,
     Devices(Vec<String>),
+    /// The members of a group when the job is created.
+    Group(String),
 }
 
 pub enum CreateJobError {
     UnknownDevice(String),
+    UnknownGroup(String),
     NoTargets,
 }
 
@@ -456,6 +502,22 @@ pub fn create_job(
                 }
             }
             unique
+        }
+        Targets::Group(group_id) => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM groups WHERE id = ?1)",
+                [group_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(Err(CreateJobError::UnknownGroup(group_id.clone())));
+            }
+            tx.prepare(
+                "SELECT d.id FROM group_members m JOIN devices d ON d.id = m.device_id
+                 WHERE m.group_id = ?1 ORDER BY d.hostname, d.id",
+            )?
+            .query_map([group_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
         }
     };
     if device_ids.is_empty() {
@@ -771,6 +833,59 @@ pub fn finish_target(
     get_target_change(conn, target_id)
 }
 
+/// What cancelling a job did.
+pub struct Cancelled {
+    /// The job as it stands after the immediate changes, without output.
+    pub job: Job,
+    /// The targets that were changed here.
+    pub changes: Vec<TargetChange>,
+}
+
+/// Cancels the unfinished targets of a job, in one transaction. Returns
+/// `None` if there is no such job.
+///
+/// Queued targets fail at once. For a target that was sent to a device,
+/// `signal(device_id, job_target_id)` tries to tell the device to stop and
+/// returns whether it could; if so the target is left for the device's
+/// `job.result` to settle, otherwise (the device is gone) it fails at once.
+/// The caller holds the presence lock around this, so a device cannot go
+/// offline between `signal` and the commit without that being seen.
+pub fn cancel_job(
+    conn: &mut Connection,
+    job_id: &str,
+    mut signal: impl FnMut(&str, &str) -> bool,
+) -> rusqlite::Result<Option<Cancelled>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let exists: bool =
+        tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)", [job_id], |row| row.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    let unfinished: Vec<(String, String, String)> = tx
+        .prepare(
+            "SELECT id, device_id, state FROM job_targets
+             WHERE job_id = ?1 AND state IN ('queued', 'sent', 'running') ORDER BY rowid",
+        )?
+        .query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut changes = Vec::new();
+    for (target_id, device_id, state) in unfinished {
+        if state != target_state::QUEUED && signal(&device_id, &target_id) {
+            continue;
+        }
+        tx.execute(
+            "UPDATE job_targets
+             SET state = 'failed', exit_code = NULL, reason = ?2, message = NULL, finished = ?3
+             WHERE id = ?1",
+            params![target_id, protocol::reason::CANCELLED, now_ms()],
+        )?;
+        changes.extend(get_target_change(&tx, &target_id)?);
+    }
+    let job = get_job(&tx, job_id, false)?.expect("job exists");
+    tx.commit()?;
+    Ok(Some(Cancelled { job, changes }))
+}
+
 /// Expires targets that have been queued since before `cutoff`.
 pub fn expire_queued_targets(conn: &mut Connection, cutoff: i64) -> rusqlite::Result<Vec<TargetChange>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -879,18 +994,299 @@ pub fn list_device_targets(conn: &Connection, device_id: &str, limit: u32) -> ru
     .collect()
 }
 
-/// Forgets a device and its job history. Jobs left without any target are
-/// removed too. Returns false if there was no such device.
-pub fn delete_device(conn: &mut Connection, device_id: &str) -> rusqlite::Result<bool> {
+/// What forgetting a device removed.
+pub struct DeviceDeleted {
+    /// The device was a member of at least one group.
+    pub was_in_group: bool,
+}
+
+/// Forgets a device, its job history and its group memberships. Jobs left
+/// without any target are removed too. Returns `None` if there was no such
+/// device.
+pub fn delete_device(conn: &mut Connection, device_id: &str) -> rusqlite::Result<Option<DeviceDeleted>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM job_targets WHERE device_id = ?1", [device_id])?;
     tx.execute(
         "DELETE FROM jobs WHERE NOT EXISTS (SELECT 1 FROM job_targets t WHERE t.job_id = jobs.id)",
         [],
     )?;
+    // Explicitly, rather than through the cascade, so this does not depend
+    // on foreign keys being enforced.
+    let was_in_group = tx.execute("DELETE FROM group_members WHERE device_id = ?1", [device_id])? > 0;
     let deleted = tx.execute("DELETE FROM devices WHERE id = ?1", [device_id])?;
     tx.commit()?;
+    Ok((deleted > 0).then_some(DeviceDeleted { was_in_group }))
+}
+
+// ---------------------------------------------------------------- groups
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    /// Sorted.
+    pub device_ids: Vec<String>,
+}
+
+/// Why a group could not be changed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GroupError {
+    NotFound,
+    NameTaken,
+    UnknownDevice(String),
+}
+
+fn get_group(conn: &Connection, id: &str) -> rusqlite::Result<Option<Group>> {
+    let group = conn
+        .query_row("SELECT id, name, created FROM groups WHERE id = ?1", [id], |row| {
+            Ok(Group { id: row.get(0)?, name: row.get(1)?, created_at: row.get(2)?, device_ids: Vec::new() })
+        })
+        .optional()?;
+    let Some(mut group) = group else { return Ok(None) };
+    group.device_ids = conn
+        .prepare("SELECT device_id FROM group_members WHERE group_id = ?1 ORDER BY device_id")?
+        .query_map([id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(group))
+}
+
+/// Groups ordered by name.
+pub fn list_groups(conn: &Connection) -> rusqlite::Result<Vec<Group>> {
+    let mut groups: Vec<Group> = conn
+        .prepare("SELECT id, name, created FROM groups ORDER BY name, id")?
+        .query_map([], |row| {
+            Ok(Group { id: row.get(0)?, name: row.get(1)?, created_at: row.get(2)?, device_ids: Vec::new() })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    let mut statement = conn.prepare("SELECT group_id, device_id FROM group_members ORDER BY device_id")?;
+    for row in statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+        let (group_id, device_id) = row?;
+        members.entry(group_id).or_default().push(device_id);
+    }
+    for group in &mut groups {
+        group.device_ids = members.remove(&group.id).unwrap_or_default();
+    }
+    Ok(groups)
+}
+
+/// Creates an empty group. Returns `None` if the name is taken (ignoring case).
+pub fn create_group(conn: &Connection, name: &str) -> rusqlite::Result<Option<Group>> {
+    let group = Group {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_owned(),
+        created_at: now_ms(),
+        device_ids: Vec::new(),
+    };
+    let inserted = conn.execute(
+        "INSERT INTO groups (id, name, created) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO NOTHING",
+        params![group.id, group.name, group.created_at],
+    )?;
+    Ok((inserted > 0).then_some(group))
+}
+
+pub fn rename_group(conn: &mut Connection, id: &str, name: &str) -> rusqlite::Result<Result<Group, GroupError>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if get_group(&tx, id)?.is_none() {
+        return Ok(Err(GroupError::NotFound));
+    }
+    // The column compares ignoring case, so this also finds "LAB" for "lab".
+    let taken: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM groups WHERE name = ?1 AND id != ?2)",
+        params![name, id],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Ok(Err(GroupError::NameTaken));
+    }
+    tx.execute("UPDATE groups SET name = ?2 WHERE id = ?1", params![id, name])?;
+    let group = get_group(&tx, id)?.expect("group exists");
+    tx.commit()?;
+    Ok(Ok(group))
+}
+
+/// Deletes a group; its members stay. Returns false if there was none.
+pub fn delete_group(conn: &mut Connection, id: &str) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
+    let deleted = tx.execute("DELETE FROM groups WHERE id = ?1", [id])?;
+    tx.commit()?;
     Ok(deleted > 0)
+}
+
+/// Replaces a group's membership. Nothing changes if a device is unknown.
+pub fn set_group_members(
+    conn: &mut Connection,
+    id: &str,
+    device_ids: &[String],
+) -> rusqlite::Result<Result<Group, GroupError>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if get_group(&tx, id)?.is_none() {
+        return Ok(Err(GroupError::NotFound));
+    }
+    for device_id in device_ids {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1)",
+            [device_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(Err(GroupError::UnknownDevice(device_id.clone())));
+        }
+    }
+    tx.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
+    for device_id in device_ids {
+        tx.execute(
+            "INSERT INTO group_members (group_id, device_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![id, device_id],
+        )?;
+    }
+    let group = get_group(&tx, id)?.expect("group exists");
+    tx.commit()?;
+    Ok(Ok(group))
+}
+
+// ---------------------------------------------------------------- scripts
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Script {
+    pub id: String,
+    pub name: String,
+    /// `powershell` or `cmd`.
+    pub shell: String,
+    pub body: String,
+    pub built_in: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Why a script could not be changed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScriptError {
+    NotFound,
+    NameTaken,
+    BuiltIn,
+}
+
+const SCRIPT_COLUMNS: &str = "id, name, shell, body, built_in, created, updated";
+
+fn script_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Script> {
+    Ok(Script {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        shell: row.get(2)?,
+        body: row.get(3)?,
+        built_in: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+/// Scripts ordered by name.
+pub fn list_scripts(conn: &Connection) -> rusqlite::Result<Vec<Script>> {
+    conn.prepare(&format!("SELECT {SCRIPT_COLUMNS} FROM scripts ORDER BY name, id"))?
+        .query_map([], script_from_row)?
+        .collect()
+}
+
+fn get_script(conn: &Connection, id: &str) -> rusqlite::Result<Option<Script>> {
+    conn.query_row(&format!("SELECT {SCRIPT_COLUMNS} FROM scripts WHERE id = ?1"), [id], script_from_row)
+        .optional()
+}
+
+/// Creates a script. Returns `None` if the name is taken (ignoring case).
+pub fn create_script(conn: &Connection, name: &str, shell: &str, body: &str) -> rusqlite::Result<Option<Script>> {
+    let now = now_ms();
+    let script = Script {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_owned(),
+        shell: shell.to_owned(),
+        body: body.to_owned(),
+        built_in: false,
+        created_at: now,
+        updated_at: now,
+    };
+    let inserted = conn.execute(
+        "INSERT INTO scripts (id, name, shell, body, built_in, created, updated)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5) ON CONFLICT(name) DO NOTHING",
+        params![script.id, script.name, script.shell, script.body, now],
+    )?;
+    Ok((inserted > 0).then_some(script))
+}
+
+pub fn update_script(
+    conn: &mut Connection,
+    id: &str,
+    name: &str,
+    shell: &str,
+    body: &str,
+) -> rusqlite::Result<Result<Script, ScriptError>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match get_script(&tx, id)? {
+        None => return Ok(Err(ScriptError::NotFound)),
+        Some(script) if script.built_in => return Ok(Err(ScriptError::BuiltIn)),
+        Some(_) => {}
+    }
+    let taken: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scripts WHERE name = ?1 AND id != ?2)",
+        params![name, id],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Ok(Err(ScriptError::NameTaken));
+    }
+    tx.execute(
+        "UPDATE scripts SET name = ?2, shell = ?3, body = ?4, updated = ?5 WHERE id = ?1",
+        params![id, name, shell, body, now_ms()],
+    )?;
+    let script = get_script(&tx, id)?.expect("script exists");
+    tx.commit()?;
+    Ok(Ok(script))
+}
+
+pub fn delete_script(conn: &mut Connection, id: &str) -> rusqlite::Result<Result<(), ScriptError>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match get_script(&tx, id)? {
+        None => return Ok(Err(ScriptError::NotFound)),
+        Some(script) if script.built_in => return Ok(Err(ScriptError::BuiltIn)),
+        Some(_) => {}
+    }
+    tx.execute("DELETE FROM scripts WHERE id = ?1", [id])?;
+    tx.commit()?;
+    Ok(Ok(()))
+}
+
+/// Makes sure the built-in scripts are stored as this version defines them:
+/// inserted if missing, name and body refreshed if they differ (so a newer
+/// coordinator updates them). A built-in whose name a user's script already
+/// uses is left alone rather than failing the start.
+pub fn seed_builtin_scripts(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = now_ms();
+    for script in &crate::builtin_scripts::BUILT_IN_SCRIPTS {
+        let name_in_use: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scripts WHERE name = ?1 AND id != ?2)",
+            params![script.name, script.id],
+            |row| row.get(0),
+        )?;
+        if name_in_use {
+            tracing::warn!(id = script.id, name = script.name, "a script already has this built-in's name; skipping it");
+            continue;
+        }
+        // `updated` only moves when something changed, so a restart is not an edit.
+        tx.execute(
+            "INSERT INTO scripts (id, name, shell, body, built_in, created, updated)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name, shell = excluded.shell, body = excluded.body, updated = excluded.updated
+             WHERE scripts.name COLLATE BINARY IS NOT excluded.name
+                OR scripts.shell IS NOT excluded.shell
+                OR scripts.body IS NOT excluded.body",
+            params![script.id, script.name, script.shell, script.body, now],
+        )?;
+    }
+    tx.commit()
 }
 
 // ---------------------------------------------------------------- accounts

@@ -33,6 +33,10 @@ pub enum Event {
     JobOutput { job_id: String, job_target_id: String, data: String, truncated: bool, offset: u64 },
     #[serde(rename = "connection.rejected")]
     ConnectionRejected { rejected: Rejected },
+    /// A group was created, renamed, deleted or had its members changed, or
+    /// a device that belonged to a group was forgotten.
+    #[serde(rename = "groups.changed")]
+    GroupsChanged,
     /// Events were dropped; the UI should refetch what it shows.
     #[serde(rename = "resync")]
     Resync,
@@ -135,6 +139,8 @@ mod tests {
     fn events_carry_their_type_tag() {
         let json = serde_json::to_value(Event::Resync).unwrap();
         assert_eq!(json, serde_json::json!({"type": "resync"}));
+        let json = serde_json::to_value(Event::GroupsChanged).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "groups.changed"}));
         let json = serde_json::to_value(removed("x")).unwrap();
         assert_eq!(json, serde_json::json!({"type": "device.removed", "device_id": "x"}));
     }

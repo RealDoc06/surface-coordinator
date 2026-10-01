@@ -6,8 +6,11 @@
 
 mod api;
 mod auth;
+mod builtin_scripts;
 mod client_ws;
 mod events;
+mod groups;
+mod scripts;
 mod state;
 mod store;
 mod ui;
@@ -152,6 +155,7 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
     store
         .call(move |conn| {
             store::mark_all_devices_offline(conn)?;
+            store::seed_builtin_scripts(conn)?;
             if token_mode {
                 // The token changes with every launch; sessions opened with
                 // an earlier one must not outlive it.

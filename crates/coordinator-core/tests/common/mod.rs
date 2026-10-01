@@ -66,9 +66,12 @@ impl TestServer {
         reqwest::Client::builder().cookie_store(true).build().unwrap()
     }
 
-    /// Stops the server and starts a new one on the same data directory.
+    /// Stops the server (if it is running) and starts a new one on the same
+    /// data directory.
     pub async fn restart(&mut self) {
-        self.coordinator.take().unwrap().stop().await;
+        if let Some(coordinator) = self.coordinator.take() {
+            coordinator.stop().await;
+        }
         let mut config = test_config(self.data_dir.path());
         if self.accounts {
             config.auth = AuthMode::Accounts;
@@ -108,6 +111,56 @@ impl TestServer {
             .unwrap();
         let status = response.status().as_u16();
         (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Any method, with the API token and an optional JSON body. The body of
+    /// an empty response (204) comes back as `null`.
+    pub async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+        let mut request = self.http.request(method, self.url(path)).bearer_auth(API_TOKEN);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    pub async fn put(&self, path: &str, body: Value) -> (u16, Value) {
+        self.request(reqwest::Method::PUT, path, Some(body)).await
+    }
+
+    pub async fn patch(&self, path: &str, body: Value) -> (u16, Value) {
+        self.request(reqwest::Method::PATCH, path, Some(body)).await
+    }
+
+    pub async fn delete(&self, path: &str) -> (u16, Value) {
+        self.request(reqwest::Method::DELETE, path, None).await
+    }
+
+    /// Creates a group and returns it.
+    pub async fn create_group(&self, name: &str) -> Value {
+        let (status, body) = self.post("/api/v1/groups", json!({"name": name})).await;
+        assert_eq!(status, 201, "create group failed: {body}");
+        body["group"].clone()
+    }
+
+    /// Replaces a group's members and returns the group.
+    pub async fn set_members(&self, group_id: &str, device_ids: &[&str]) -> Value {
+        let (status, body) = self
+            .put(&format!("/api/v1/groups/{group_id}/members"), json!({"device_ids": device_ids}))
+            .await;
+        assert_eq!(status, 200, "set members failed: {body}");
+        body["group"].clone()
+    }
+
+    /// Creates a job of any kind; returns the status and body.
+    pub async fn create_job(&self, kind: &str, payload: Value, targets: Value) -> (u16, Value) {
+        self.post("/api/v1/jobs", json!({"kind": kind, "payload": payload, "targets": targets})).await
+    }
+
+    /// Cancels a job and returns the status and body.
+    pub async fn cancel(&self, job_id: &str) -> (u16, Value) {
+        self.post(&format!("/api/v1/jobs/{job_id}/cancel"), json!({})).await
     }
 
     pub async fn devices(&self) -> Vec<Value> {
@@ -152,6 +205,29 @@ impl TestServer {
         let targets = job["targets"].as_array().unwrap();
         assert_eq!(targets.len(), 1);
         targets[0].clone()
+    }
+
+    /// Waits until the target of a job on `device_id` is in `state`.
+    pub async fn wait_for_target_state_of(&self, job_id: &str, device_id: &str, state: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let job = self.job(job_id).await;
+            let target = job["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["device_id"] == device_id)
+                .unwrap_or_else(|| panic!("no target for {device_id}"))
+                .clone();
+            if target["state"] == state {
+                return target;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "target of {device_id} never reached state {state}; last seen: {target}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     pub async fn wait_for_target_state(&self, job_id: &str, state: &str) -> Value {
@@ -319,6 +395,29 @@ impl FakeClient {
                 other => panic!("expected job, got {other:?}"),
             }
         }
+    }
+
+    /// Waits for a `job.cancel` and returns the target it names.
+    pub async fn expect_cancel(&mut self) -> String {
+        loop {
+            match self.recv().await {
+                Some(ServerMessage::JobCancel { job_target_id }) => return job_target_id,
+                Some(ServerMessage::HeartbeatAck) => continue,
+                other => panic!("expected job.cancel, got {other:?}"),
+            }
+        }
+    }
+
+    /// Reports a target as stopped on request, the way a real client answers `job.cancel`.
+    pub async fn result_cancelled(&mut self, target_id: &str) {
+        self.send(ClientMessage::JobResult(JobResult {
+            job_target_id: target_id.to_owned(),
+            status: JobStatus::Failed,
+            exit_code: None,
+            reason: Some(protocol::reason::CANCELLED.to_owned()),
+            message: Some("cancelled by the operator".into()),
+        }))
+        .await;
     }
 
     pub async fn expect_result_ack(&mut self, target_id: &str) {

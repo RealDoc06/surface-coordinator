@@ -346,7 +346,7 @@ async fn job_creation_is_validated() {
     let payload = json!({"shell": "powershell", "body": "Get-Date"});
 
     let cases = [
-        (json!({"kind": "power", "payload": {"action": "restart"}, "targets": targets}), "unsupported_kind"),
+        (json!({"kind": "teleport", "payload": {"destination": "moon"}, "targets": targets}), "unsupported_kind"),
         (json!({"kind": "script.run", "payload": {"shell": "bash", "body": "ls"}, "targets": targets}), "invalid_payload"),
         (json!({"kind": "script.run", "payload": {"shell": "cmd", "body": "  "}, "targets": targets}), "invalid_payload"),
         (json!({"kind": "script.run", "payload": {"shell": "cmd", "body": "dir", "timeout_secs": 0}, "targets": targets}), "invalid_payload"),
@@ -362,7 +362,7 @@ async fn job_creation_is_validated() {
 
     // A target type this version does not know is a client error too.
     let (status, _) = server
-        .post("/api/v1/jobs", json!({"kind": "script.run", "payload": payload, "targets": {"type": "group", "group_id": "g"}}))
+        .post("/api/v1/jobs", json!({"kind": "script.run", "payload": payload, "targets": {"type": "planet"}}))
         .await;
     assert!((400..500).contains(&status));
 

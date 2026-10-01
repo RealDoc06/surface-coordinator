@@ -274,3 +274,128 @@ async fn a_presumed_handoff_is_announced() {
     assert!(event["target"]["exit_code"].is_null());
     assert!(event["target"]["message"].as_str().unwrap().contains("presumed to have joined"));
 }
+
+#[tokio::test]
+async fn cancelling_announces_each_target_that_changed_at_once() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    FakeClient::connect(&server, &key, "device-a").await.disconnect().await;
+    let mut online = FakeClient::connect(&server, &key, "device-b").await;
+    let job = server.create_script_job(json!({"type": "all"})).await;
+    let job_id = job["id"].as_str().unwrap();
+    let (target_id, ..) = online.expect_job().await;
+    online.started(&target_id).await;
+    server.wait_for_target_state_of(job_id, "device-b", "running").await;
+    let mut events = Events::open(&server).await;
+
+    let (status, _) = server.cancel(job_id).await;
+    assert_eq!(status, 200);
+    // The queued target changes at once ...
+    let event = events.next_of("job.target.updated").await;
+    assert_eq!(event["job_id"], job_id);
+    assert_eq!(event["target"]["device_id"], "device-a");
+    assert_eq!(event["target"]["state"], "failed");
+    assert_eq!(event["target"]["reason"], "cancelled");
+    assert!(event["target"].get("output").is_none());
+    // ... the running one only when its device confirms.
+    assert!(events.nothing_within(Duration::from_millis(200)).await);
+    assert_eq!(online.expect_cancel().await, target_id);
+    online.result_cancelled(&target_id).await;
+    let event = events.next_of("job.target.updated").await;
+    assert_eq!(event["target"]["device_id"], "device-b");
+    assert_eq!(event["target"]["state"], "failed");
+    assert_eq!(event["target"]["reason"], "cancelled");
+
+    // Cancelling a job with nothing left to cancel announces nothing.
+    server.cancel(job_id).await;
+    assert!(events.nothing_within(Duration::from_millis(200)).await);
+}
+
+#[tokio::test]
+async fn cancelling_a_running_target_of_an_offline_device_is_announced() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let job = server.create_script_job(json!({"type": "all"})).await;
+    let job_id = job["id"].as_str().unwrap();
+    let (target_id, ..) = client.expect_job().await;
+    client.started(&target_id).await;
+    server.wait_for_target_state(job_id, "running").await;
+    client.disconnect().await;
+    assert!(common::wait_until(|| async { !server.is_online("device-a").await }).await);
+    let mut events = Events::open(&server).await;
+
+    server.cancel(job_id).await;
+    let event = events.next_of("job.target.updated").await;
+    assert_eq!(event["target"]["id"], target_id.as_str());
+    assert_eq!(event["target"]["state"], "failed");
+    assert_eq!(event["target"]["reason"], "cancelled");
+}
+
+#[tokio::test]
+async fn group_changes_are_announced() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let _a = FakeClient::connect(&server, &key, "device-a").await;
+    let mut events = Events::open(&server).await;
+    let changed = json!({"type": "groups.changed"});
+
+    let group = server.create_group("Lab").await;
+    let id = group["id"].as_str().unwrap();
+    assert_eq!(events.next_of("groups.changed").await, changed);
+
+    server.patch(&format!("/api/v1/groups/{id}"), json!({"name": "Lab 2"})).await;
+    assert_eq!(events.next_of("groups.changed").await, changed);
+
+    server.set_members(id, &["device-a"]).await;
+    assert_eq!(events.next_of("groups.changed").await, changed);
+
+    server.delete(&format!("/api/v1/groups/{id}")).await;
+    assert_eq!(events.next_of("groups.changed").await, changed);
+
+    // Requests that change nothing announce nothing.
+    let (status, _) = server.post("/api/v1/groups", json!({"name": " "})).await;
+    assert_eq!(status, 400);
+    let (status, _) = server.delete(&format!("/api/v1/groups/{id}")).await;
+    assert_eq!(status, 404);
+    let (status, _) = server.put("/api/v1/groups/nope/members", json!({"device_ids": []})).await;
+    assert_eq!(status, 404);
+    assert!(events.nothing_within(Duration::from_millis(200)).await);
+}
+
+#[tokio::test]
+async fn forgetting_a_device_in_a_group_announces_the_change_but_forgetting_any_other_does_not() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let _a = FakeClient::connect(&server, &key, "device-a").await;
+    let _b = FakeClient::connect(&server, &key, "device-b").await;
+    let group = server.create_group("Lab").await;
+    server.set_members(group["id"].as_str().unwrap(), &["device-a"]).await;
+    let mut events = Events::open(&server).await;
+
+    server.delete("/api/v1/devices/device-b").await;
+    assert_eq!(events.next().await, json!({"type": "device.removed", "device_id": "device-b"}));
+    assert!(events.nothing_within(Duration::from_millis(200)).await);
+
+    server.delete("/api/v1/devices/device-a").await;
+    // The device goes first, so a view that reacts to `groups.changed` by
+    // refetching sees the membership already gone.
+    assert_eq!(events.next().await, json!({"type": "device.removed", "device_id": "device-a"}));
+    assert_eq!(events.next().await, json!({"type": "groups.changed"}));
+}
+
+#[tokio::test]
+async fn device_updates_carry_the_groups_of_the_device() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    FakeClient::connect(&server, &key, "device-a").await.disconnect().await;
+    let group = server.create_group("Lab").await;
+    let id = group["id"].as_str().unwrap();
+    server.set_members(id, &["device-a"]).await;
+    let mut events = Events::open(&server).await;
+
+    let _client = FakeClient::connect(&server, &key, "device-a").await;
+    let event = events.next_of("device.updated").await;
+    assert_eq!(event["device"]["id"], "device-a");
+    assert_eq!(event["device"]["group_ids"], json!([id]));
+}

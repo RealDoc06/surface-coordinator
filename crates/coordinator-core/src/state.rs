@@ -125,6 +125,18 @@ impl AppState {
         self.connections().get(device_id).cloned()
     }
 
+    /// Asks a device to stop a job target. Returns false if the device has no
+    /// live connection, or the connection is already winding down and will
+    /// not deliver the message.
+    pub fn signal_cancel(&self, device_id: &str, job_target_id: &str) -> bool {
+        self.connection(device_id).is_some_and(|connection| {
+            connection
+                .outbound
+                .send(ServerMessage::JobCancel { job_target_id: job_target_id.to_owned() })
+                .is_ok()
+        })
+    }
+
     /// Sends pending job targets to a device if it is connected. With
     /// `include_unresolved`, targets it may already have are sent again.
     pub async fn dispatch(&self, device_id: &str, include_unresolved: bool) {

@@ -9,13 +9,16 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use protocol::{job_kind, ScriptRunPayload, WifiJoinPayload};
+use protocol::{
+    job_kind, AppLaunchPayload, PowerPayload, ScriptRunPayload, SettingApplyPayload, WifiJoinPayload,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{self, Identity};
 use crate::events::{self, Event};
 use crate::state::AppState;
+use crate::{groups, scripts};
 use crate::store::{self, CreateJobError, Targets};
 use crate::AuthMode;
 
@@ -28,6 +31,9 @@ const MAX_SSID_BYTES: usize = 32;
 const MIN_WIFI_PASSWORD_CHARS: usize = 8;
 const MAX_WIFI_PASSWORD_CHARS: usize = 63;
 const MAX_COORDINATOR_URL_BYTES: usize = 2048;
+const MAX_APP_PATH_CHARS: usize = 1024;
+const MAX_APP_ARGUMENTS: usize = 64;
+const MAX_APP_ARGUMENT_CHARS: usize = 1024;
 
 pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let open = Router::new()
@@ -42,6 +48,13 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices/{id}", get(get_device).delete(delete_device))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/settings-catalogue", get(settings_catalogue))
+        .route("/groups", get(groups::list).post(groups::create))
+        .route("/groups/{id}", axum::routing::patch(groups::rename).delete(groups::delete))
+        .route("/groups/{id}/members", axum::routing::put(groups::set_members))
+        .route("/scripts", get(scripts::list).post(scripts::create))
+        .route("/scripts/{id}", axum::routing::put(scripts::replace).delete(scripts::delete))
         .route("/enrollment-keys", get(list_keys).post(create_key))
         .route("/enrollment-keys/{id}/secret", get(export_key))
         .route("/enrollment-keys/{id}/revoke", post(revoke_key))
@@ -76,11 +89,11 @@ impl ApiError {
         ApiError { status, code, message: message.into() }
     }
 
-    fn bad_request(code: &'static str, message: impl Into<String>) -> ApiError {
+    pub(crate) fn bad_request(code: &'static str, message: impl Into<String>) -> ApiError {
         ApiError::new(StatusCode::BAD_REQUEST, code, message)
     }
 
-    fn not_found(what: &str) -> ApiError {
+    pub(crate) fn not_found(what: &str) -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, "not_found", format!("no such {what}"))
     }
 
@@ -103,9 +116,9 @@ impl From<crate::Error> for ApiError {
     }
 }
 
-type ApiResult<T = Json<Value>> = Result<T, ApiError>;
+pub(crate) type ApiResult<T = Json<Value>> = Result<T, ApiError>;
 
-fn no_content() -> Response {
+pub(crate) fn no_content() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -353,11 +366,14 @@ async fn delete_device(State(state): State<Arc<AppState>>, Path(id): Path<String
     state.drop_connection(&id);
     let device_id = id.clone();
     let deleted = state.store.call(move |conn| store::delete_device(conn, &device_id)).await?;
-    if !deleted {
+    let Some(deleted) = deleted else {
         return Err(ApiError::not_found("device"));
-    }
+    };
     tracing::info!(device_id = %id, "device forgotten");
     state.publish(Event::DeviceRemoved { device_id: id });
+    if deleted.was_in_group {
+        state.publish(Event::GroupsChanged);
+    }
     Ok(no_content())
 }
 
@@ -375,6 +391,7 @@ struct CreateJob {
 enum TargetSelector {
     All,
     Devices { device_ids: Vec<String> },
+    Group { group_id: String },
 }
 
 /// Checks a payload for its kind and returns it with defaults filled in.
@@ -432,6 +449,38 @@ fn validate_payload(kind: &str, payload: Value) -> Result<Value, ApiError> {
             }
             Ok(serde_json::to_value(wifi).expect("payload serialises"))
         }
+        job_kind::APP_LAUNCH => {
+            let launch: AppLaunchPayload = serde_json::from_value(payload)
+                .map_err(|e| ApiError::bad_request("invalid_payload", e.to_string()))?;
+            let invalid = |message: String| Err(ApiError::bad_request("invalid_payload", message));
+            if launch.path.is_empty() || launch.path.chars().count() > MAX_APP_PATH_CHARS {
+                return invalid(format!("path must be 1 to {MAX_APP_PATH_CHARS} characters"));
+            }
+            if launch.arguments.len() > MAX_APP_ARGUMENTS {
+                return invalid(format!("at most {MAX_APP_ARGUMENTS} arguments are allowed"));
+            }
+            if launch.arguments.iter().any(|a| a.chars().count() > MAX_APP_ARGUMENT_CHARS) {
+                return invalid(format!("each argument must be at most {MAX_APP_ARGUMENT_CHARS} characters"));
+            }
+            // A NUL ends a string for the Windows API the client calls, so
+            // what would run is not what the operator wrote.
+            if launch.path.contains('\0') || launch.arguments.iter().any(|a| a.contains('\0')) {
+                return invalid("path and arguments must not contain NUL characters".to_owned());
+            }
+            Ok(serde_json::to_value(launch).expect("payload serialises"))
+        }
+        job_kind::SETTING_APPLY => {
+            let apply: SettingApplyPayload = serde_json::from_value(payload)
+                .map_err(|e| ApiError::bad_request("invalid_payload", e.to_string()))?;
+            protocol::settings::validate(&apply.setting, &apply.value)
+                .map_err(|message| ApiError::bad_request("invalid_payload", message))?;
+            Ok(serde_json::to_value(apply).expect("payload serialises"))
+        }
+        job_kind::POWER => {
+            let power: PowerPayload = serde_json::from_value(payload)
+                .map_err(|e| ApiError::bad_request("invalid_payload", e.to_string()))?;
+            Ok(serde_json::to_value(power).expect("payload serialises"))
+        }
         other => Err(ApiError::bad_request(
             "unsupported_kind",
             format!("job kind {other:?} is not supported by this coordinator"),
@@ -448,6 +497,7 @@ async fn create_job(
     let targets = match request.targets {
         TargetSelector::All => Targets::All,
         TargetSelector::Devices { device_ids } => Targets::Devices(device_ids),
+        TargetSelector::Group { group_id } => Targets::Group(group_id),
     };
     let kind = request.kind;
     let created_by = identity.username().map(str::to_owned);
@@ -459,6 +509,9 @@ async fn create_job(
         Ok(job) => job,
         Err(CreateJobError::UnknownDevice(id)) => {
             return Err(ApiError::bad_request("unknown_device", format!("no device with id {id:?}")))
+        }
+        Err(CreateJobError::UnknownGroup(id)) => {
+            return Err(ApiError::bad_request("unknown_group", format!("no group with id {id:?}")))
         }
         Err(CreateJobError::NoTargets) => {
             return Err(ApiError::bad_request("no_targets", "the job would have no target devices"))
@@ -490,6 +543,36 @@ async fn get_job(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
         Some(job) => Ok(Json(json!({ "job": job }))),
         None => Err(ApiError::not_found("job")),
     }
+}
+
+async fn cancel_job(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult {
+    // Whether a device is online is decided while holding the presence lock,
+    // as in `delete_device`: a device cannot connect or leave between being
+    // sent the cancel and the target being left for it to answer (or, if it
+    // is gone, failed here).
+    let presence = state.presence.lock().await;
+    let live = Arc::clone(&state);
+    let cancelled = state
+        .store
+        .call(move |conn| {
+            store::cancel_job(conn, &id, |device_id, target_id| live.signal_cancel(device_id, target_id))
+        })
+        .await?;
+    drop(presence);
+    let Some(cancelled) = cancelled else {
+        return Err(ApiError::not_found("job"));
+    };
+    if !cancelled.changes.is_empty() {
+        tracing::info!(job_id = %cancelled.job.id, changed = cancelled.changes.len(), "job cancelled");
+    }
+    for change in cancelled.changes {
+        state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+    }
+    Ok(Json(json!({ "job": cancelled.job })))
+}
+
+async fn settings_catalogue() -> Json<Value> {
+    Json(json!({ "settings": protocol::settings::catalogue() }))
 }
 
 // ---------------------------------------------------------------- enrollment keys
