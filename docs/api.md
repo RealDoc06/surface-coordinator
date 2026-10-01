@@ -338,3 +338,52 @@ type Script = {
   updated_at: number
 }
 ```
+
+## Milestone 5 additions
+
+### Client versions
+
+`Device` gains `protocol_version: number`, `restricted: boolean` (connected
+with a protocol version this coordinator no longer supports; it only accepts
+`client.update`) and `update_available: boolean` (its `client_version` is
+older than the newest cached client version).
+
+### Updates
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /updates` | | `200 Updates` |
+| `POST /updates/check` | | `200 Updates` after checking the release source now; `502 update_check_failed` (message says why; `Updates.last_error` is set too) |
+
+```ts
+type Updates = {
+  enabled: boolean               // false: no update key is built in or checking is turned off
+  source: string | null          // e.g. "RealDoc06/surface-coordinator"
+  last_checked_at: number | null
+  last_error: string | null
+  latest: ClientRelease | null   // newest cached, verified version
+  cached: ClientRelease[]        // newest first
+}
+type ClientRelease = {
+  version: string                // "1.2.3"
+  target: string                 // "windows-x86_64"
+  size: number
+  sha256: string
+  cached_at: number
+  notes: string | null
+}
+```
+
+### `client.update` jobs
+
+`POST /jobs` accepts `kind: 'client.update'` with payload
+`{ version: string; downgrade?: boolean }`. The version must be cached
+(`400 invalid_payload` otherwise); the coordinator fills in `size`, `sha256`
+and `target` before dispatch. Devices already on that version finish as
+`succeeded` with a message saying so. New failure reasons: `bad_signature`,
+`bad_hash`, `downgrade_refused`, `download_failed`, `rolled_back`.
+
+### Downloads for clients (not under `/api`, no authentication)
+
+`GET /updates/client/<version>/<target>` and
+`GET /updates/client/<version>/<target>.sig`, served where clients connect.
