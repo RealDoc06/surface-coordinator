@@ -13,6 +13,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
 };
+use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 
 use super::{
     OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo, Utf8Decoder,
@@ -45,6 +46,22 @@ impl WindowsPlatform {
 fn system32() -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     Path::new(&root).join("System32")
+}
+
+/// The full host name. `COMPUTERNAME` is the NetBIOS name, cut at 15
+/// characters.
+fn hostname() -> Option<String> {
+    let mut length = 0u32;
+    // SAFETY: the first call only asks for the required length; the second
+    // writes at most `length` UTF-16 units into a buffer of that size.
+    unsafe {
+        GetComputerNameExW(ComputerNameDnsHostname, std::ptr::null_mut(), &mut length);
+        let mut buffer = vec![0u16; length as usize];
+        if GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &mut length) == 0 {
+            return None;
+        }
+        String::from_utf16(&buffer[..length as usize]).ok().filter(|name| !name.is_empty())
+    }
 }
 
 /// A Job Object holding the script's process tree, so that a timeout can
@@ -130,7 +147,9 @@ async fn pump(
 impl Platform for WindowsPlatform {
     fn system_info(&self) -> SystemInfo {
         SystemInfo {
-            hostname: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into()),
+            hostname: hostname()
+                .or_else(|| std::env::var("COMPUTERNAME").ok())
+                .unwrap_or_else(|| "unknown".into()),
             os: "windows".into(),
         }
     }
