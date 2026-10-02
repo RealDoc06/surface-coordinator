@@ -153,10 +153,17 @@ export function DevicesPage() {
               {localWifi.warning}
             </p>
           ) : null}
-          <p className="muted">
-            They will reach this coordinator at <code>{localWifi.coordinator_url}</code> from then on. A device that
-            cannot join comes back to the hotspot and reports the failure.
-          </p>
+          {localWifi.coordinator === 'online' ? (
+            <p className="muted">
+              They will connect to the online coordinator at <code>{localWifi.coordinator_url}</code> from then on and
+              leave this local one; this job is marked as succeeded once they have been gone for two minutes.
+            </p>
+          ) : (
+            <p className="muted">
+              They will reach this coordinator at <code>{localWifi.coordinator_url}</code> from then on. A device that
+              cannot join comes back to the hotspot and reports the failure.
+            </p>
+          )}
         </ConfirmDialog>
       ) : null}
     </>

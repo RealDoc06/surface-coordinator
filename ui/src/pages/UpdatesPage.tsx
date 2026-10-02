@@ -2,11 +2,43 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, errorMessage } from '../api/client'
 import type { Updates } from '../api/types'
+import { AutoUpdateSwitch, RolloutStatus } from '../components/AutoUpdates'
 import { ErrorNote } from '../components/bits'
+import { ClientUploadForm } from '../components/ClientUploadForm'
 import { formatBytes, formatDateTime, plural, relativeTime, useNow } from '../lib/format'
 import type { ComposeRequest } from '../lib/targets'
 import { useStore } from '../state/StoreProvider'
 import { sortedDevices } from '../state/store'
+
+/** Where the coordinator looks for releases by itself, and how that last went. */
+function ReleaseSource({ updates, now }: { updates: Updates; now: number }) {
+  return (
+    <section className="panel" aria-labelledby="source">
+      <h2 id="source">Release source</h2>
+      <dl className="fields">
+        <div>
+          <dt>Checking</dt>
+          <dd>{updates.enabled ? 'on' : 'off'}</dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd>{updates.source ? <span className="mono">{updates.source}</span> : <span className="muted">none</span>}</dd>
+        </div>
+        <div>
+          <dt>Last checked</dt>
+          <dd title={updates.last_checked_at !== null ? formatDateTime(updates.last_checked_at) : undefined}>
+            {updates.last_checked_at !== null ? relativeTime(updates.last_checked_at, now) : <span className="muted">never</span>}
+          </dd>
+        </div>
+      </dl>
+      {updates.last_error ? (
+        <p className="error" role="alert">
+          Last check failed: {updates.last_error}
+        </p>
+      ) : null}
+    </section>
+  )
+}
 
 export function UpdatesPage() {
   const { state, reload } = useStore()
@@ -33,6 +65,9 @@ export function UpdatesPage() {
       cancelled = true
     }
   }, [state.syncEpoch])
+
+  // Older coordinators do not say; they always check.
+  const checksReleases = updates?.checking !== false
 
   const outdated = useMemo(() => sortedDevices(state).filter((d) => d.update_available === true), [state.devices])
 
@@ -65,9 +100,11 @@ export function UpdatesPage() {
       <div className="page-head">
         <h1>Updates</h1>
         <span className="toolbar-spacer" />
-        <button type="button" onClick={() => void checkNow()} disabled={checking || (updates !== null && !updates.enabled)}>
-          {checking ? 'Checking…' : 'Check now'}
-        </button>
+        {checksReleases ? (
+          <button type="button" onClick={() => void checkNow()} disabled={checking || (updates !== null && !updates.enabled)}>
+            {checking ? 'Checking…' : 'Check now'}
+          </button>
+        ) : null}
       </div>
       <ErrorNote message={error} onRetry={reload} />
       <ErrorNote message={checkError} />
@@ -76,40 +113,25 @@ export function UpdatesPage() {
         error ? null : <p className="muted">Loading&hellip;</p>
       ) : (
         <>
-          {!updates.enabled ? (
-            <div className="notice" role="note">
-              <p>
-                <strong>Update checking is off.</strong> This build of the coordinator has no update signing key built
-                in, or checking has been turned off, so it cannot look for new client versions. Versions that were
-                downloaded earlier can still be installed.
-              </p>
-            </div>
+          {updates.rollout ? (
+            <section className="panel" aria-labelledby="rollout">
+              <h2 id="rollout">Rollout</h2>
+              <RolloutStatus rollout={updates.rollout} />
+            </section>
           ) : null}
 
-          <section className="panel" aria-labelledby="source">
-            <h2 id="source">Release source</h2>
-            <dl className="fields">
-              <div>
-                <dt>Checking</dt>
-                <dd>{updates.enabled ? 'on' : 'off'}</dd>
-              </div>
-              <div>
-                <dt>Source</dt>
-                <dd>{updates.source ? <span className="mono">{updates.source}</span> : <span className="muted">none</span>}</dd>
-              </div>
-              <div>
-                <dt>Last checked</dt>
-                <dd title={updates.last_checked_at !== null ? formatDateTime(updates.last_checked_at) : undefined}>
-                  {updates.last_checked_at !== null ? relativeTime(updates.last_checked_at, now) : <span className="muted">never</span>}
-                </dd>
-              </div>
-            </dl>
-            {updates.last_error ? (
-              <p className="error" role="alert">
-                Last check failed: {updates.last_error}
-              </p>
-            ) : null}
-          </section>
+          {updates.auto_update !== undefined ? (
+            <section className="panel" aria-labelledby="auto">
+              <h2 id="auto">Automatic updates</h2>
+              <AutoUpdateSwitch enabled={updates.auto_update} onChanged={setUpdates} />
+            </section>
+          ) : null}
+
+          {checksReleases ? (
+            <ReleaseSource updates={updates} now={now} />
+          ) : (
+            <p className="muted">Updates are provided by upload; this coordinator does not check a release source.</p>
+          )}
 
           <section className="panel" aria-labelledby="newest">
             <h2 id="newest">Newest client version</h2>
@@ -127,7 +149,7 @@ export function UpdatesPage() {
             ) : (
               <p className="muted">
                 No client version has been downloaded yet.{' '}
-                {updates.enabled ? 'Use “Check now” to look for one.' : ''}
+                {!updates.enabled ? '' : checksReleases ? 'Use “Check now” to look for one.' : 'Upload one below.'}
               </p>
             )}
             <p>
@@ -145,6 +167,18 @@ export function UpdatesPage() {
                 Update all outdated devices&hellip;
               </button>
             </div>
+          </section>
+
+          <section className="panel" aria-labelledby="upload">
+            <h2 id="upload">Upload a client build</h2>
+            {updates.enabled ? (
+              <ClientUploadForm onUploaded={setUpdates} />
+            ) : (
+              <p className="muted">
+                Uploads are off: this coordinator has no update key built in, so it cannot verify client builds or
+                install them on devices. Versions that were downloaded earlier can still be installed.
+              </p>
+            )}
           </section>
 
           <section aria-labelledby="cached">

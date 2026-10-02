@@ -81,11 +81,11 @@ describe('client versions in the UI', () => {
 })
 
 describe('Updates page', () => {
-  it('explains that checking is off when the build has no key or it is turned off', async () => {
+  it('hides the upload form and says why when the build has no update key', async () => {
     fakeCoordinator({ updates: emptyUpdates({ enabled: false, source: null }) })
     start('/updates')
-    expect(await screen.findByText('Update checking is off.')).toBeInTheDocument()
-    expect(screen.getByText(/no update signing key built in, or checking has been turned off/)).toBeInTheDocument()
+    expect(await screen.findByText(/this coordinator has no update key built in/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('Client executable')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Check now' })).toBeDisabled()
   })
 

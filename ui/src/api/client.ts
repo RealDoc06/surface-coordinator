@@ -63,7 +63,7 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, code, message)
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: 'same-origin',
@@ -73,7 +73,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         : { Accept: 'application/json', 'Content-Type': 'application/json' },
   }
   if (body !== undefined) init.body = JSON.stringify(body)
+  return send<T>(path, init)
+}
 
+async function send<T>(path: string, init: RequestInit): Promise<T> {
   let res: Response
   try {
     res = await fetch(`${API_BASE}${path}`, init)
@@ -94,6 +97,30 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 const seg = encodeURIComponent
+
+export type ClientUpload = {
+  /** The signed client executable; sent as the request body without reading it into memory. */
+  file: File
+  /** "1.2.3" */
+  version: string
+  /** Base64 signature over the file, version and target. */
+  signature: string
+  notes?: string
+}
+
+/** The one target the UI uploads builds for. */
+export const UPLOAD_TARGET = 'windows-x86_64'
+
+function uploadClient({ file, version, signature, notes }: ClientUpload) {
+  const params = new URLSearchParams({ version, target: UPLOAD_TARGET })
+  if (notes) params.set('notes', notes)
+  return send<Updates>(`/updates/upload?${params.toString()}`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/octet-stream', 'X-Signature': signature },
+    body: file,
+  })
+}
 
 export const api = {
   // Session and authentication
@@ -150,6 +177,9 @@ export const api = {
   // Client updates
   getUpdates: () => request<Updates>('GET', '/updates'),
   checkUpdates: () => request<Updates>('POST', '/updates/check'),
+  /** Adds a client build signed with the update key to the cache. */
+  uploadClient,
+  setAutoUpdate: (enabled: boolean) => request<Updates>('POST', '/updates/auto', { enabled }),
 
   // Enrollment keys
   listKeys: () => request<{ keys: Key[] }>('GET', '/enrollment-keys'),
@@ -192,6 +222,13 @@ const MESSAGES: Record<string, string> = {
   invalid_key: 'The key id or secret is not valid.',
   key_exists: 'An enrollment key with that id already exists.',
   key_revoked: 'That enrollment key has been revoked. Choose another one.',
+  invalid_version: 'The version must have three numbers, like 1.2.3.',
+  unsupported_target: 'This coordinator does not take client builds for that platform.',
+  bad_signature: "The signature does not match this file, version and the coordinator's update key.",
+  version_exists: 'That version has already been uploaded. Use a new version number.',
+  too_large: 'The file is too large for this coordinator.',
+  http_413: 'The file is too large for this coordinator, or for a proxy in front of it.',
+  updates_unavailable: 'This coordinator has no update key built in, so it cannot take client builds.',
   unauthorized: 'You are no longer signed in.',
   network_error: 'Could not reach the coordinator.',
 }

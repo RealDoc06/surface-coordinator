@@ -192,6 +192,11 @@ export function fakeCoordinator(initial: Partial<Omit<FakeServer, 'calls'>> = {}
       return server.updates ? { body: server.updates } : undefined
     }
 
+    if (path === '/updates/auto' && method === 'POST' && server.updates) {
+      server.updates = { ...server.updates, auto_update: (body as { enabled: boolean }).enabled }
+      return { body: server.updates }
+    }
+
     // Jobs
     if (method === 'POST' && path === '/jobs') {
       const request = body as { kind: string; payload: unknown; targets: { type: string; device_ids?: string[]; group_id?: string } }

@@ -180,6 +180,12 @@ export type ManagerWifi = {
   secured: boolean
   /** Where moved devices will find this coordinator. */
   coordinator_url: string | null
+  /**
+   * Which coordinator moved devices connect to: the online one (this local
+   * coordinator is left behind) or this local one. Optional: older managers
+   * do not send it, and then it is the local one.
+   */
+  coordinator?: 'online' | 'local'
   /** Why not, when unavailable. */
   reason: string | null
   /** A problem that will probably make the move fail, when available. */
@@ -245,9 +251,29 @@ export type ClientRelease = {
   notes: string | null
 }
 
+export type RolloutState = 'canary' | 'rolling' | 'halted' | 'done'
+
+/** The staged rollout of the newest version (automatic updates). */
+export type Rollout = {
+  version: string
+  state: RolloutState
+  canary_device_id: string | null
+  /** devices on that version */
+  updated: number
+  /** devices still to update */
+  pending: number
+  /** devices whose update failed */
+  failed: number
+}
+
 export type Updates = {
-  /** false: no update key is built in or checking is turned off */
+  /** An update key is built in: uploads and client updates are possible. */
   enabled: boolean
+  /**
+   * The coordinator also checks the release source by itself. Optional: older
+   * coordinators do not send it, and then they do check.
+   */
+  checking?: boolean
   /** e.g. "RealDoc06/surface-coordinator" */
   source: string | null
   last_checked_at: number | null
@@ -256,6 +282,10 @@ export type Updates = {
   latest: ClientRelease | null
   /** newest first */
   cached: ClientRelease[]
+  /** Optional: older coordinators have no automatic updates. */
+  auto_update?: boolean
+  /** Optional likewise; null when no rollout is under way or finished. */
+  rollout?: Rollout | null
 }
 
 export type ServerEvent =
