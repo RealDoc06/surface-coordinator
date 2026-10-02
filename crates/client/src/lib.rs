@@ -112,7 +112,7 @@ impl ClientConfig {
             state_dir: None,
             backoff: BackoffConfig::default(),
             handshake_timeout: Duration::from_secs(10),
-            search_after: Duration::from_secs(60),
+            search_after: Duration::from_secs(20),
             search_interval: Duration::from_secs(30),
             handoff_timeout: Duration::from_secs(60),
             offline_search_interval: Duration::from_secs(10),
