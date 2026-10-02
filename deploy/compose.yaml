@@ -1,0 +1,14 @@
+# Surface Coordinator behind a TLS-terminating reverse proxy.
+#   docker compose up -d
+#   docker compose exec coordinator coordinator account create <username>
+services:
+  coordinator:
+    image: surface-coordinator:latest
+    restart: unless-stopped
+    ports:
+      # Point the reverse proxy here. Change the left side to taste.
+      - "${SC_PUBLISH:-127.0.0.1:8080}:8080"
+    volumes:
+      - data:/data
+volumes:
+  data:
