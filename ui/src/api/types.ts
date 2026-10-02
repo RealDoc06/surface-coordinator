@@ -172,6 +172,18 @@ export type JobOutputEvent = {
 export type HotspotControl = 'automatic' | 'manual' | 'unsupported'
 export type HotspotState = 'off' | 'starting' | 'on' | 'error'
 
+/** The Wi-Fi network the manager's computer is on (only when `capabilities.hotspot`). */
+export type ManagerWifi = {
+  /** Whether devices can be moved to it without typing anything. */
+  available: boolean
+  ssid: string | null
+  secured: boolean
+  /** Where moved devices will find this coordinator. */
+  coordinator_url: string | null
+  /** Why not, when unavailable. */
+  reason: string | null
+}
+
 /** The manager's hotspot (only when `capabilities.hotspot`). */
 export type Hotspot = {
   /** manual: the operator enables it by hand (macOS) */

@@ -13,6 +13,8 @@ fn options() -> Options {
         client_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         // Never this computer's real hotspot.
         hotspot: Arc::new(hotspot::Unsupported),
+        // Nor its real Wi-Fi.
+        wifi: Arc::new(manager::wifi::Unsupported),
     }
 }
 

@@ -24,6 +24,10 @@ type Props = {
   onRun: (targets: TargetSpec) => void
   /** The user asked to move these targets to another Wi-Fi network. */
   onMove: (targets: TargetSpec) => void
+  /** Name of the Wi-Fi network the manager's computer is on, when devices can be moved to it directly. */
+  localWifi?: string
+  /** The user asked to move these targets to that network. */
+  onMoveLocal?: (targets: TargetSpec) => void
   /** Every group (names for the chips and the filter). */
   groups?: Group[]
   /** The user chose another action (launch app, setting, power, client update) for these targets. */
@@ -66,6 +70,8 @@ export function DeviceList({
   initialSelected,
   onRun,
   onMove,
+  localWifi,
+  onMoveLocal,
   groups = [],
   onAction,
   onLibrary,
@@ -219,6 +225,16 @@ export function DeviceList({
           >
             Move to Wi-Fi&hellip;
           </button>
+          {localWifi && onMoveLocal ? (
+            <button
+              type="button"
+              disabled={selectedIds.length === 0}
+              title="The Wi-Fi network this computer is on; no password needed"
+              onClick={() => onMoveLocal({ type: 'devices', device_ids: selectedIds })}
+            >
+              Move to {localWifi}
+            </button>
+          ) : null}
           <MenuButton label="More actions…" items={moreItems} />
           <button type="button" onClick={() => onRun({ type: 'all' })}>
             Run on all devices

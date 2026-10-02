@@ -109,6 +109,7 @@ impl Manager {
             // The app uses the fixed client port; tests must not collide.
             client_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             hotspot: control,
+            wifi: Arc::new(manager::wifi::Unsupported),
         };
         let embedded = Embedded::start(data_dir.path(), options).await.unwrap();
         let token = embedded.entry_url().split_once("#token=").unwrap().1.to_owned();

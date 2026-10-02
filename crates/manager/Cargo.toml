@@ -32,6 +32,8 @@ tracing-subscriber.workspace = true
 url = "2"
 
 [target.'cfg(windows)'.dependencies]
+# The current Wi-Fi network and its saved profile (Native Wi-Fi API).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_NetworkManagement_WiFi"] }
 # Mobile Hotspot (WinRT tethering API). 0.62 is what Tauri already pulls in.
 windows = { version = "0.62", features = [
     "Foundation",

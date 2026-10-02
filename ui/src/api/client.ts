@@ -9,6 +9,8 @@ import type {
   DeviceTarget,
   Group,
   Hotspot,
+  ManagerWifi,
+  TargetSpec,
   Job,
   Key,
   KeyWithSecret,
@@ -162,6 +164,10 @@ export const api = {
   getHotspot: () => request<Hotspot>('GET', '/manager/hotspot'),
   startHotspot: (keyId: string) => request<Hotspot>('POST', '/manager/hotspot/start', { key_id: keyId }),
   stopHotspot: () => request<Hotspot>('POST', '/manager/hotspot/stop'),
+  /** The network the manager's computer is on; the password stays with the manager. */
+  getManagerWifi: () => request<ManagerWifi>('GET', '/manager/wifi'),
+  /** Moves devices to that network; the manager fills in SSID, password and coordinator address. */
+  moveToManagerWifi: (targets: TargetSpec) => request<{ job: Job }>('POST', '/manager/wifi/move', { targets }),
 
   // Rejected connection attempts
   listRejected: () => request<{ rejected: Rejected[] }>('GET', '/rejected-connections'),

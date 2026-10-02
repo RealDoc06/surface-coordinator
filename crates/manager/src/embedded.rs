@@ -12,6 +12,7 @@ use std::sync::Arc;
 use coordinator_core::{AuthMode, Capabilities, Config, Coordinator};
 
 use crate::hotspot::{self, Control, HotspotControl, HotspotService};
+use crate::wifi::{self, WifiService, WifiSource};
 
 pub struct Embedded {
     coordinator: Coordinator,
@@ -25,6 +26,8 @@ pub struct Options {
     pub client_bind: SocketAddr,
     /// Turns this computer's hotspot on and off.
     pub hotspot: Arc<dyn HotspotControl>,
+    /// Reads the Wi-Fi network this computer is on.
+    pub wifi: Arc<dyn WifiSource>,
 }
 
 impl Default for Options {
@@ -32,6 +35,7 @@ impl Default for Options {
         Options {
             client_bind: SocketAddr::from(([0, 0, 0, 0], protocol::EMBEDDED_CLIENT_PORT)),
             hotspot: hotspot::native(),
+            wifi: wifi::native(),
         }
     }
 }
@@ -45,9 +49,12 @@ impl Embedded {
         let mut config = Config::new(options.client_bind, data_dir, AuthMode::Token(token.clone()));
         config.ui_bind = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
         config.capabilities = Capabilities { hotspot: control != Control::Unsupported };
-        config.extra_api_routes = Some(hotspot::router(hotspot.clone()));
+        let wifi = Arc::new(WifiService::new(options.wifi));
+        config.extra_api_routes = Some(hotspot::router(hotspot.clone()).merge(wifi::router(wifi.clone())));
         let coordinator = coordinator_core::start(config).await?;
-        hotspot.set_client_port(coordinator.local_addr().port());
+        let client_port = coordinator.local_addr().port();
+        hotspot.set_client_port(client_port);
+        wifi.connect(format!("http://{}", coordinator.ui_addr()), token.clone(), client_port);
         Ok(Embedded { coordinator, hotspot, token })
     }
 

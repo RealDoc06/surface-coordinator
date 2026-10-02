@@ -9,6 +9,7 @@ pub mod hotspot;
 pub mod remote;
 pub mod settings;
 pub mod update;
+pub mod wifi;
 
 use url::Url;
 

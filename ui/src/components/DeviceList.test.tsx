@@ -187,3 +187,21 @@ describe('DeviceList', () => {
     })
   })
 })
+
+describe('DeviceList: moving to the manager\'s own Wi-Fi', () => {
+  it('offers the network by name and passes the selection on', async () => {
+    const onMoveLocal = vi.fn<(targets: TargetSpec) => void>()
+    const { user } = setup({ localWifi: 'Office-Net', onMoveLocal })
+    const button = screen.getByRole('button', { name: 'Move to Office-Net' })
+    expect(button).toBeDisabled()
+
+    await user.click(checkbox('LAB-01'))
+    await user.click(button)
+    expect(onMoveLocal).toHaveBeenCalledWith({ type: 'devices', device_ids: ['a1'] })
+  })
+
+  it('is absent when the manager has no network to offer', () => {
+    setup()
+    expect(screen.queryByRole('button', { name: /^Move to (?!Wi-Fi)/ })).toBeNull()
+  })
+})
