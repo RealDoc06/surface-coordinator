@@ -22,7 +22,7 @@ use tokio::time::Instant;
 use crate::events::Event;
 use crate::state::AppState;
 use crate::store::{self, DeviceInfo, TargetResult};
-use crate::updates;
+use crate::{rollout, updates};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest message accepted from a client. Output chunks are far smaller.
@@ -166,6 +166,10 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
         // Registered before this query, so a job created from now on is
         // either picked up here or dispatched to this connection directly.
         state.dispatch(&device_id, true).await;
+        // The device may be one the update rollout is waiting for. In its own
+        // task, so this connection starts serving at once.
+        let rollout_state = state.clone();
+        state.tasks.spawn(async move { rollout::run(&rollout_state).await });
         let ended = session(&state, &device_id, &connection, sink, stream, outbound_rx).await;
         tracing::info!(%device_id, reason = ended, "device connection ended");
     }

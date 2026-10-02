@@ -74,7 +74,8 @@ pub async fn check(origin: &str) -> Result<Health, RemoteError> {
     Ok(health)
 }
 
-fn describe(error: &reqwest::Error) -> String {
+/// A transport failure, in words for the operator.
+pub(crate) fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "the connection timed out".into()
     } else if error.is_connect() {

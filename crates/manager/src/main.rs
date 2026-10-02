@@ -4,10 +4,11 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use manager::embedded::{Embedded, Options};
 use manager::settings::Settings;
+use manager::sync::{self, SyncError};
 use manager::update::{self, DownloadProgress, UpdateStatus};
 use manager::{is_launcher_page, navigation_allowed, remote};
 use serde::Serialize;
@@ -27,6 +28,11 @@ const UPDATER_PUBKEY: &str = env!("SC_UPDATER_PUBKEY");
 /// the footer saying "Checking…" for minutes.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long opening the local coordinator waits for the enrollment keys to
+/// be copied, so they are usually there when its UI loads. Offline the copy
+/// can take longer; it then finishes in the background.
+const KEY_SYNC_WAIT: Duration = Duration::from_secs(3);
+
 struct AppState {
     data_dir: PathBuf,
     embedded: tokio::sync::Mutex<Option<Embedded>>,
@@ -39,6 +45,8 @@ struct AppState {
     /// The update found by the last check, installed when the operator
     /// confirms.
     pending_update: tokio::sync::Mutex<Option<Update>>,
+    /// How the last copy of enrollment keys from the online coordinator went.
+    key_sync: Mutex<KeySync>,
 }
 
 impl AppState {
@@ -58,6 +66,18 @@ struct Status {
     /// Port clients connect to while the local coordinator runs.
     local_client_port: Option<u16>,
     remote_url: Option<String>,
+    key_sync: KeySync,
+}
+
+/// The last copy of enrollment keys from the online coordinator into the
+/// local one. `at` stays `None` until there is an online coordinator to copy
+/// from.
+#[derive(Debug, Clone, Default, Serialize)]
+struct KeySync {
+    /// Unix milliseconds.
+    at: Option<u64>,
+    imported: usize,
+    error: Option<String>,
 }
 
 #[tauri::command]
@@ -68,6 +88,7 @@ async fn status(state: State<'_, AppState>) -> Result<Status, String> {
         local_running: embedded.is_some(),
         local_client_port: embedded.as_ref().map(|e| e.client_addr().port()),
         remote_url: Settings::load(&state.data_dir).remote_url,
+        key_sync: state.key_sync.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     })
 }
 
@@ -76,13 +97,70 @@ fn navigate(window: &WebviewWindow, address: &str) -> Result<(), String> {
     window.navigate(url).map_err(|error| error.to_string())
 }
 
-/// Starts the local coordinator if it is not running and shows its UI.
+/// The `sc_session` cookie the window holds for `origin`, if the operator
+/// signed in there. Read through the webview's own cookie store, which
+/// includes HttpOnly cookies that page scripts cannot see.
+async fn session_cookie(window: &WebviewWindow, origin: &str) -> Option<String> {
+    let url = Url::parse(origin).ok()?;
+    let window = window.clone();
+    // The call blocks until the event loop has asked WebView2, so it must
+    // not run on the main thread nor hold up an async worker.
+    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url)).await.ok()?;
+    match cookies {
+        Ok(cookies) => cookies
+            .into_iter()
+            .find(|cookie| cookie.name() == sync::SESSION_COOKIE)
+            .map(|cookie| cookie.value().to_owned()),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the webview's cookies");
+            None
+        }
+    }
+}
+
+/// Copies the online coordinator's enrollment keys into the local
+/// coordinator at `local_origin` and records how that went for the launcher.
+/// Without an online coordinator there is nothing to copy and nothing to say.
+async fn sync_keys(window: WebviewWindow, local_origin: String, local_token: String) {
+    let state = window.state::<AppState>();
+    let Some(remote) = Settings::load(&state.data_dir).remote_url else { return };
+    let outcome = match session_cookie(&window, &remote).await {
+        Some(cookie) => sync::pull_keys(&remote, &cookie, &local_origin, &local_token).await,
+        None => Err(SyncError::NotLoggedIn),
+    };
+    match &outcome {
+        Ok(report) => tracing::info!(
+            %remote,
+            imported = report.imported,
+            already_present = report.already_present,
+            skipped_revoked = report.skipped_revoked,
+            "enrollment keys synced"
+        ),
+        Err(error) => tracing::info!(%remote, %error, "enrollment keys not synced"),
+    }
+    let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64);
+    *state.key_sync.lock().unwrap_or_else(|e| e.into_inner()) = KeySync {
+        at: Some(at),
+        imported: outcome.as_ref().map_or(0, |report| report.imported),
+        error: outcome.err().map(|error| error.to_string()),
+    };
+}
+
+/// Runs [`sync_keys`] into `running` in the background.
+fn start_key_sync(window: &WebviewWindow, running: &Embedded) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(sync_keys(window.clone(), running.origin(), running.api_token().to_owned()))
+}
+
+/// Starts the local coordinator if it is not running, copies the online
+/// coordinator's enrollment keys into it and shows its UI.
 #[tauri::command]
 async fn open_local(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
     let mut embedded = state.embedded.lock().await;
     if embedded.is_none() {
         let data_dir = state.data_dir.join("coordinator");
-        let started = Embedded::start(&data_dir, Options::default()).await.map_err(|error| {
+        let online_coordinator = Settings::load(&state.data_dir).remote_url;
+        let options = Options { online_coordinator, ..Options::default() };
+        let started = Embedded::start(&data_dir, options).await.map_err(|error| {
             format!(
                 "The local coordinator could not be started: {error}. \
                  Is another copy of the manager running?"
@@ -93,7 +171,11 @@ async fn open_local(window: WebviewWindow, state: State<'_, AppState>) -> Result
     }
     let running = embedded.as_ref().expect("just started");
     state.allow(running.origin());
-    navigate(&window, &running.entry_url())
+    let entry = running.entry_url();
+    let syncing = start_key_sync(&window, running);
+    drop(embedded);
+    let _ = tokio::time::timeout(KEY_SYNC_WAIT, syncing).await;
+    navigate(&window, &entry)
 }
 
 /// Stops the local coordinator, and with it the hotspot, and closes its
@@ -127,6 +209,12 @@ async fn open_remote(
     settings.remote_url = Some(origin.clone());
     if let Err(error) = settings.save(&state.data_dir) {
         tracing::warn!(%error, "could not save settings");
+    }
+    // A running local coordinator sends devices to this one from now on and
+    // gets its keys, if the operator is still signed in there.
+    if let Some(running) = state.embedded.lock().await.as_ref() {
+        running.set_online_coordinator(Some(&origin));
+        start_key_sync(&window, running);
     }
     state.allow(origin.clone());
     navigate(&window, &origin)
@@ -268,6 +356,7 @@ fn main() {
                 allowed_origins: allowed_origins.clone(),
                 launcher: launcher.clone(),
                 pending_update: tokio::sync::Mutex::new(None),
+                key_sync: Mutex::new(KeySync::default()),
             });
 
             WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))

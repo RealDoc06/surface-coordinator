@@ -53,16 +53,21 @@ enum Command {
         #[arg(long, env = "SC_UI_DIR")]
         ui_dir: Option<PathBuf>,
         /// Seconds between client heartbeats.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, env = "SC_HEARTBEAT_INTERVAL_SECS", default_value_t = 30)]
         heartbeat_interval_secs: u64,
         /// Hours a job stays queued for an offline device before it expires.
         #[arg(long, default_value_t = 24)]
         queued_expiry_hours: u64,
         /// Do not look for new client releases (neither periodically nor
-        /// when asked from the UI). Releases already cached can still be
-        /// pushed to clients.
+        /// when asked from the UI). Releases already cached, or uploaded
+        /// through the UI, can still be pushed to clients.
         #[arg(long, env = "SC_NO_UPDATE_CHECK")]
         no_update_check: bool,
+        /// Roll out the newest cached client release automatically (one
+        /// device first, then the rest). Only the initial default: once
+        /// stored, the setting is changed from the UI.
+        #[arg(long, env = "SC_AUTO_UPDATE")]
+        auto_update: bool,
         /// GitHub repository (owner/repo) whose releases provide client updates.
         #[arg(long, env = "SC_UPDATE_SOURCE", default_value = coordinator_core::DEFAULT_UPDATE_SOURCE)]
         update_source: String,
@@ -145,6 +150,7 @@ fn main() -> anyhow::Result<()> {
             heartbeat_interval_secs,
             queued_expiry_hours,
             no_update_check,
+            auto_update,
             update_source,
             verbose,
         } => {
@@ -178,6 +184,7 @@ fn main() -> anyhow::Result<()> {
             config.queued_expiry = Duration::from_secs(queued_expiry_hours * 60 * 60);
             config.updates.enabled = !no_update_check;
             config.updates.source = update_source;
+            config.auto_update = auto_update;
             serve(config)
         }
         Command::Key { command } => key(command),
@@ -187,14 +194,21 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn serve(config: Config) -> anyhow::Result<()> {
-    let updates = match config.client_updates() {
-        Ok(()) => format!("enabled, checking the releases of {}", config.updates.source),
-        Err(why) => format!("disabled ({why})"),
+    let has_key = config.has_update_key();
+    let checking = if config.updates.enabled {
+        format!("checking the releases of {}", config.updates.source)
+    } else {
+        "not checking for releases".to_owned()
     };
     let coordinator = coordinator_core::start(config).await.context("failed to start")?;
     println!("Clients connect to {}", coordinator.local_addr());
     println!("Web UI and API on http://{}", coordinator.ui_addr());
-    println!("Client updates: {updates}");
+    if has_key {
+        let auto = if coordinator.auto_update() { "on" } else { "off" };
+        println!("Client updates: update key present, {checking}, automatic rollout {auto}");
+    } else {
+        println!("Client updates: disabled (no update key is built into this coordinator)");
+    }
     shutdown_signal().await;
     coordinator.stop().await;
     Ok(())

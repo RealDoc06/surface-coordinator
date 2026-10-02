@@ -120,6 +120,11 @@ const MIGRATIONS: &[&str] = &["
         cached  INTEGER NOT NULL,
         PRIMARY KEY (version, target)
     );
+", "
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 "];
 
 /// Current time as Unix milliseconds.
@@ -499,6 +504,10 @@ pub enum CreateJobError {
     NoTargets,
 }
 
+/// Starts the message of a `client.update` target that succeeded without
+/// installing anything, whether the coordinator or the client decided so.
+pub const ALREADY_ON_VERSION: &str = "already on version";
+
 /// Creates a job and one queued target per device, atomically.
 ///
 /// With `done_if_on_version` (a `client.update` job), the target of a device
@@ -577,7 +586,7 @@ pub fn create_job(
             tx.execute(
                 "INSERT INTO job_targets (id, job_id, device_id, state, message, created, finished)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![target_id, job_id, device_id, target_state::SUCCEEDED, format!("already on version {version}"), now],
+                params![target_id, job_id, device_id, target_state::SUCCEEDED, format!("{ALREADY_ON_VERSION} {version}"), now],
             )?;
         } else {
             tx.execute(
@@ -1146,6 +1155,60 @@ pub fn insert_client_release(conn: &Connection, release: &ClientRelease) -> rusq
 
 pub fn delete_client_release(conn: &Connection, version: &str, target: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM client_releases WHERE version = ?1 AND target = ?2", params![version, target])?;
+    Ok(())
+}
+
+/// Every known device's id and reported client version, ordered by id.
+pub fn device_versions(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    conn.prepare("SELECT id, client_version FROM devices ORDER BY id")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
+}
+
+/// One `client.update` target for a version: a device's attempt to get it.
+#[derive(Debug, Clone)]
+pub struct UpdateAttempt {
+    pub device_id: String,
+    pub state: String,
+    pub message: Option<String>,
+    /// Created by the automatic rollout rather than an operator.
+    pub automatic: bool,
+}
+
+/// The `client.update` targets for `version`, oldest first. `automatic_creator`
+/// is the `created_by` of jobs the rollout created.
+pub fn update_attempts(conn: &Connection, version: &str, automatic_creator: &str) -> rusqlite::Result<Vec<UpdateAttempt>> {
+    conn.prepare(
+        "SELECT t.device_id, t.state, t.message, j.created_by IS ?3
+         FROM job_targets t JOIN jobs j ON j.id = t.job_id
+         WHERE j.kind = ?1 AND json_extract(j.payload, '$.version') = ?2
+         ORDER BY t.created, t.rowid",
+    )?
+    .query_map(params![protocol::job_kind::CLIENT_UPDATE, version, automatic_creator], |row| {
+        Ok(UpdateAttempt { device_id: row.get(0)?, state: row.get(1)?, message: row.get(2)?, automatic: row.get(3)? })
+    })?
+    .collect()
+}
+
+// ---------------------------------------------------------------- settings
+
+/// Keys of the `settings` table.
+pub mod setting {
+    /// `"true"` or `"false"`: the automatic update rollout is on.
+    pub const AUTO_UPDATE: &str = "auto_update";
+}
+
+/// The stored value of a setting, storing `default` first if there is none.
+pub fn setting_or_init(conn: &Connection, key: &str, default: &str) -> rusqlite::Result<String> {
+    conn.execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING", params![key, default])?;
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
     Ok(())
 }
 

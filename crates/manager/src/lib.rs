@@ -8,6 +8,7 @@ pub mod embedded;
 pub mod hotspot;
 pub mod remote;
 pub mod settings;
+pub mod sync;
 pub mod update;
 pub mod wifi;
 

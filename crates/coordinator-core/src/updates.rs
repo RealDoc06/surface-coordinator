@@ -1,22 +1,25 @@
 //! Client updates: the cache of verified client releases, fed from the
-//! release source (the GitHub repository's latest release), the API that
-//! shows and refreshes it, and the downloads clients install from.
+//! release source (the GitHub repository's latest release) or uploaded by an
+//! operator, the API that shows and refreshes it, and the downloads clients
+//! install from.
 //!
-//! Nothing reaches the cache unverified: an artifact is downloaded to a
+//! Nothing reaches the cache unverified: an artifact is written to a
 //! temporary file, its signature checked against the update public key, and
 //! only then moved into `<data dir>/updates/<version>/` and recorded. Only
 //! recorded files are served.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
-use axum::extract::{Path as UrlPath, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use protocol::update::{self, Version, TARGET_WINDOWS_X86_64};
 use protocol::ClientUpdatePayload;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::api::{ApiError, ApiResult};
 use crate::events::Event;
+use crate::rollout::{self, Rollout};
 use crate::state::AppState;
 use crate::store::{self, ClientRelease, Store};
 use crate::{Config, Error};
@@ -42,6 +46,7 @@ const TARGETS: &[&str] = &[TARGET_WINDOWS_X86_64];
 
 const MAX_ARTIFACT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
+const MAX_UPLOAD_NOTES_CHARS: usize = 4000;
 /// A release description with its asset list; far smaller in practice.
 const MAX_RELEASE_BYTES: u64 = 4 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -56,7 +61,8 @@ const TEMP_PREFIX: &str = ".download-";
 #[derive(Debug, Clone)]
 pub struct UpdateConfig {
     /// Check the release source periodically and on request. Without an
-    /// update public key nothing is checked either way.
+    /// update public key nothing is checked either way. Uploads do not
+    /// depend on this.
     pub enabled: bool,
     /// `owner/repository` on GitHub.
     pub source: String,
@@ -87,15 +93,15 @@ fn public_key(config: &Config) -> Option<&str> {
     config.update_public_key.as_deref().map(str::trim).filter(|key| !key.is_empty())
 }
 
-/// Whether releases are checked: turned on, and there is a key to verify
-/// them with.
-pub fn enabled(config: &Config) -> bool {
+/// Whether the release source is checked: turned on, and there is a key to
+/// verify releases with.
+pub fn checking(config: &Config) -> bool {
     config.updates.enabled && public_key(config).is_some()
 }
 
 /// Refuses configurations that would build odd URLs or never tick.
 pub fn validate_config(config: &Config) -> Result<(), Error> {
-    if !enabled(config) {
+    if !checking(config) {
         return Ok(());
     }
     let updates = &config.updates;
@@ -134,19 +140,26 @@ struct Status {
 /// The release cache's state that lives in memory.
 pub struct UpdateState {
     status: Mutex<Status>,
-    /// One check at a time; a request arriving during a check waits for it
-    /// and then finds the release cached.
+    /// One check or upload storing at a time: a request arriving during a
+    /// check waits for it and then finds the release cached, and two uploads
+    /// of one version cannot both be moved into place.
     check: tokio::sync::Mutex<()>,
     /// Newest cached version. Every view of a device needs it, so it is kept
     /// here rather than queried each time.
     newest: Mutex<Option<Version>>,
     /// Present only when checking is enabled.
     http: Option<reqwest::Client>,
+    /// The stored auto-update setting, mirrored so the sweep need not read it.
+    auto_update: AtomicBool,
+    /// One rollout step at a time, so two runs cannot both pick a canary or
+    /// both target the same devices.
+    pub(crate) rollout: tokio::sync::Mutex<()>,
 }
 
 impl UpdateState {
-    pub fn new(config: &Config, newest: Option<Version>) -> Result<UpdateState, Error> {
-        let http = if enabled(config) {
+    /// `auto_update` is the stored setting (see [`store::setting::AUTO_UPDATE`]).
+    pub fn new(config: &Config, newest: Option<Version>, auto_update: bool) -> Result<UpdateState, Error> {
+        let http = if checking(config) {
             let client = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .user_agent(format!("surface-coordinator/{}", env!("CARGO_PKG_VERSION")))
@@ -161,6 +174,8 @@ impl UpdateState {
             check: tokio::sync::Mutex::new(()),
             newest: Mutex::new(newest),
             http,
+            auto_update: AtomicBool::new(auto_update),
+            rollout: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -168,7 +183,11 @@ impl UpdateState {
         self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn newest(&self) -> Option<Version> {
+    pub fn auto_update(&self) -> bool {
+        self.auto_update.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn newest(&self) -> Option<Version> {
         *self.newest.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -252,6 +271,13 @@ pub fn load_cache(store: &Store, data_dir: &Path) -> Result<Option<Version>, Err
 struct TempFile {
     path: PathBuf,
     keep: bool,
+}
+
+impl TempFile {
+    /// A fresh name in `dir` (the updates directory); nothing is created yet.
+    fn new(dir: &Path) -> TempFile {
+        TempFile { path: dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple())), keep: false }
+    }
 }
 
 impl Drop for TempFile {
@@ -410,30 +436,48 @@ async fn fetch_latest(state: &AppState, http: &reqwest::Client) -> Result<Option
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-    let mut temp = TempFile { path: dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple())), keep: false };
+    let mut temp = TempFile::new(&dir);
     let (size, sha256) = download_to(http, &artifact_url, &temp.path, MAX_ARTIFACT_BYTES).await?;
     update::verify(key, &version_text, target, &sha256, &signature)
         .map_err(|error| format!("the signature of release {version} does not verify: {error}"))?;
+    let verified = Verified { version, target, size, sha256, signature, notes: release.body };
+    store_verified(state, &mut temp, verified).await.map(Some)
+}
 
-    // Verified: move it into place, then record it. Until it is recorded it
-    // is not served.
-    let artifact = artifact_path(&config.data_dir, &version, target);
-    let signature_file = signature_path(&config.data_dir, &version, target);
+/// An artifact in a temporary file whose signature has been checked.
+struct Verified {
+    version: Version,
+    target: &'static str,
+    size: u64,
+    sha256: [u8; 32],
+    signature: String,
+    notes: Option<String>,
+}
+
+/// Moves a verified artifact into the cache and records it; until it is
+/// recorded it is not served. Downloaded and uploaded releases end up the
+/// same way. The caller holds the check lock.
+async fn store_verified(state: &AppState, temp: &mut TempFile, verified: Verified) -> Result<ClientRelease, String> {
+    let Verified { version, target, size, sha256, signature, notes } = verified;
+    let data_dir = &state.config.data_dir;
+    let artifact = artifact_path(data_dir, &version, target);
     let move_failed = |error: std::io::Error| format!("could not store release {version}: {error}");
     if let Some(parent) = artifact.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(move_failed)?;
     }
-    tokio::fs::write(&signature_file, format!("{signature}\n")).await.map_err(move_failed)?;
+    tokio::fs::write(signature_path(data_dir, &version, target), format!("{}\n", signature.trim()))
+        .await
+        .map_err(move_failed)?;
     tokio::fs::rename(&temp.path, &artifact).await.map_err(move_failed)?;
     temp.keep = true;
 
     let release = ClientRelease {
-        version: version_text,
+        version: version.to_string(),
         target: target.to_owned(),
         size,
         sha256: hex::encode(sha256),
         cached_at: store::now_ms(),
-        notes: release.body.filter(|notes| !notes.trim().is_empty()),
+        notes: notes.filter(|notes| !notes.trim().is_empty()),
     };
     let record = release.clone();
     state
@@ -441,30 +485,37 @@ async fn fetch_latest(state: &AppState, http: &reqwest::Client) -> Result<Option
         .call(move |conn| store::insert_client_release(conn, &record))
         .await
         .map_err(|error| format!("could not record release {version}: {error}"))?;
-    Ok(Some(release))
+    Ok(release)
+}
+
+/// After a release was added to the cache: devices' `update_available` may
+/// have changed, and the rollout may have a new version to roll out.
+async fn release_cached(state: &AppState, release: &ClientRelease) {
+    tracing::info!(version = %release.version, target = %release.target, size = release.size,
+        "client release verified and cached");
+    match state.store.call(|conn| store::list_client_releases(conn)).await {
+        Ok(releases) => state.updates.set_newest(newest_of(&releases)),
+        Err(error) => tracing::error!(%error, "failed to reload the update cache"),
+    }
+    state.publish(Event::Resync);
+    rollout::run(state).await;
 }
 
 /// Checks the release source now. Returns why it failed; the reason is also
 /// kept for the API. Does nothing when checking is disabled.
 pub async fn check(state: &AppState) -> Result<(), String> {
     let Some(http) = &state.updates.http else { return Ok(()) };
-    let _one_at_a_time = state.updates.check.lock().await;
-    let outcome = fetch_latest(state, http).await;
-    {
+    let outcome = {
+        let _one_at_a_time = state.updates.check.lock().await;
+        let outcome = fetch_latest(state, http).await;
         let mut status = state.updates.status();
         status.last_checked_at = Some(store::now_ms());
         status.last_error = outcome.as_ref().err().cloned();
-    }
+        outcome
+    };
     match outcome {
         Ok(Some(release)) => {
-            tracing::info!(version = %release.version, target = %release.target, size = release.size,
-                "client release verified and cached");
-            match state.store.call(|conn| store::list_client_releases(conn)).await {
-                Ok(releases) => state.updates.set_newest(newest_of(&releases)),
-                Err(error) => tracing::error!(%error, "failed to reload the update cache"),
-            }
-            // Every device's `update_available` may have changed.
-            state.publish(Event::Resync);
+            release_cached(state, &release).await;
             Ok(())
         }
         Ok(None) => Ok(()),
@@ -498,25 +549,32 @@ pub async fn check_periodically(state: std::sync::Arc<AppState>) {
 #[derive(Serialize)]
 pub struct Updates {
     enabled: bool,
+    checking: bool,
+    auto_update: bool,
     source: Option<String>,
     last_checked_at: Option<i64>,
     last_error: Option<String>,
     latest: Option<ClientRelease>,
     cached: Vec<ClientRelease>,
+    rollout: Option<Rollout>,
 }
 
 async fn snapshot(state: &AppState) -> Result<Updates, Error> {
     let cached = state.store.call(|conn| store::list_client_releases(conn)).await?;
-    let enabled = enabled(&state.config);
+    let rollout = rollout::status(state).await?;
+    let checking = checking(&state.config);
     let status = state.updates.status();
     Ok(Updates {
-        enabled,
+        enabled: public_key(&state.config).is_some(),
+        checking,
+        auto_update: state.updates.auto_update(),
         // Not shown while nothing is checked, so it does not look as if it were.
-        source: enabled.then(|| state.config.updates.source.clone()),
+        source: checking.then(|| state.config.updates.source.clone()),
         last_checked_at: status.last_checked_at,
         last_error: status.last_error.clone(),
         latest: cached.first().cloned(),
         cached,
+        rollout,
     })
 }
 
@@ -530,6 +588,171 @@ pub async fn check_now(State(state): State<std::sync::Arc<AppState>>) -> ApiResu
     if let Err(reason) = check(&state).await {
         return Err(ApiError::new(StatusCode::BAD_GATEWAY, "update_check_failed", reason));
     }
+    Ok(Json(snapshot(&state).await?))
+}
+
+#[derive(Deserialize)]
+pub struct UploadQuery {
+    // Missing parameters are reported like wrong ones, in the API's format.
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    target: String,
+    notes: Option<String>,
+}
+
+/// `POST /api/v1/updates/upload?version=..&target=..[&notes=..]`: a client
+/// executable signed with the update key, as the body, with its signature in
+/// `X-Signature`. Stored exactly like a release fetched from the source.
+pub async fn upload(
+    State(state): State<std::sync::Arc<AppState>>,
+    Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    let UploadRequest { key, version, target, signature } = match upload_request(&state, &query, &headers).await {
+        Ok(request) => request,
+        Err(error) => {
+            // Read what the client sends before answering: a connection
+            // closed on an unread body can reach it as a reset instead of
+            // this answer. Not worth it for a body announced as too large.
+            if error.status != StatusCode::PAYLOAD_TOO_LARGE {
+                discard(body).await;
+            }
+            return Err(error);
+        }
+    };
+    let bad_signature = |message: String| ApiError::bad_request("bad_signature", message);
+    let exists = || ApiError::new(StatusCode::CONFLICT, "version_exists", format!("version {version} is already cached"));
+
+    // Streamed to disk and hashed on the way; never held in memory.
+    let dir = updates_dir(&state.config.data_dir);
+    let internal = |error: std::io::Error| ApiError::from(Error::from(error));
+    tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
+    let mut temp = TempFile::new(&dir);
+    let mut file = tokio::fs::File::create(&temp.path).await.map_err(internal)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ApiError::bad_request("bad_request", format!("reading the upload failed: {error}")))?;
+        size += chunk.len() as u64;
+        if size > MAX_ARTIFACT_BYTES {
+            return Err(too_large());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(internal)?;
+    }
+    file.sync_all().await.map_err(internal)?;
+    drop(file);
+    let sha256: [u8; 32] = hasher.finalize().into();
+    update::verify(key, &version.to_string(), target, &sha256, &signature)
+        .map_err(|error| bad_signature(format!("the signature does not verify: {error}")))?;
+
+    let notes = query.notes.map(|notes| notes.chars().take(MAX_UPLOAD_NOTES_CHARS).collect());
+    let release = {
+        let _one_at_a_time = state.updates.check.lock().await;
+        // Another upload or a check may have cached it meanwhile.
+        if is_cached(&state, &version, target).await? {
+            return Err(exists());
+        }
+        let verified = Verified { version, target, size, sha256, signature, notes };
+        store_verified(&state, &mut temp, verified).await.map_err(|reason| ApiError::from(Error::Internal(reason)))?
+    };
+    release_cached(&state, &release).await;
+    Ok((StatusCode::CREATED, Json(snapshot(&state).await?)).into_response())
+}
+
+/// An upload whose query and headers make sense; the body is still unread.
+struct UploadRequest<'a> {
+    key: &'a str,
+    version: Version,
+    target: &'static str,
+    signature: String,
+}
+
+/// Everything about an upload that can be refused before reading its body.
+async fn upload_request<'a>(
+    state: &'a AppState,
+    query: &UploadQuery,
+    headers: &HeaderMap,
+) -> Result<UploadRequest<'a>, ApiError> {
+    let Some(key) = public_key(&state.config) else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "updates_unavailable",
+            "no update key is configured, so uploads cannot be verified",
+        ));
+    };
+    let version: Version = query.version.parse().map_err(|_| {
+        ApiError::bad_request("invalid_version", "version must be of the form major.minor.patch")
+    })?;
+    let Some(target) = known_target(&query.target) else {
+        return Err(ApiError::bad_request(
+            "unsupported_target",
+            format!("target must be one of: {}", TARGETS.join(", ")),
+        ));
+    };
+    let signature = headers
+        .get("x-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_owned())
+        .ok_or_else(|| {
+            ApiError::bad_request("bad_signature", "the X-Signature header with the base64 signature is missing")
+        })?;
+    if is_cached(state, &version, target).await? {
+        return Err(ApiError::new(StatusCode::CONFLICT, "version_exists", format!("version {version} is already cached")));
+    }
+    let announced = headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+    if announced.is_some_and(|length| length > MAX_ARTIFACT_BYTES) {
+        return Err(too_large());
+    }
+    Ok(UploadRequest { key, version, target, signature })
+}
+
+fn too_large() -> ApiError {
+    ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("the upload exceeds {MAX_ARTIFACT_BYTES} bytes"))
+}
+
+/// Reads and drops a request body, up to the upload limit.
+async fn discard(body: Body) {
+    let mut stream = body.into_data_stream();
+    let mut read = 0u64;
+    while let Some(Ok(chunk)) = stream.next().await {
+        read += chunk.len() as u64;
+        if read > MAX_ARTIFACT_BYTES {
+            return;
+        }
+    }
+}
+
+async fn is_cached(state: &AppState, version: &Version, target: &'static str) -> Result<bool, Error> {
+    let version = version.to_string();
+    let found = state.store.call(move |conn| store::get_client_release(conn, &version, target)).await?;
+    Ok(found.is_some())
+}
+
+#[derive(Deserialize)]
+pub struct AutoUpdateRequest {
+    enabled: bool,
+}
+
+/// `POST /api/v1/updates/auto`: turns the automatic rollout on or off.
+/// Turning it on rolls out an already cached release right away.
+pub async fn set_auto_update(
+    State(state): State<std::sync::Arc<AppState>>,
+    Json(request): Json<AutoUpdateRequest>,
+) -> ApiResult<Json<Updates>> {
+    {
+        // Under the rollout lock, so a run in progress finishes with the
+        // setting it started with.
+        let _rollout = state.updates.rollout.lock().await;
+        let value = if request.enabled { "true" } else { "false" };
+        state.store.call(move |conn| store::set_setting(conn, store::setting::AUTO_UPDATE, value)).await?;
+        state.updates.auto_update.store(request.enabled, Ordering::Relaxed);
+    }
+    tracing::info!(enabled = request.enabled, "automatic client update rollout changed");
+    rollout::run(&state).await;
     Ok(Json(snapshot(&state).await?))
 }
 

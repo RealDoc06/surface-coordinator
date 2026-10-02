@@ -4,6 +4,9 @@
 //! does not have to type them. The password never goes to the browser: the
 //! manager creates the `wifi.join` job itself, through the embedded
 //! coordinator's API.
+//!
+//! On that network the devices report to the online coordinator the operator
+//! uses, if there is one; otherwise to this computer.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -16,6 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use url::Url;
 
 /// The Wi-Fi network this computer is connected to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,22 +90,49 @@ struct Api {
     token: String,
 }
 
+/// The address clients use for the coordinator whose web UI is at `origin`:
+/// `https://host[:port]` → `wss://host[:port]`, `http://` → `ws://`. Clients
+/// and browsers share the host and port (see `deploy/README.md`).
+pub fn client_url(origin: &str) -> Option<String> {
+    let mut url = Url::parse(origin).ok()?;
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return None,
+    };
+    url.set_scheme(scheme).ok()?;
+    url.host_str()?;
+    Some(url.origin().ascii_serialization())
+}
+
 pub struct WifiService {
     source: Arc<dyn WifiSource>,
     /// Port devices connect to on this computer.
     client_port: AtomicU16,
     api: Mutex<Option<Api>>,
+    /// Client address of the online coordinator, when the operator uses one.
+    online: Mutex<Option<String>>,
 }
 
 impl WifiService {
     pub fn new(source: Arc<dyn WifiSource>) -> WifiService {
-        WifiService { source, client_port: AtomicU16::new(0), api: Mutex::new(None) }
+        WifiService { source, client_port: AtomicU16::new(0), api: Mutex::new(None), online: Mutex::new(None) }
     }
 
     /// Called once the embedded coordinator is up.
     pub fn connect(&self, origin: String, token: String, client_port: u16) {
         self.client_port.store(client_port, Ordering::Relaxed);
         *self.api.lock().unwrap_or_else(|e| e.into_inner()) = Some(Api { origin, token });
+    }
+
+    /// Sends moved devices to the online coordinator at `origin` (its web
+    /// address), or with `None` to this computer.
+    pub fn set_online_coordinator(&self, origin: Option<&str>) {
+        *self.online.lock().unwrap_or_else(|e| e.into_inner()) = origin.and_then(client_url);
+    }
+
+    fn online_url(&self) -> Option<String> {
+        self.online.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     async fn network(&self) -> Result<WifiNetwork, String> {
@@ -111,10 +142,19 @@ impl WifiService {
             .unwrap_or_else(|error| Err(error.to_string()))
     }
 
-    /// Where moved devices find this coordinator on that network.
-    fn coordinator_url(&self) -> Option<String> {
+    /// Where moved devices find this computer on that network.
+    fn lan_url(&self) -> Option<String> {
         let port = self.client_port.load(Ordering::Relaxed);
         lan_address().map(|address| format!("ws://{}", SocketAddr::new(address, port)))
+    }
+
+    /// Where moved devices report: the online coordinator, otherwise this
+    /// computer. `"online"` or `"local"`, and the address.
+    fn destination(&self) -> (&'static str, Option<String>) {
+        match self.online_url() {
+            Some(url) => ("online", Some(url)),
+            None => ("local", self.lan_url()),
+        }
     }
 }
 
@@ -124,22 +164,26 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
 
 /// `GET /wifi`: what the button would move devices to. Never the password.
 async fn show(State(service): State<Arc<WifiService>>) -> Json<Value> {
-    let coordinator_url = service.coordinator_url();
+    let (coordinator, coordinator_url) = service.destination();
     Json(match service.network().await {
         Ok(network) if coordinator_url.is_some() => json!({
             "available": true,
             "ssid": network.ssid,
             "secured": network.password.is_some(),
+            "coordinator": coordinator,
             "coordinator_url": coordinator_url,
             "reason": null,
-            "warning": lan_address().and_then(lan_route_problem),
+            // Only devices coming back to this computer need a route to it.
+            "warning": if coordinator == "local" { lan_address().and_then(lan_route_problem) } else { None },
         }),
         Ok(_) => json!({
-            "available": false, "ssid": null, "secured": false, "coordinator_url": null,
+            "available": false, "ssid": null, "secured": false,
+            "coordinator": coordinator, "coordinator_url": null,
             "reason": "this computer has no network address devices could reach it at",
         }),
         Err(reason) => json!({
-            "available": false, "ssid": null, "secured": false, "coordinator_url": null,
+            "available": false, "ssid": null, "secured": false,
+            "coordinator": coordinator, "coordinator_url": null,
             "reason": reason,
         }),
     })
@@ -157,7 +201,7 @@ async fn move_devices(State(service): State<Arc<WifiService>>, Json(request): Js
         Ok(network) => network,
         Err(reason) => return error(StatusCode::CONFLICT, "wifi_unavailable", reason),
     };
-    let Some(coordinator_url) = service.coordinator_url() else {
+    let (_, Some(coordinator_url)) = service.destination() else {
         return error(
             StatusCode::CONFLICT,
             "wifi_unavailable",
@@ -408,6 +452,23 @@ mod tests {
     #[test]
     fn enterprise_networks_cannot_be_passed_on() {
         assert!(password_from_profile(&profile("WPA2", "")).unwrap_err().contains("WPA2 sign-in"));
+    }
+
+    #[test]
+    fn clients_reach_the_online_coordinator_over_websockets_at_the_same_host_and_port() {
+        let cases = [
+            ("https://coordinator.example.org", "wss://coordinator.example.org"),
+            ("https://coordinator.example.org:8443", "wss://coordinator.example.org:8443"),
+            ("https://coordinator.example.org:443", "wss://coordinator.example.org"),
+            ("http://192.168.1.10:8080", "ws://192.168.1.10:8080"),
+            ("http://[::1]:8080", "ws://[::1]:8080"),
+        ];
+        for (origin, expected) in cases {
+            assert_eq!(client_url(origin).as_deref(), Some(expected), "{origin}");
+        }
+        for unusable in ["", "coordinator.example.org", "ftp://coordinator.example.org", "file:///C:/x"] {
+            assert_eq!(client_url(unusable), None, "{unusable}");
+        }
     }
 
     #[test]

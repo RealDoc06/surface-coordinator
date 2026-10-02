@@ -186,7 +186,7 @@ type Job = {
   id: string
   kind: string
   payload: unknown               // wifi.join: password shown as "********"
-  created_by: string | null      // username, or null in token mode
+  created_by: string | null      // username, null in token mode, 'auto-update' for the update rollout
   created_at: number
   targets: Target[]
 }
@@ -415,23 +415,29 @@ type Rejected = {
 ## Updates
 
 The coordinator keeps a cache of verified client releases, read from the
-latest release of a GitHub repository, so that devices can be updated with
-`client.update` jobs. A release is cached only after its signature verifies
-against the update public key built into the coordinator.
+latest release of a GitHub repository or uploaded by an operator, so that
+devices can be updated with `client.update` jobs. A release is cached only
+after its signature verifies against the update public key built into the
+coordinator.
 
 | Route | Request | Response |
 |---|---|---|
 | `GET /updates` | | `200 Updates` |
 | `POST /updates/check` | | `200 Updates` after checking the release source now; `502 update_check_failed` (message says why; `Updates.last_error` is set too) |
+| `POST /updates/upload?version=<x.y.z>&target=windows-x86_64[&notes=<text>]` | the executable, `application/octet-stream`, at most 200 MiB; header `X-Signature: <base64 signature>` | `201 Updates`; `400 invalid_version`, `400 unsupported_target`, `400 bad_signature`, `409 version_exists`, `413 too_large`, `503 updates_unavailable` |
+| `POST /updates/auto` | `{enabled: boolean}` | `200 Updates` |
 
 ```ts
 type Updates = {
-  enabled: boolean               // false: no update key is built in or checking is turned off
-  source: string | null          // e.g. "RealDoc06/surface-coordinator"; null while disabled
+  enabled: boolean               // an update key is configured: uploads are accepted
+  checking: boolean              // the release source is checked (periodically and on request)
+  auto_update: boolean           // the automatic rollout is on
+  source: string | null          // e.g. "RealDoc06/surface-coordinator"; null while not checking
   last_checked_at: number | null
   last_error: string | null
   latest: ClientRelease | null   // newest cached, verified version
   cached: ClientRelease[]        // newest first
+  rollout: Rollout | null        // null while auto_update is off or nothing is cached
 }
 type ClientRelease = {
   version: string                // "1.2.3"
@@ -441,16 +447,77 @@ type ClientRelease = {
   cached_at: number
   notes: string | null
 }
+type Rollout = {
+  version: string                // the newest cached release, L
+  state: 'canary' | 'rolling' | 'halted' | 'done'
+  canary_device_id: string | null   // device of the first automatic attempt for L
+  updated: number                // devices reporting L, online or not
+  pending: number                // devices older than L without a finished attempt for L
+  failed: number                 // devices older than L whose latest attempt for L failed or expired
+}
 ```
 
-The coordinator checks at start and then every 6 hours by default. After any
-check, successful or not, `last_checked_at` is set; `last_error` holds the
-reason for a failed check and is cleared by a successful one. A check that
-caches a new release is followed by a `resync` event, because every device's
-`update_available` may have changed.
+When checking is on, the coordinator checks at start and then every 6 hours
+by default. After any check, successful or not, `last_checked_at` is set;
+`last_error` holds the reason for a failed check and is cleared by a
+successful one. Caching a new release, by a check or an upload, is followed
+by a `resync` event, because every device's `update_available` may have
+changed.
 
-While updates are disabled, `POST /updates/check` returns `200` with
-`enabled: false` and contacts nothing, and `last_checked_at` stays null.
+While checking is off (turned off, or no update key), `POST /updates/check`
+returns `200` with `checking: false` and contacts nothing, and
+`last_checked_at` stays null.
+
+### Upload
+
+`POST /updates/upload` adds a release without the release source, and works
+whether or not checking is on. The body is the client executable; the
+`X-Signature` header holds the base64 signature that the release tool makes
+for the version, target and SHA-256 of the file (the `.sig` asset of a
+release). The coordinator stores the body as it arrives, verifies the
+signature, and only then caches it exactly as a release from the source:
+same files, same download routes, same `ClientRelease`. `notes` is optional
+and cut to 4000 characters; an empty one is `null`.
+
+- `400 invalid_version`: `version` is missing or not `major.minor.patch`.
+  Another spelling of a version is the same version (`01.2.3` is `1.2.3`).
+- `400 unsupported_target`: `target` is missing or not `windows-x86_64`.
+- `400 bad_signature`: `X-Signature` is missing, or the signature does not
+  verify for this file, version and target. Nothing is kept.
+- `409 version_exists`: that version is already cached for the target.
+- `413 too_large`: the body is larger than 200 MiB (refused at once when
+  `Content-Length` says so).
+- `503 updates_unavailable`: no update key is configured.
+
+### Automatic rollout
+
+`auto_update` is stored by the coordinator; `POST /updates/auto` changes it
+(the coordinator's start option only sets it the first time). While it is on,
+the coordinator rolls out the newest cached release L in stages, from its
+periodic sweep (every minute), right after a release is cached, when a device
+comes online, and when `auto_update` is turned on:
+
+- A device is outdated when it is online, its `client_version` is older than
+  L, and it has no `client.update` target for L yet, in any state. So every
+  device gets at most one automatic attempt per version; devices on L or
+  newer, and versions that do not parse, are never targeted.
+- Until some device has been updated to L (a succeeded `client.update`
+  target for L that is not "already on version"), the lowest-id outdated
+  device gets L alone: the canary. Nothing else happens while its target is
+  unresolved.
+- If an automatic target for L failed or expired before any device was
+  updated, the rollout is halted. It resumes when an operator updates any
+  device to L by hand with success.
+- Once a device has been updated, every outdated device gets L in one job.
+  Devices that come online later get it then.
+
+Rollout jobs are ordinary `client.update` jobs (`downgrade: false`) with
+`created_by: 'auto-update'`, announced and dispatched like any other.
+
+`rollout.state` is `done` when `pending` is 0, else `halted` as above, else
+`canary` while no device has been updated to L (also before a canary was
+picked, when no outdated device is online), else `rolling`. A device whose
+update succeeded counts as `updated` once it reconnects reporting L.
 
 Cached releases are never pruned: there is no removal by age or count. (At
 start, an entry whose files have gone missing is forgotten.)

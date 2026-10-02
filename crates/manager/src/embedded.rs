@@ -20,6 +20,7 @@ const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 pub struct Embedded {
     coordinator: Coordinator,
     hotspot: Arc<HotspotService>,
+    wifi: Arc<WifiService>,
     token: String,
 }
 
@@ -31,6 +32,9 @@ pub struct Options {
     pub hotspot: Arc<dyn HotspotControl>,
     /// Reads the Wi-Fi network this computer is on.
     pub wifi: Arc<dyn WifiSource>,
+    /// Origin of the online coordinator the operator uses, e.g.
+    /// `https://coordinator.example.org`. Devices moved to Wi-Fi go there.
+    pub online_coordinator: Option<String>,
 }
 
 impl Default for Options {
@@ -39,6 +43,7 @@ impl Default for Options {
             client_bind: SocketAddr::from(([0, 0, 0, 0], protocol::EMBEDDED_CLIENT_PORT)),
             hotspot: hotspot::native(),
             wifi: wifi::native(),
+            online_coordinator: None,
         }
     }
 }
@@ -55,14 +60,30 @@ impl Embedded {
         // default 30 s a device that left would still show as online for a
         // minute and a half.
         config.heartbeat_interval = HEARTBEAT_INTERVAL;
+        // Client builds reach a coordinator by upload; the repository has no
+        // releases to look for, and on a hotspot there is no internet anyway.
+        config.updates.enabled = false;
         config.capabilities = Capabilities { hotspot: control != Control::Unsupported };
         let wifi = Arc::new(WifiService::new(options.wifi));
+        wifi.set_online_coordinator(options.online_coordinator.as_deref());
         config.extra_api_routes = Some(hotspot::router(hotspot.clone()).merge(wifi::router(wifi.clone())));
         let coordinator = coordinator_core::start(config).await?;
         let client_port = coordinator.local_addr().port();
         hotspot.set_client_port(client_port);
         wifi.connect(format!("http://{}", coordinator.ui_addr()), token.clone(), client_port);
-        Ok(Embedded { coordinator, hotspot, token })
+        Ok(Embedded { coordinator, hotspot, wifi, token })
+    }
+
+    /// The token for this launch, for the manager's own calls to the API
+    /// (`Authorization: Bearer`).
+    pub fn api_token(&self) -> &str {
+        &self.token
+    }
+
+    /// The operator chose another online coordinator (or none) while this
+    /// one runs.
+    pub fn set_online_coordinator(&self, origin: Option<&str>) {
+        self.wifi.set_online_coordinator(origin);
     }
 
     /// Origin of the web UI, e.g. `http://127.0.0.1:51234`.

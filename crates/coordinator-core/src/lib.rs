@@ -10,6 +10,7 @@ mod builtin_scripts;
 mod client_ws;
 mod events;
 mod groups;
+mod rollout;
 mod scripts;
 mod state;
 mod store;
@@ -86,24 +87,22 @@ pub struct Config {
     pub extra_api_routes: Option<axum::Router>,
     /// Ed25519 public key (base64) client releases must be signed with
     /// before they are cached. Defaults to the key built in from
-    /// `release-keys/client-update.pub`; without one, client updates are
-    /// disabled.
+    /// `release-keys/client-update.pub`; without one, nothing can be
+    /// cached: no uploads, no checks.
     pub update_public_key: Option<String>,
     /// Where and how often to look for client releases.
     pub updates: UpdateConfig,
+    /// Whether the newest cached release is rolled out automatically. Only
+    /// the initial value: the setting is stored in the database the first
+    /// time and changed through the API from then on.
+    pub auto_update: bool,
 }
 
 impl Config {
-    /// Whether this configuration checks for client releases, and if not,
-    /// why: for the operator at start-up.
-    pub fn client_updates(&self) -> Result<(), &'static str> {
-        if self.update_public_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
-            Err("no update key is built into this coordinator")
-        } else if !self.updates.enabled {
-            Err("update checks are turned off")
-        } else {
-            Ok(())
-        }
+    /// Whether an update public key is configured, so releases can be
+    /// verified and cached.
+    pub fn has_update_key(&self) -> bool {
+        self.update_public_key.as_deref().is_some_and(|key| !key.trim().is_empty())
     }
 }
 
@@ -124,6 +123,7 @@ impl Config {
             extra_api_routes: None,
             update_public_key: built_in_public_key(),
             updates: UpdateConfig::default(),
+            auto_update: false,
         }
     }
 }
@@ -178,7 +178,8 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
         .await
         .map_err(|e| Error::Internal(e.to_string()))??;
     let token_mode = matches!(config.auth, AuthMode::Token(_));
-    store
+    let auto_update_default = if config.auto_update { "true" } else { "false" };
+    let auto_update = store
         .call(move |conn| {
             store::mark_all_devices_offline(conn)?;
             store::seed_builtin_scripts(conn)?;
@@ -187,9 +188,10 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
                 // an earlier one must not outlive it.
                 store::delete_token_sessions(conn)?;
             }
-            Ok(())
+            store::setting_or_init(conn, store::setting::AUTO_UPDATE, auto_update_default)
         })
-        .await?;
+        .await?
+        == "true";
 
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
@@ -200,7 +202,7 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
     let state = Arc::new(
         tokio::task::spawn_blocking(move || -> Result<AppState, Error> {
             let newest = updates::load_cache(&store, &config.data_dir)?;
-            let update_state = updates::UpdateState::new(&config, newest)?;
+            let update_state = updates::UpdateState::new(&config, newest, auto_update)?;
             Ok(AppState::new(config, store, update_state))
         })
         .await
@@ -208,7 +210,7 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
     );
 
     state.tasks.spawn(sweep(state.clone()));
-    if updates::enabled(&state.config) {
+    if updates::checking(&state.config) {
         state.tasks.spawn(updates::check_periodically(state.clone()));
     }
 
@@ -244,6 +246,11 @@ impl Coordinator {
         self.ui_addr
     }
 
+    /// Whether the automatic update rollout is on (the stored setting).
+    pub fn auto_update(&self) -> bool {
+        self.state.updates.auto_update()
+    }
+
     /// Stops accepting connections, closes client connections and waits for
     /// everything to finish.
     pub async fn stop(self) {
@@ -257,8 +264,9 @@ impl Coordinator {
     }
 }
 
-/// Periodic housekeeping: expires targets that stayed queued too long and
-/// settles `wifi.join` targets whose device has left for good.
+/// Periodic housekeeping: expires targets that stayed queued too long, takes
+/// the next step of the automatic update rollout, and settles `wifi.join`
+/// targets whose device has left for good.
 async fn sweep(state: Arc<AppState>) {
     // After a restart devices get a full grace period to reconnect: the time
     // this coordinator was not running says nothing about them.
@@ -281,6 +289,8 @@ async fn sweep(state: Arc<AppState>) {
             }
             Err(error) => tracing::error!(%error, "expiry sweep failed"),
         }
+        // After expiry, so a canary whose job just expired halts the rollout.
+        rollout::run(&state).await;
 
         let gone_since = store::now_ms() - state.config.handoff_grace.as_millis() as i64;
         if gone_since <= started {

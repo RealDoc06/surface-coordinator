@@ -63,6 +63,11 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/accounts/{id}/password", post(set_password))
         .route("/updates", get(updates::get_updates))
         .route("/updates/check", post(updates::check_now))
+        // The body is streamed to disk with its own size limit, so the
+        // default body limit (which only buffering extractors apply) does
+        // not stand in the way of a 200 MiB executable.
+        .route("/updates/upload", post(updates::upload))
+        .route("/updates/auto", post(updates::set_auto_update))
         .route("/events", get(events::upgrade));
     if let Some(extra) = state.config.extra_api_routes.clone() {
         // Routes supplied by the embedder (the manager), behind the same
@@ -80,9 +85,9 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 // ---------------------------------------------------------------- errors
 
 pub struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl ApiError {
@@ -495,23 +500,35 @@ async fn create_job(
     Extension(identity): Extension<Identity>,
     Json(request): Json<CreateJob>,
 ) -> ApiResult<Response> {
-    // A `client.update` is checked against the release cache; a device
-    // already on its version needs nothing sent.
-    let (payload, done_if_on_version) = match request.kind.as_str() {
-        job_kind::CLIENT_UPDATE => {
-            let update = updates::client_update_payload(&state, request.payload).await?;
-            let version = update.version.parse().ok();
-            (serde_json::to_value(update).expect("payload serialises"), version)
-        }
-        kind => (validate_payload(kind, request.payload)?, None),
-    };
     let targets = match request.targets {
         TargetSelector::All => Targets::All,
         TargetSelector::Devices { device_ids } => Targets::Devices(device_ids),
         TargetSelector::Group { group_id } => Targets::Group(group_id),
     };
-    let kind = request.kind;
     let created_by = identity.username().map(str::to_owned);
+    let job = submit_job(&state, request.kind, request.payload, targets, created_by).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "job": job }))).into_response())
+}
+
+/// Validates, stores, announces and dispatches a job: everything creating
+/// one involves, for the API and for the automatic update rollout alike.
+pub(crate) async fn submit_job(
+    state: &AppState,
+    kind: String,
+    payload: Value,
+    targets: Targets,
+    created_by: Option<String>,
+) -> Result<store::Job, ApiError> {
+    // A `client.update` is checked against the release cache; a device
+    // already on its version needs nothing sent.
+    let (payload, done_if_on_version) = match kind.as_str() {
+        job_kind::CLIENT_UPDATE => {
+            let update = updates::client_update_payload(state, payload).await?;
+            let version = update.version.parse().ok();
+            (serde_json::to_value(update).expect("payload serialises"), version)
+        }
+        kind => (validate_payload(kind, payload)?, None),
+    };
     let created = state
         .store
         .call(move |conn| {
@@ -535,7 +552,7 @@ async fn create_job(
     for target in &job.targets {
         state.dispatch(&target.device_id, false).await;
     }
-    Ok((StatusCode::CREATED, Json(json!({ "job": job }))).into_response())
+    Ok(job)
 }
 
 #[derive(Deserialize)]

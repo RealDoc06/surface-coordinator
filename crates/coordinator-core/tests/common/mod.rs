@@ -257,6 +257,73 @@ impl TestServer {
     }
 }
 
+// ---------------------------------------------------------------- client updates
+
+/// A throwaway Ed25519 key pair, generated per test.
+pub struct Keys {
+    pub signing: String,
+    pub public: String,
+}
+
+impl Keys {
+    pub fn generate() -> Keys {
+        use base64::Engine;
+        let signing = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>());
+        let public = protocol::update::public_key_for(&signing).unwrap();
+        Keys { signing, public }
+    }
+
+    pub fn sign(&self, version: &str, target: &str, artifact: &[u8]) -> String {
+        use protocol::update;
+        let sha256 = update::parse_sha256_hex(&update::sha256_hex(artifact)).unwrap();
+        update::sign(&self.signing, version, target, &sha256).unwrap()
+    }
+}
+
+/// Bytes standing in for the client executable of `version`; large enough
+/// to arrive in several chunks.
+pub fn artifact(version: &str) -> Vec<u8> {
+    let mut bytes = format!("MZ fake client {version}\n").into_bytes();
+    bytes.extend((0..200_000u32).map(|i| (i % 251) as u8));
+    bytes
+}
+
+impl TestServer {
+    /// `POST /api/v1/updates/upload` with the given query, signature header
+    /// (if any) and body.
+    pub async fn upload_raw(&self, query: &[(&str, &str)], signature: Option<&str>, body: Vec<u8>) -> (u16, Value) {
+        let mut request = self
+            .http
+            .post(self.url("/api/v1/updates/upload"))
+            .query(query)
+            .bearer_auth(API_TOKEN)
+            .header("content-type", "application/octet-stream")
+            .body(body);
+        if let Some(signature) = signature {
+            request = request.header("x-signature", signature);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Uploads a correctly signed release of `version` and returns `Updates`.
+    pub async fn upload_release(&self, keys: &Keys, version: &str) -> Value {
+        let bytes = artifact(version);
+        let signature = keys.sign(version, protocol::update::TARGET_WINDOWS_X86_64, &bytes);
+        let query = [("version", version), ("target", protocol::update::TARGET_WINDOWS_X86_64)];
+        let (status, body) = self.upload_raw(&query, Some(&signature), bytes).await;
+        assert_eq!(status, 201, "upload failed: {body}");
+        body
+    }
+
+    pub async fn updates(&self) -> Value {
+        let (status, body) = self.get("/api/v1/updates").await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+}
+
 /// Polls `condition` until it holds or [`WAIT`] passes.
 pub async fn wait_until<F, Fut>(mut condition: F) -> bool
 where
@@ -322,6 +389,13 @@ impl<'a> HandshakeOptions<'a> {
             network: None,
         }
     }
+}
+
+/// Connects a device reporting `version` as its client version.
+pub async fn connect_as(server: &TestServer, key: &EnrollmentKey, id: &str, version: &str) -> FakeClient {
+    let mut options = HandshakeOptions::new(key, id);
+    options.client_version = version;
+    FakeClient::handshake(server.addr, options).await.expect("handshake")
 }
 
 pub async fn open_socket(addr: SocketAddr) -> Socket {

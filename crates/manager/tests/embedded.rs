@@ -15,6 +15,7 @@ fn options() -> Options {
         hotspot: Arc::new(hotspot::Unsupported),
         // Nor its real Wi-Fi.
         wifi: Arc::new(manager::wifi::Unsupported),
+        online_coordinator: None,
     }
 }
 

@@ -10,10 +10,25 @@ const localOpen = document.getElementById('local-open');
 const localStop = document.getElementById('local-stop');
 const localStatus = document.getElementById('local-status');
 const localError = document.getElementById('local-error');
+const keySync = document.getElementById('key-sync');
 
 function showError(element, message) {
   element.textContent = message;
   element.hidden = !message;
+}
+
+// One quiet line on how the enrollment keys were copied from the online
+// coordinator into the local one; nothing before the first attempt.
+function keySyncText(status) {
+  const sync = status.key_sync;
+  if (!status.local_running || !sync.at) {
+    return '';
+  }
+  if (sync.error) {
+    return `${sync.error}.`;
+  }
+  const from = status.remote_url ? new URL(status.remote_url).host : 'the online coordinator';
+  return `Enrollment keys synced from ${from} (${sync.imported} new).`;
 }
 
 async function refresh() {
@@ -29,6 +44,7 @@ async function refresh() {
     localStatus.textContent = 'Not running.';
     localOpen.textContent = 'Start local coordinator';
   }
+  showText(keySync, keySyncText(status));
   localStop.hidden = !status.local_running;
   document.getElementById('update-hint').hidden = !status.local_running;
 }

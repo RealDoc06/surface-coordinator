@@ -14,8 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use base64::Engine;
-use common::{wait_until, FakeClient, HandshakeOptions, TestServer, API_TOKEN, WAIT};
+use common::{artifact, connect_as, wait_until, FakeClient, HandshakeOptions, Keys, TestServer, API_TOKEN, WAIT};
 use coordinator_core::Config;
 use futures_util::StreamExt;
 use protocol::update::{self, TARGET_WINDOWS_X86_64};
@@ -27,33 +26,6 @@ use tokio_tungstenite::tungstenite::Message;
 const SOURCE: &str = "fixture-owner/fixture-repo";
 
 // ---------------------------------------------------------------- fake release source
-
-/// A throwaway Ed25519 key pair, generated per test.
-struct Keys {
-    signing: String,
-    public: String,
-}
-
-impl Keys {
-    fn generate() -> Keys {
-        let signing = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>());
-        let public = update::public_key_for(&signing).unwrap();
-        Keys { signing, public }
-    }
-
-    fn sign(&self, version: &str, target: &str, artifact: &[u8]) -> String {
-        let sha256 = update::parse_sha256_hex(&update::sha256_hex(artifact)).unwrap();
-        update::sign(&self.signing, version, target, &sha256).unwrap()
-    }
-}
-
-/// Bytes standing in for the client executable of `version`; large enough
-/// to arrive in several chunks.
-fn artifact(version: &str) -> Vec<u8> {
-    let mut bytes = format!("MZ fake client {version}\n").into_bytes();
-    bytes.extend((0..200_000u32).map(|i| (i % 251) as u8));
-    bytes
-}
 
 fn artifact_name(version: &str) -> String {
     format!("surface-coordinator-client-{version}-windows-x86_64.exe")
@@ -187,14 +159,8 @@ async fn start_checking(releases: &FakeReleases) -> TestServer {
 }
 
 async fn wait_for_first_check(server: &TestServer) {
-    let checked = wait_until(|| async { !updates(server).await["last_checked_at"].is_null() }).await;
+    let checked = wait_until(|| async { !server.updates().await["last_checked_at"].is_null() }).await;
     assert!(checked, "the start-up check never finished");
-}
-
-async fn updates(server: &TestServer) -> Value {
-    let (status, body) = server.get("/api/v1/updates").await;
-    assert_eq!(status, 200, "{body}");
-    body
 }
 
 async fn check(server: &TestServer) -> (u16, Value) {
@@ -203,12 +169,6 @@ async fn check(server: &TestServer) -> (u16, Value) {
 
 fn one_device(id: &str) -> Value {
     json!({"type": "devices", "device_ids": [id]})
-}
-
-async fn connect_as(server: &TestServer, key: &coordinator_core::EnrollmentKey, id: &str, version: &str) -> FakeClient {
-    let mut options = HandshakeOptions::new(key, id);
-    options.client_version = version;
-    FakeClient::handshake(server.addr, options).await.expect("handshake")
 }
 
 /// Every file below a directory, recursively.
@@ -250,6 +210,9 @@ async fn a_check_caches_the_latest_release_and_lists_it() {
     let (status, body) = check(&server).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["enabled"], true);
+    assert_eq!(body["checking"], true);
+    assert_eq!(body["auto_update"], false);
+    assert!(body["rollout"].is_null(), "no rollout while auto-update is off");
     assert_eq!(body["source"], SOURCE);
     assert!(body["last_checked_at"].as_i64().unwrap() > 0);
     assert!(body["last_error"].is_null(), "{body}");
@@ -261,7 +224,7 @@ async fn a_check_caches_the_latest_release_and_lists_it() {
     assert_eq!(latest["notes"], "Fixes the thing.");
     assert!(latest["cached_at"].as_i64().unwrap() > 0);
     assert_eq!(body["cached"], json!([latest.clone()]));
-    assert_eq!(updates(&server).await, body);
+    assert_eq!(server.updates().await, body);
 
     // Asked the way the GitHub API expects.
     assert!(releases.requests().contains(&format!("/repos/{SOURCE}/releases/latest")));
@@ -281,7 +244,7 @@ async fn checking_again_for_a_cached_version_downloads_nothing() {
     let releases = FakeReleases::start().await;
     releases.publish("1.2.3", "");
     let server = start_checking(&releases).await;
-    let first = updates(&server).await;
+    let first = server.updates().await;
     assert_eq!(first["latest"]["version"], "1.2.3");
 
     for _ in 0..2 {
@@ -331,7 +294,7 @@ async fn assert_check_fails(server: &TestServer, mentions: &str) {
     assert_eq!(body["error"]["code"], "update_check_failed");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.to_lowercase().contains(mentions), "{message:?} should mention {mentions:?}");
-    let state = updates(server).await;
+    let state = server.updates().await;
     assert_eq!(state["last_error"], message);
     assert!(state["last_checked_at"].as_i64().is_some());
     assert_eq!(state["cached"], json!([]));
@@ -434,7 +397,7 @@ async fn an_unreachable_release_source_fails_the_check_but_not_the_coordinator()
     let (status, body) = check(&server).await;
     assert_eq!(status, 502, "{body}");
     assert_eq!(body["error"]["code"], "update_check_failed");
-    assert!(!updates(&server).await["last_error"].is_null());
+    assert!(!server.updates().await["last_error"].is_null());
 
     // Everything else carries on.
     let key = server.new_key();
@@ -459,9 +422,12 @@ async fn without_a_key_or_when_turned_off_nothing_is_checked() {
     })
     .await;
 
-    for server in [&no_key, &turned_off] {
-        let body = updates(server).await;
-        assert_eq!(body["enabled"], false, "{body}");
+    // `enabled` is about the key (uploads are possible), `checking` about the
+    // release source.
+    for (server, enabled) in [(&no_key, false), (&turned_off, true)] {
+        let body = server.updates().await;
+        assert_eq!(body["enabled"], enabled, "{body}");
+        assert_eq!(body["checking"], false, "{body}");
         assert!(body["source"].is_null());
         assert!(body["last_checked_at"].is_null());
         assert!(body["latest"].is_null());
@@ -469,7 +435,8 @@ async fn without_a_key_or_when_turned_off_nothing_is_checked() {
 
         let (status, body) = check(server).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body["enabled"], false);
+        assert_eq!(body["enabled"], enabled);
+        assert_eq!(body["checking"], false);
         assert!(body["last_checked_at"].is_null());
     }
     // Not at start-up, not on demand.
@@ -483,7 +450,21 @@ async fn the_update_routes_need_authentication() {
     let server = start_checking(&releases).await;
     let anonymous = TestServer::client();
     assert_eq!(anonymous.get(server.url("/api/v1/updates")).send().await.unwrap().status(), 401);
-    assert_eq!(anonymous.post(server.url("/api/v1/updates/check")).send().await.unwrap().status(), 401);
+    for path in ["/api/v1/updates/check", "/api/v1/updates/upload?version=1.2.3&target=windows-x86_64", "/api/v1/updates/auto"] {
+        assert_eq!(anonymous.post(server.url(path)).send().await.unwrap().status(), 401, "{path}");
+        // Authenticated, but caused by a page on another site.
+        let response = server
+            .http
+            .post(server.url(path))
+            .bearer_auth(API_TOKEN)
+            .header("origin", "https://evil.example")
+            .json(&json!({"enabled": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "{path}");
+    }
+    assert_eq!(server.updates().await["auto_update"], false);
 }
 
 #[tokio::test]
@@ -493,12 +474,12 @@ async fn the_cache_survives_a_restart_and_entries_whose_files_are_gone_are_dropp
     let mut server = start_checking(&releases).await;
     releases.publish("1.3.0", "second");
     assert_eq!(check(&server).await.0, 200);
-    let before = updates(&server).await;
+    let before = server.updates().await;
     assert_eq!(before["cached"].as_array().unwrap().len(), 2);
 
     // Restarted without update checks: the cache is still listed and served.
     server.restart_with(|config| config.updates.enabled = false).await;
-    let after = updates(&server).await;
+    let after = server.updates().await;
     assert_eq!(after["cached"], before["cached"]);
     assert_eq!(after["latest"]["version"], "1.3.0");
     let response = reqwest::get(server.url("/updates/client/1.2.3/windows-x86_64")).await.unwrap();
@@ -508,12 +489,176 @@ async fn the_cache_survives_a_restart_and_entries_whose_files_are_gone_are_dropp
     // A version whose file disappeared is forgotten at the next start.
     std::fs::remove_file(server.data_dir.path().join("updates/1.3.0/client-windows-x86_64.exe")).unwrap();
     server.restart_with(|config| config.updates.enabled = false).await;
-    let after = updates(&server).await;
+    let after = server.updates().await;
     let versions: Vec<&str> = after["cached"].as_array().unwrap().iter().map(|r| r["version"].as_str().unwrap()).collect();
     assert_eq!(versions, ["1.2.3"]);
     assert_eq!(after["latest"]["version"], "1.2.3");
     let response = reqwest::get(server.url("/updates/client/1.3.0/windows-x86_64")).await.unwrap();
     assert_eq!(response.status(), 404);
+}
+
+// ---------------------------------------------------------------- uploads
+
+/// A coordinator that trusts `keys` and does not check a release source.
+async fn start_with_key(keys: &Keys) -> TestServer {
+    TestServer::start_with(|config| config.update_public_key = Some(keys.public.clone())).await
+}
+
+fn upload_query(version: &str) -> [(&str, &str); 2] {
+    [("version", version), ("target", TARGET_WINDOWS_X86_64)]
+}
+
+/// Asserts an upload was refused with `code` and left nothing behind.
+async fn assert_upload_refused(server: &TestServer, outcome: (u16, Value), status: u16, code: &str) {
+    let (got, body) = outcome;
+    assert_eq!(got, status, "{body}");
+    assert_eq!(body["error"]["code"], code, "{body}");
+    assert_eq!(server.updates().await["cached"], json!([]));
+    assert!(files_below(&server.data_dir.path().join("updates")).is_empty(), "nothing unverified is kept");
+}
+
+#[tokio::test]
+async fn an_uploaded_release_is_cached_served_and_pushed_like_a_fetched_one_without_checking() {
+    let keys = Keys::generate();
+    let server = start_with_key(&keys).await;
+    let mut events = Events::open(&server).await;
+    let bytes = artifact("1.2.3");
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+
+    let query = [("version", "1.2.3"), ("target", TARGET_WINDOWS_X86_64), ("notes", "Uploaded by hand.")];
+    let (status, body) = server.upload_raw(&query, Some(&signature), bytes.clone()).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["checking"], false);
+    assert!(body["source"].is_null());
+    assert!(body["last_checked_at"].is_null());
+    let latest = &body["latest"];
+    assert_eq!(latest["version"], "1.2.3");
+    assert_eq!(latest["target"], "windows-x86_64");
+    assert_eq!(latest["size"], bytes.len());
+    assert_eq!(latest["sha256"], update::sha256_hex(&bytes));
+    assert_eq!(latest["notes"], "Uploaded by hand.");
+    assert_eq!(body["cached"], json!([latest.clone()]));
+    assert_eq!(server.updates().await, body);
+    events.next_of("resync").await;
+
+    // Stored where a fetched release is, and served to clients.
+    let dir = server.data_dir.path().join("updates").join("1.2.3");
+    assert_eq!(std::fs::read(dir.join("client-windows-x86_64.exe")).unwrap(), bytes);
+    let response = reqwest::get(server.url("/updates/client/1.2.3/windows-x86_64")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().to_vec(), bytes);
+    let response = reqwest::get(server.url("/updates/client/1.2.3/windows-x86_64.sig")).await.unwrap();
+    assert_eq!(response.text().await.unwrap(), format!("{signature}\n"));
+
+    let key = server.new_key();
+    let mut client = connect_as(&server, &key, "device-a", "1.0.0").await;
+    let (status, body) = server.create_job("client.update", json!({"version": "1.2.3"}), one_device("device-a")).await;
+    assert_eq!(status, 201, "{body}");
+    let (_, _, kind, payload) = client.expect_job().await;
+    assert_eq!(kind, "client.update");
+    assert_eq!(payload["sha256"], update::sha256_hex(&bytes));
+
+    // Long notes are cut to 4000 characters.
+    let bytes = artifact("1.2.4");
+    let signature = keys.sign("1.2.4", TARGET_WINDOWS_X86_64, &bytes);
+    let notes = "é".repeat(5000);
+    let query = [("version", "1.2.4"), ("target", TARGET_WINDOWS_X86_64), ("notes", notes.as_str())];
+    let (status, body) = server.upload_raw(&query, Some(&signature), bytes).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["latest"]["version"], "1.2.4");
+    assert_eq!(body["latest"]["notes"].as_str().unwrap().chars().count(), 4000);
+}
+
+#[tokio::test]
+async fn an_upload_whose_signature_does_not_verify_is_refused_and_nothing_is_kept() {
+    let keys = Keys::generate();
+    let server = start_with_key(&keys).await;
+    let bytes = artifact("1.2.3");
+
+    let other_file = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, b"some other file");
+    let stranger = Keys::generate().sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+    let other_version = keys.sign("1.2.4", TARGET_WINDOWS_X86_64, &bytes);
+    let other_target = keys.sign("1.2.3", "linux-x86_64", &bytes);
+    let not_base64 = "not base64".to_owned();
+    for signature in [Some(&other_file), Some(&stranger), Some(&other_version), Some(&other_target), Some(&not_base64), None] {
+        let outcome = server.upload_raw(&upload_query("1.2.3"), signature.map(String::as_str), bytes.clone()).await;
+        assert_upload_refused(&server, outcome, 400, "bad_signature").await;
+    }
+
+    // The right signature is accepted afterwards.
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+    let (status, body) = server.upload_raw(&upload_query("1.2.3"), Some(&signature), bytes).await;
+    assert_eq!(status, 201, "{body}");
+}
+
+#[tokio::test]
+async fn an_upload_with_a_bad_version_or_target_is_refused() {
+    let keys = Keys::generate();
+    let server = start_with_key(&keys).await;
+    let bytes = artifact("1.2.3");
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+
+    for version in ["latest", "1.2", "v1.2.3", "1.2.3-beta", ""] {
+        let outcome = server.upload_raw(&upload_query(version), Some(&signature), bytes.clone()).await;
+        assert_upload_refused(&server, outcome, 400, "invalid_version").await;
+    }
+    let outcome = server.upload_raw(&[("target", TARGET_WINDOWS_X86_64)], Some(&signature), bytes.clone()).await;
+    assert_upload_refused(&server, outcome, 400, "invalid_version").await;
+    for target in [&[("version", "1.2.3"), ("target", "linux-x86_64")][..], &[("version", "1.2.3")][..]] {
+        let outcome = server.upload_raw(target, Some(&signature), bytes.clone()).await;
+        assert_upload_refused(&server, outcome, 400, "unsupported_target").await;
+    }
+}
+
+#[tokio::test]
+async fn uploading_a_cached_version_again_is_a_conflict() {
+    let keys = Keys::generate();
+    let server = start_with_key(&keys).await;
+    let first = server.upload_release(&keys, "1.2.3").await;
+
+    let bytes = artifact("1.2.3");
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+    // `01.2.3` is another spelling of the same version.
+    for version in ["1.2.3", "01.2.3"] {
+        let (status, body) = server.upload_raw(&upload_query(version), Some(&signature), bytes.clone()).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "version_exists");
+    }
+    assert_eq!(server.updates().await["cached"], first["cached"]);
+}
+
+#[tokio::test]
+async fn without_an_update_key_uploads_are_unavailable() {
+    let keys = Keys::generate();
+    let server = TestServer::start().await;
+    let bytes = artifact("1.2.3");
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, &bytes);
+    let outcome = server.upload_raw(&upload_query("1.2.3"), Some(&signature), bytes).await;
+    assert_upload_refused(&server, outcome, 503, "updates_unavailable").await;
+    assert_eq!(server.updates().await["enabled"], false);
+}
+
+#[tokio::test]
+async fn an_upload_announcing_more_than_200_mib_is_refused_before_it_is_read() {
+    let keys = Keys::generate();
+    let server = start_with_key(&keys).await;
+    let signature = keys.sign("1.2.3", TARGET_WINDOWS_X86_64, b"");
+    let request = format!(
+        "POST /api/v1/updates/upload?version=1.2.3&target=windows-x86_64 HTTP/1.1\r\n\
+         Host: {}\r\nAuthorization: Bearer {API_TOKEN}\r\nX-Signature: {signature}\r\n\
+         Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        server.addr,
+        200 * 1024 * 1024 + 1,
+    );
+    let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(WAIT, stream.read_to_end(&mut response)).await.unwrap().unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(response.contains("too_large"), "{response}");
+    assert!(files_below(&server.data_dir.path().join("updates")).is_empty());
 }
 
 // ---------------------------------------------------------------- downloads for clients
@@ -685,7 +830,7 @@ async fn update_available_marks_devices_older_than_the_newest_cached_version() {
     let releases = FakeReleases::start().await;
     // Nothing published yet: the start-up check finds no release.
     let server = start_checking(&releases).await;
-    assert!(!updates(&server).await["last_error"].is_null());
+    assert!(!server.updates().await["last_error"].is_null());
     let key = server.new_key();
     let old = connect_as(&server, &key, "device-old", "1.0.0").await;
     let _current = connect_as(&server, &key, "device-current", "1.2.3").await;
