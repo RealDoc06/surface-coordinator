@@ -56,6 +56,11 @@ pub enum PlatformError {
     /// no user to act as.
     #[error("no user session: {0}")]
     NoUserSession(String),
+    /// The operating system refuses to tell. On Windows 11 the list of
+    /// Wi-Fi networks and the name of the current one are withheld while
+    /// Location services are off.
+    #[error("access denied: {0}")]
+    AccessDenied(String),
     #[error("{0}")]
     Failed(String),
 }
@@ -63,7 +68,9 @@ pub enum PlatformError {
 /// The Wi-Fi network the device is connected to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiConnection {
-    pub ssid: String,
+    /// `None` when the operating system does not say which network it is
+    /// (see [`PlatformError::AccessDenied`]).
+    pub ssid: Option<String>,
     /// The device's address on that network.
     pub ip: Option<IpAddr>,
     /// The network's gateway. On a manager's hotspot this is the manager.

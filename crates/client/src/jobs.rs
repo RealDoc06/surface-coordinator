@@ -470,7 +470,9 @@ pub(crate) fn platform_failure(job_target_id: &str, error: PlatformError) -> Job
     let (reason, message) = match error {
         PlatformError::Unsupported(message) => (reason::UNSUPPORTED, message),
         PlatformError::NoUserSession(message) => (reason::NO_USER_SESSION, message),
-        PlatformError::Failed(message) => (reason::ERROR, message),
+        PlatformError::AccessDenied(message) | PlatformError::Failed(message) => {
+            (reason::ERROR, message)
+        }
     };
     failed(job_target_id, reason, Some(message))
 }

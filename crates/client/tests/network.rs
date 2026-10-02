@@ -379,3 +379,84 @@ async fn wifi_join_on_a_platform_without_wifi_fails_as_unsupported() {
     assert!(gateway.no_connection_within(QUIET).await);
     client.stop().await;
 }
+
+// ------------------------------------------------------------ Wi-Fi names withheld
+
+#[tokio::test]
+async fn with_wifi_names_withheld_the_hotspot_is_joined_without_seeing_it() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.withhold_wifi_names();
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let client = start_client(config(None, &gateway), platform.clone());
+
+    let (_connection, hello) = gateway.accept().await;
+    assert_eq!(
+        platform.joins(),
+        [WifiJoinRequest {
+            ssid: hotspot_ssid(),
+            passphrase: Some(hotspot::passphrase(SECRET)),
+            auto_connect: false,
+        }]
+    );
+    // The client cannot name the network, but still reports its address.
+    let network = hello.network.expect("hello carries the network");
+    assert_eq!(network.ssid, None);
+    assert_eq!(network.ip.as_deref(), Some("192.168.137.23"));
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn blind_joins_are_spaced_out_when_the_hotspot_is_not_there() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.withhold_wifi_names();
+    // No outcome for the hotspot: every join fails, as when out of range.
+    let mut config = config(None, &gateway);
+    config.search_interval = Duration::from_millis(40);
+    config.blind_join_interval = Duration::from_millis(400);
+    let client = start_client(config, platform.clone());
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Several search rounds have passed, but the device was taken off its
+    // network only once.
+    assert!(platform.scans().len() >= 3, "{} scans", platform.scans().len());
+    assert_eq!(platform.joins().len(), 1);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(platform.joins().len(), 2);
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn with_wifi_names_withheld_a_device_already_on_the_hotspot_asks_its_gateway() {
+    let remote = Unreachable::start().await;
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.withhold_wifi_names();
+    platform.set_current(Some(wifi_on(&hotspot_ssid())));
+    let mut config = config(Some(remote.addr), &gateway);
+    // Not searching yet: nothing may be joined.
+    config.search_after = Duration::from_secs(600);
+    let client = start_client(config, platform.clone());
+
+    let (_connection, _hello) = gateway.accept().await;
+    assert!(platform.joins().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn with_wifi_names_withheld_no_join_happens_while_a_session_is_up() {
+    let remote = FakeCoordinator::start().await;
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.withhold_wifi_names();
+    platform.set_current(Some(wifi_on(OFFICE)));
+    let client = start_client(config(Some(remote.addr), &gateway), platform.clone());
+
+    let (_connection, _hello) = remote.accept().await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(platform.joins().is_empty());
+    assert!(platform.scans().is_empty());
+    client.stop().await;
+}

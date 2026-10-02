@@ -74,6 +74,11 @@ pub struct ClientConfig {
     /// How long a `wifi.join` waits for a coordinator on the new network
     /// before going back.
     pub handoff_timeout: Duration,
+    /// While searching on a device that may not see Wi-Fi networks: time
+    /// between attempts to join the hotspot without knowing it is there.
+    /// Each attempt takes the device off its current network for a moment,
+    /// hence much rarer than a scan.
+    pub blind_join_interval: Duration,
     /// Port of the coordinator at the hotspot's gateway.
     pub hotspot_port: u16,
     /// How long a `power` job waits for the coordinator to acknowledge its
@@ -105,6 +110,7 @@ impl ClientConfig {
             search_after: Duration::from_secs(60),
             search_interval: Duration::from_secs(30),
             handoff_timeout: Duration::from_secs(60),
+            blind_join_interval: Duration::from_secs(5 * 60),
             hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
             power_ack_timeout: Duration::from_secs(5),
             update_public_key: BUILT_IN_UPDATE_KEY.to_owned(),
@@ -210,6 +216,8 @@ impl<P: Platform> Client<P> {
             search_requested: false,
             searching: false,
             wifi_unsupported_noted: false,
+            wifi_hidden_noted: false,
+            last_blind_join: None,
         };
         supervisor.run().await;
         // A job still running is cut short here; it is recorded as started,
@@ -238,6 +246,11 @@ enum Round {
 /// hotspot after scanning for and joining it. Nothing is scanned or joined
 /// while a session is up, so a working connection is never given up for the
 /// hotspot.
+///
+/// Where the operating system withholds Wi-Fi names (Windows 11 with
+/// Location services off) the client cannot look: it asks whatever gateway
+/// it has, and while searching joins the hotspot without knowing whether it
+/// is in range. The handshake tells a coordinator from anything else.
 struct Supervisor<'a, P: Platform> {
     config: &'a ClientConfig,
     platform: &'a P,
@@ -255,6 +268,10 @@ struct Supervisor<'a, P: Platform> {
     searching: bool,
     /// Wi-Fi being unsupported is said once, not every round.
     wifi_unsupported_noted: bool,
+    /// So is Wi-Fi names being withheld.
+    wifi_hidden_noted: bool,
+    /// When the hotspot was last joined without seeing it.
+    last_blind_join: Option<Instant>,
 }
 
 impl<P: Platform> Supervisor<'_, P> {
@@ -299,10 +316,21 @@ impl<P: Platform> Supervisor<'_, P> {
             }
         }
 
-        if let Some(on_hotspot) = current.filter(|c| c.ssid == self.hotspot_ssid) {
-            // Already there (joined earlier, or by hand): no need to scan.
-            let round = self.try_gateway(&on_hotspot).await;
-            return (round, searching);
+        match current {
+            Some(on_hotspot) if on_hotspot.ssid.as_deref() == Some(self.hotspot_ssid.as_str()) => {
+                // Already there (joined earlier, or by hand): no need to scan.
+                let round = self.try_gateway(&on_hotspot).await;
+                return (round, searching);
+            }
+            Some(unnamed) if unnamed.ssid.is_none() => {
+                // This may be the hotspot; asking its gateway costs one
+                // connection attempt.
+                let round = self.try_gateway(&unnamed).await;
+                if !matches!(round, Round::NotConnected) {
+                    return (round, searching);
+                }
+            }
+            _ => {}
         }
         if !searching {
             return (Round::NotConnected, false);
@@ -343,6 +371,7 @@ impl<P: Platform> Supervisor<'_, P> {
                 self.disconnected_since = Instant::now();
                 self.search_requested = false;
                 self.searching = false;
+                self.last_blind_join = None;
                 if lasted >= self.config.backoff.stable_after {
                     self.backoff.reset();
                 }
@@ -370,18 +399,31 @@ impl<P: Platform> Supervisor<'_, P> {
     async fn join_hotspot(&mut self) -> Result<Option<WifiConnection>, Round> {
         let network = self.network;
         let _wifi = network.wifi_lock().await;
-        let visible = match self.unless_shutdown(self.platform.wifi_scan()).await? {
-            Ok(visible) => visible,
+        match self.unless_shutdown(self.platform.wifi_scan()).await? {
+            Ok(visible) if visible.contains(&self.hotspot_ssid) => {
+                tracing::info!(ssid = %self.hotspot_ssid, "hotspot in range; joining it");
+            }
+            Ok(_) => {
+                tracing::debug!(ssid = %self.hotspot_ssid, "hotspot not in range");
+                return Ok(None);
+            }
+            Err(PlatformError::AccessDenied(message)) => {
+                if !self.wifi_hidden_noted {
+                    self.wifi_hidden_noted = true;
+                    tracing::warn!(%message, "cannot see Wi-Fi networks; joining the hotspot without looking for it");
+                }
+                let waited = self.last_blind_join.map(|at| at.elapsed());
+                if waited.is_some_and(|waited| waited < self.config.blind_join_interval) {
+                    return Ok(None);
+                }
+                self.last_blind_join = Some(Instant::now());
+                tracing::info!(ssid = %self.hotspot_ssid, "trying to join the hotspot");
+            }
             Err(error) => {
                 self.note_wifi_error("scanning for the hotspot", error);
                 return Ok(None);
             }
-        };
-        if !visible.contains(&self.hotspot_ssid) {
-            tracing::debug!(ssid = %self.hotspot_ssid, "hotspot not in range");
-            return Ok(None);
         }
-        tracing::info!(ssid = %self.hotspot_ssid, "hotspot in range; joining it");
         let request = WifiJoinRequest {
             ssid: self.hotspot_ssid.clone(),
             passphrase: Some(protocol::hotspot::passphrase(&self.config.key_secret)),
@@ -393,7 +435,9 @@ impl<P: Platform> Supervisor<'_, P> {
             return Ok(None);
         }
         let current = self.wifi_current().await;
-        Ok(current.filter(|c| c.ssid == self.hotspot_ssid))
+        // An unnamed connection right after a successful join is the hotspot
+        // as far as anyone can tell; the gateway's handshake decides.
+        Ok(current.filter(|c| c.ssid.as_ref().is_none_or(|ssid| *ssid == self.hotspot_ssid)))
     }
 
     /// Platform calls can take seconds; shutdown should not wait for them.
@@ -422,6 +466,12 @@ impl<P: Platform> Supervisor<'_, P> {
                     tracing::info!(%message, "Wi-Fi is not available; the client cannot fall back to the hotspot");
                 }
             }
+            PlatformError::AccessDenied(message) => {
+                if !self.wifi_hidden_noted {
+                    self.wifi_hidden_noted = true;
+                    tracing::warn!(%message, "{what} was refused");
+                }
+            }
             PlatformError::Failed(message) | PlatformError::NoUserSession(message) => {
                 tracing::warn!(%message, "{what} failed")
             }
@@ -432,7 +482,7 @@ impl<P: Platform> Supervisor<'_, P> {
 /// What `hello` says about the network.
 fn network_info(current: Option<&WifiConnection>) -> Option<NetworkInfo> {
     current.map(|connection| NetworkInfo {
-        ssid: Some(connection.ssid.clone()),
+        ssid: connection.ssid.clone(),
         ip: connection.ip.map(|ip| ip.to_string()),
     })
 }

@@ -95,6 +95,9 @@ impl Drop for DropWatch<'_> {
 #[derive(Default)]
 struct FakeWifi {
     supported: bool,
+    /// Like Windows 11 with Location services off: no list of networks and
+    /// no name for the current one.
+    names_withheld: bool,
     visible: Vec<String>,
     current: Option<WifiConnection>,
     /// On success the device is then on the given connection.
@@ -189,6 +192,10 @@ impl FakePlatform {
         platform
     }
 
+    pub fn withhold_wifi_names(&self) {
+        self.wifi.lock().unwrap().names_withheld = true;
+    }
+
     pub fn set_visible(&self, ssids: &[&str]) {
         self.wifi.lock().unwrap().visible = ssids.iter().map(|s| s.to_string()).collect();
     }
@@ -255,6 +262,9 @@ impl Platform for FakePlatform {
     async fn wifi_scan(&self) -> Result<Vec<String>, PlatformError> {
         let mut wifi = self.wifi_supported()?;
         wifi.scans.push(Instant::now());
+        if wifi.names_withheld {
+            return Err(PlatformError::AccessDenied("fake: Wi-Fi names are withheld".into()));
+        }
         Ok(wifi.visible.clone())
     }
 
@@ -272,7 +282,14 @@ impl Platform for FakePlatform {
     }
 
     async fn wifi_current(&self) -> Result<Option<WifiConnection>, PlatformError> {
-        Ok(self.wifi_supported()?.current.clone())
+        let wifi = self.wifi_supported()?;
+        let mut current = wifi.current.clone();
+        if wifi.names_withheld {
+            if let Some(current) = &mut current {
+                current.ssid = None;
+            }
+        }
+        Ok(current)
     }
 
     async fn launch_app(&self, path: String, arguments: Vec<String>) -> Result<u32, PlatformError> {
@@ -364,7 +381,7 @@ impl FakePlatform {
 /// [`FakeCoordinator`] can play the coordinator at the gateway.
 pub fn wifi_on(ssid: &str) -> WifiConnection {
     WifiConnection {
-        ssid: ssid.to_owned(),
+        ssid: Some(ssid.to_owned()),
         ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 137, 23))),
         gateway: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     }
@@ -404,6 +421,7 @@ pub fn client_config(addr: SocketAddr) -> ClientConfig {
         search_after: Duration::from_millis(300),
         search_interval: Duration::from_millis(100),
         handoff_timeout: Duration::from_millis(700),
+        blind_join_interval: Duration::from_millis(400),
         hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
         power_ack_timeout: Duration::from_millis(200),
         // No update key: tests of `client.update` give their own.

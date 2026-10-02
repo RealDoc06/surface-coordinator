@@ -19,7 +19,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::NetworkManagement::WiFi::{
     dot11_BSS_type_infrastructure, wlan_connection_mode_profile, wlan_interface_state_connected,
-    wlan_intf_opcode_current_connection, WlanCloseHandle, WlanConnect, WlanEnumInterfaces,
+    wlan_intf_opcode_current_connection, WlanCloseHandle, WlanConnect, WlanDisconnect,
+    WlanEnumInterfaces,
     WlanFreeMemory, WlanGetAvailableNetworkList, WlanOpenHandle, WlanQueryInterface,
     WlanReasonCodeToString, WlanScan, WlanSetProfile, DOT11_SSID, WLAN_API_VERSION_2_0,
     WLAN_AVAILABLE_NETWORK, WLAN_AVAILABLE_NETWORK_LIST, WLAN_CONNECTION_ATTRIBUTES,
@@ -34,6 +35,18 @@ use crate::platform::{PlatformError, WifiConnection, WifiJoinRequest};
 const SCAN_WAIT: Duration = Duration::from_secs(4);
 /// Association plus DHCP.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the old network's address may linger after a disconnect.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
+const WITHHELD: &str = "Windows does not reveal Wi-Fi networks to this client \
+     (Location services are off)";
+
+/// What Windows says about the network the interface is on.
+enum Association {
+    Connected(String),
+    NotConnected,
+    /// Windows 11 withholds the name while Location services are off.
+    Withheld,
+}
 const JOIN_POLL: Duration = Duration::from_millis(500);
 /// `GetAdaptersAddresses` recommends starting with 15 KB.
 const ADAPTERS_BUFFER: u32 = 15 * 1024;
@@ -118,8 +131,8 @@ impl Wlan {
         Ok(wlan)
     }
 
-    /// The SSID the interface is connected to, if any.
-    fn connected_ssid(&self) -> Result<Option<String>, PlatformError> {
+    /// The network the interface is connected to, as far as Windows tells.
+    fn association(&self) -> Result<Association, PlatformError> {
         let mut size = 0u32;
         let mut data: *mut c_void = null_mut();
         // SAFETY: valid handle, interface and out pointers; the data is
@@ -139,7 +152,8 @@ impl Wlan {
         match code {
             ERROR_SUCCESS => {}
             // The interface is not connected.
-            ERROR_INVALID_STATE => return Ok(None),
+            ERROR_INVALID_STATE => return Ok(Association::NotConnected),
+            ERROR_ACCESS_DENIED => return Ok(Association::Withheld),
             code => return Err(failed("WlanQueryInterface", code)),
         }
         if data.0.is_null() || (size as usize) < std::mem::size_of::<WLAN_CONNECTION_ATTRIBUTES>() {
@@ -148,9 +162,9 @@ impl Wlan {
         // SAFETY: checked above that the buffer holds the structure.
         let attributes = unsafe { &*data.0 };
         if attributes.isState != wlan_interface_state_connected {
-            return Ok(None);
+            return Ok(Association::NotConnected);
         }
-        Ok(Some(ssid_string(&attributes.wlanAssociationAttributes.dot11Ssid)))
+        Ok(Association::Connected(ssid_string(&attributes.wlanAssociationAttributes.dot11Ssid)))
     }
 }
 
@@ -270,6 +284,9 @@ pub fn scan() -> Result<Vec<String>, PlatformError> {
     // SAFETY: valid handle, interface and out pointer; freed by the guard.
     let code = unsafe { WlanGetAvailableNetworkList(wlan.handle, &wlan.interface, 0, null(), &mut list) };
     let list = WlanMemory(list);
+    if code == ERROR_ACCESS_DENIED {
+        return Err(PlatformError::AccessDenied(WITHHELD.into()));
+    }
     check(code, "WlanGetAvailableNetworkList")?;
     // SAFETY: on success the list holds `dwNumberOfItems` entries; the array
     // pointer is derived from the list pointer.
@@ -293,9 +310,22 @@ pub fn scan() -> Result<Vec<String>, PlatformError> {
 
 pub fn current() -> Result<Option<WifiConnection>, PlatformError> {
     let wlan = Wlan::open()?;
-    let Some(ssid) = wlan.connected_ssid()? else { return Ok(None) };
+    let ssid = match wlan.association()? {
+        Association::Connected(ssid) => Some(ssid),
+        Association::NotConnected => return Ok(None),
+        Association::Withheld => None,
+    };
     let (ip, gateway) = adapter_addresses(&wlan.interface)?;
+    // Without a name, an address is the only sign of a connection.
+    if ssid.is_none() && !ip.is_some_and(usable) {
+        return Ok(None);
+    }
     Ok(Some(WifiConnection { ssid, ip, gateway }))
+}
+
+/// An address from a DHCP server rather than the link-local fallback.
+fn usable(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(ip) if !ip.is_link_local())
 }
 
 fn reason_text(reason: u32) -> String {
@@ -336,6 +366,19 @@ pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
         )));
     }
 
+    // When Windows withholds the name of the network, being connected can
+    // only be told from having an address. Leave the current network first,
+    // so that an address seen afterwards is one from the network asked for.
+    let blind = matches!(wlan.association()?, Association::Withheld);
+    if blind {
+        // SAFETY: valid handle and interface.
+        unsafe { WlanDisconnect(wlan.handle, &wlan.interface, null()) };
+        let deadline = Instant::now() + LEAVE_TIMEOUT;
+        while adapter_addresses(&wlan.interface)?.0.is_some_and(usable) && Instant::now() < deadline {
+            std::thread::sleep(JOIN_POLL);
+        }
+    }
+
     // The profile is named after the SSID.
     let profile = wide(ssid);
     let parameters = WLAN_CONNECTION_PARAMETERS {
@@ -358,12 +401,13 @@ pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
     // fallback).
     let deadline = Instant::now() + JOIN_TIMEOUT;
     loop {
-        if wlan.connected_ssid()?.as_deref() == Some(ssid) {
-            if let (Some(IpAddr::V4(ip)), _) = adapter_addresses(&wlan.interface)? {
-                if !ip.is_link_local() {
-                    return Ok(());
-                }
-            }
+        let associated = match wlan.association()? {
+            Association::Connected(current) => current == ssid,
+            Association::NotConnected => false,
+            Association::Withheld => true,
+        };
+        if associated && adapter_addresses(&wlan.interface)?.0.is_some_and(usable) {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(PlatformError::Failed(format!(
