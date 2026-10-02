@@ -148,6 +148,11 @@ export function DevicesPage() {
             leave their current network and join <strong>{localWifi.ssid}</strong>, the Wi-Fi this computer is on. The
             saved password is used; nothing needs typing.
           </p>
+          {localWifi.warning ? (
+            <p className="error" role="alert">
+              {localWifi.warning}
+            </p>
+          ) : null}
           <p className="muted">
             They will reach this coordinator at <code>{localWifi.coordinator_url}</code> from then on. A device that
             cannot join comes back to the hotspot and reports the failure.

@@ -421,6 +421,7 @@ pub fn client_config(addr: SocketAddr) -> ClientConfig {
         search_after: Duration::from_millis(300),
         search_interval: Duration::from_millis(100),
         handoff_timeout: Duration::from_millis(700),
+        offline_search_interval: Duration::from_millis(100),
         blind_join_interval: Duration::from_millis(400),
         hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
         power_ack_timeout: Duration::from_millis(200),

@@ -14,6 +14,9 @@ use coordinator_core::{AuthMode, Capabilities, Config, Coordinator};
 use crate::hotspot::{self, Control, HotspotControl, HotspotService};
 use crate::wifi::{self, WifiService, WifiSource};
 
+/// Devices are declared offline after three of these.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct Embedded {
     coordinator: Coordinator,
     hotspot: Arc<HotspotService>,
@@ -48,6 +51,10 @@ impl Embedded {
 
         let mut config = Config::new(options.client_bind, data_dir, AuthMode::Token(token.clone()));
         config.ui_bind = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+        // An operator next to the devices watches them come and go: with the
+        // default 30 s a device that left would still show as online for a
+        // minute and a half.
+        config.heartbeat_interval = HEARTBEAT_INTERVAL;
         config.capabilities = Capabilities { hotspot: control != Control::Unsupported };
         let wifi = Arc::new(WifiService::new(options.wifi));
         config.extra_api_routes = Some(hotspot::router(hotspot.clone()).merge(wifi::router(wifi.clone())));

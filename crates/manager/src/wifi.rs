@@ -58,6 +58,27 @@ fn lan_address() -> Option<IpAddr> {
     (!address.is_unspecified() && !address.is_loopback()).then_some(address)
 }
 
+/// Whether traffic to other devices on this computer's network would leave
+/// through another interface, as with a VPN that routes the same subnet.
+/// Devices then cannot connect here: the firewall drops replies that go out
+/// by a different interface than the request came in on.
+fn lan_route_problem(lan: IpAddr) -> Option<String> {
+    let IpAddr::V4(address) = lan else { return None };
+    // A neighbour: the same address with the last bit flipped.
+    let mut octets = address.octets();
+    octets[3] ^= 1;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect((std::net::Ipv4Addr::from(octets), 9)).ok()?;
+    let source = socket.local_addr().ok()?.ip();
+    (source != lan).then(|| {
+        format!(
+            "Traffic to this network ({lan}) leaves this computer through another interface \
+             ({source}), probably a VPN that routes the same addresses. Devices will not be able \
+             to connect to this computer over the Wi-Fi until that is turned off."
+        )
+    })
+}
+
 /// How the manager reaches the embedded coordinator's API.
 #[derive(Clone)]
 struct Api {
@@ -111,6 +132,7 @@ async fn show(State(service): State<Arc<WifiService>>) -> Json<Value> {
             "secured": network.password.is_some(),
             "coordinator_url": coordinator_url,
             "reason": null,
+            "warning": lan_address().and_then(lan_route_problem),
         }),
         Ok(_) => json!({
             "available": false, "ssid": null, "secured": false, "coordinator_url": null,

@@ -74,10 +74,15 @@ pub struct ClientConfig {
     /// How long a `wifi.join` waits for a coordinator on the new network
     /// before going back.
     pub handoff_timeout: Duration,
-    /// While searching on a device that may not see Wi-Fi networks: time
-    /// between attempts to join the hotspot without knowing it is there.
-    /// Each attempt takes the device off its current network for a moment,
-    /// hence much rarer than a scan.
+    /// The same while the device is on no Wi-Fi network at all. Nothing is
+    /// lost by looking often then, so the hotspot is found soon after it
+    /// comes up.
+    pub offline_search_interval: Duration,
+    /// While searching on a device that may not see Wi-Fi networks and is on
+    /// another network: time between attempts to join the hotspot without
+    /// knowing it is there. Each attempt takes the device off that network
+    /// for a moment, hence much rarer than a scan. A device on no network
+    /// has nothing to lose and tries every round.
     pub blind_join_interval: Duration,
     /// Port of the coordinator at the hotspot's gateway.
     pub hotspot_port: u16,
@@ -110,6 +115,7 @@ impl ClientConfig {
             search_after: Duration::from_secs(60),
             search_interval: Duration::from_secs(30),
             handoff_timeout: Duration::from_secs(60),
+            offline_search_interval: Duration::from_secs(10),
             blind_join_interval: Duration::from_secs(5 * 60),
             hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
             power_ack_timeout: Duration::from_secs(5),
@@ -218,6 +224,7 @@ impl<P: Platform> Client<P> {
             wifi_unsupported_noted: false,
             wifi_hidden_noted: false,
             last_blind_join: None,
+            on_wifi: false,
         };
         supervisor.run().await;
         // A job still running is cut short here; it is recorded as started,
@@ -272,6 +279,8 @@ struct Supervisor<'a, P: Platform> {
     wifi_hidden_noted: bool,
     /// When the hotspot was last joined without seeing it.
     last_blind_join: Option<Instant>,
+    /// Whether the device was on a Wi-Fi network at the start of the round.
+    on_wifi: bool,
 }
 
 impl<P: Platform> Supervisor<'_, P> {
@@ -283,6 +292,9 @@ impl<P: Platform> Supervisor<'_, P> {
             let (round, searching) = self.round().await;
             let delay = match round {
                 Round::Shutdown => return,
+                Round::NotConnected if searching && !self.on_wifi => {
+                    self.config.offline_search_interval.min(self.config.search_interval)
+                }
                 Round::NotConnected if searching => self.config.search_interval,
                 Round::HadSession | Round::NotConnected => self.backoff.next_delay(),
             };
@@ -301,6 +313,7 @@ impl<P: Platform> Supervisor<'_, P> {
         // Asked once per round: for `hello`, and to see whether the device
         // is on the hotspot.
         let current = self.wifi_current().await;
+        self.on_wifi = current.is_some();
 
         if let Some(url) = self.network.coordinator_url() {
             if let Some(round) = self.attempt(&url, network_info(current.as_ref())).await {
@@ -413,7 +426,8 @@ impl<P: Platform> Supervisor<'_, P> {
                     tracing::warn!(%message, "cannot see Wi-Fi networks; joining the hotspot without looking for it");
                 }
                 let waited = self.last_blind_join.map(|at| at.elapsed());
-                if waited.is_some_and(|waited| waited < self.config.blind_join_interval) {
+                // On another network an attempt costs that connection.
+                if self.on_wifi && waited.is_some_and(|waited| waited < self.config.blind_join_interval) {
                     return Ok(None);
                 }
                 self.last_blind_join = Some(Instant::now());

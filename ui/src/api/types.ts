@@ -182,6 +182,8 @@ export type ManagerWifi = {
   coordinator_url: string | null
   /** Why not, when unavailable. */
   reason: string | null
+  /** A problem that will probably make the move fail, when available. */
+  warning?: string | null
 }
 
 /** The manager's hotspot (only when `capabilities.hotspot`). */

@@ -407,10 +407,15 @@ async fn with_wifi_names_withheld_the_hotspot_is_joined_without_seeing_it() {
 }
 
 #[tokio::test]
-async fn blind_joins_are_spaced_out_when_the_hotspot_is_not_there() {
+async fn blind_joins_are_spaced_out_while_the_device_is_on_another_network() {
     let gateway = FakeCoordinator::start().await;
     let platform = FakePlatform::with_wifi();
     platform.withhold_wifi_names();
+    // On some network (Windows will not say which): every attempt costs it.
+    // No gateway, so nothing there is mistaken for the hotspot.
+    let mut elsewhere = wifi_on(OFFICE);
+    elsewhere.gateway = None;
+    platform.set_current(Some(elsewhere));
     // No outcome for the hotspot: every join fails, as when out of range.
     let mut config = config(None, &gateway);
     config.search_interval = Duration::from_millis(40);
@@ -458,5 +463,25 @@ async fn with_wifi_names_withheld_no_join_happens_while_a_session_is_up() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(platform.joins().is_empty());
     assert!(platform.scans().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_device_on_no_network_tries_the_hotspot_every_round() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.withhold_wifi_names();
+    // Not connected to anything and the hotspot is not up yet.
+    let mut config = config(None, &gateway);
+    config.offline_search_interval = Duration::from_millis(40);
+    config.blind_join_interval = Duration::from_secs(600);
+    let client = start_client(config, platform.clone());
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(platform.joins().len() >= 3, "{} joins", platform.joins().len());
+
+    // The hotspot comes up: the next round finds it.
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let (_connection, _hello) = gateway.accept().await;
     client.stop().await;
 }
