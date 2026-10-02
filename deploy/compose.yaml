@@ -8,6 +8,12 @@ services:
     ports:
       # Point the reverse proxy here. Change the left side to taste.
       - "${SC_PUBLISH:-127.0.0.1:8080}:8080"
+    environment:
+      # Client builds are uploaded (scripts/publish-client.ps1); do not look
+      # for releases on GitHub.
+      SC_NO_UPDATE_CHECK: "true"
+      # A device that drops is shown as offline after three intervals.
+      SC_HEARTBEAT_INTERVAL_SECS: "10"
     volumes:
       - data:/data
 volumes:
