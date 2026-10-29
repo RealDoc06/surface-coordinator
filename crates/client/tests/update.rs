@@ -17,6 +17,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use client::update::{read_marker, Marker, DOWNLOAD_FILE};
 use client::ClientConfig;
+use client::platform::PlatformError;
 use common::{
     client_config, start_client, FakeCoordinator, FakePlatform, RunningClient, Served, Unreachable,
     UpdateServer, WAIT,
@@ -196,6 +197,7 @@ async fn install_update(device: &Device, keys: &Keys, id: &str) {
             new_version: NEW.into(),
             starts: 0,
             rolled_back: false,
+            failure: None,
         })
     );
     let entry = device.ledger_entry(id);
@@ -217,6 +219,56 @@ async fn an_update_is_downloaded_verified_swapped_in_and_the_client_restarts() {
 }
 
 #[tokio::test]
+async fn a_signed_but_unlaunchable_candidate_keeps_the_working_client() {
+    let keys = keys();
+    let device = Device::new();
+    let updates = UpdateServer::start().await;
+    publish(&updates, &keys, NEW_EXE);
+    let coordinator = FakeCoordinator::with_updates(&updates).await;
+    let (client, platform) = device.start(&coordinator, RUNNING, &keys);
+    platform.fail_update_probe(PlatformError::Failed("the signed update cannot start".into()));
+    let (mut connection, _) = coordinator.accept().await;
+    connection.send_job("bad-image", "client.update", payload(NEW, NEW_EXE)).await;
+    connection.expect_started("bad-image").await;
+    assert_failed(&connection.expect_result("bad-image").await, reason::ERROR);
+    device.assert_untouched(&platform);
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_update_waits_for_previous_confirmation_cleanup() {
+    const NEXT: &str = "1.6.0";
+    let keys = keys();
+    let device = Device::new();
+    install_update(&device, &keys, "first").await;
+    let updates = UpdateServer::start().await;
+    updates.serve(&artifact_path(NEXT), Served::Bytes(NEW_EXE.to_vec()));
+    updates.serve(&format!("{}.sig", artifact_path(NEXT)),
+        Served::Bytes(signature(&keys, NEXT, target(), NEW_EXE).into_bytes()));
+    let coordinator = FakeCoordinator::with_updates(&updates).await;
+    let platform = device.platform();
+    platform.hold_update_cleanup();
+    let client = start_client(device.config(format!("ws://{}", coordinator.addr), NEW, &keys), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("first").await;
+    assert_eq!(connection.expect_result("first").await.status, JobStatus::Succeeded);
+    wait_for("the first update's cleanup to block", || platform.update_calls().contains(&"remove_old")).await;
+    connection.send_job("second", "client.update", payload(NEXT, NEW_EXE)).await;
+    connection.expect_started("second").await;
+    tokio::time::sleep(QUIET).await;
+    assert!(updates.requests().is_empty(), "the second update must wait for the old cleanup");
+    assert_eq!(device.marker().unwrap().job_target_id, "first");
+
+    platform.release();
+    connection.expect_output("second", 1, OutputStream::Stdout,
+        &format!("restarting to complete the update to {NEXT}\n")).await;
+    stops_by_itself(client).await;
+    assert_eq!(device.marker().unwrap().job_target_id, "second");
+    assert_eq!(device.marker().unwrap().new_version, NEXT);
+    assert_eq!(std::fs::read(device.old_exe()).unwrap(), NEW_EXE);
+}
+
+#[tokio::test]
 async fn the_new_version_reports_success_once_after_its_first_handshake() {
     let keys = keys();
     let device = Device::new();
@@ -232,6 +284,7 @@ async fn the_new_version_reports_success_once_after_its_first_handshake() {
     let result = connection.expect_result("t1").await;
     assert_eq!(result.status, JobStatus::Succeeded, "{result:?}");
     assert_eq!(result.message.as_deref(), Some("updated to 1.5.0"));
+    wait_for("the confirmed update's recovery files to be removed", || device.marker().is_none()).await;
     assert_eq!(platform.update_calls(), ["remove_old"]);
     assert!(!device.old_exe().exists());
     assert_eq!(std::fs::read(device.exe()).unwrap(), NEW_EXE);
@@ -277,6 +330,54 @@ async fn an_ordinary_restart_without_an_update_is_unaffected() {
 }
 
 // ------------------------------------------------------------ rollback
+
+#[tokio::test]
+async fn a_new_version_that_stays_alive_without_connecting_rolls_back_at_its_deadline() {
+    let keys = keys();
+    let device = Device::new();
+    install_update(&device, &keys, "deadline").await;
+    let nowhere = Unreachable::start().await;
+    let platform = device.platform();
+    let mut config = device.config(nowhere.url(), NEW, &keys);
+    config.update_confirmation_timeout = Duration::from_millis(150);
+    stops_by_itself(start_client(config, platform.clone())).await;
+    assert_eq!(platform.update_calls(), ["restore", "restart"]);
+    assert_eq!(std::fs::read(device.exe()).unwrap(), OLD_EXE);
+    let marker = device.marker().unwrap();
+    assert!(marker.rolled_back);
+    assert_eq!(marker.starts, 1, "recovery did not need repeated process crashes");
+    assert!(marker.failure.as_deref().unwrap().contains("did not confirm a coordinator connection"));
+
+    let coordinator = FakeCoordinator::start().await;
+    let (client, _) = device.start(&coordinator, RUNNING, &keys);
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("deadline").await;
+    let result = connection.expect_result("deadline").await;
+    assert_failed(&result, reason::ROLLED_BACK);
+    assert!(result.message.unwrap().contains("did not confirm a coordinator connection"));
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_confirmed_update_is_not_rolled_back_during_a_later_coordinator_outage() {
+    let keys = keys();
+    let device = Device::new();
+    install_update(&device, &keys, "confirmed").await;
+    let coordinator = FakeCoordinator::start().await;
+    let platform = device.platform();
+    let mut config = device.config(format!("ws://{}", coordinator.addr), NEW, &keys);
+    config.update_confirmation_timeout = Duration::from_millis(300);
+    let client = start_client(config, platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("confirmed").await;
+    assert_eq!(connection.expect_result("confirmed").await.status, JobStatus::Succeeded);
+    connection.drop_abruptly();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(platform.update_calls(), ["remove_old"]);
+    assert_eq!(std::fs::read(device.exe()).unwrap(), NEW_EXE);
+    assert_eq!(device.marker(), None);
+    client.stop().await;
+}
 
 #[tokio::test]
 async fn three_starts_without_a_handshake_restore_the_previous_version_which_reports_the_failure() {
@@ -526,6 +627,79 @@ async fn a_malformed_update_payload_is_invalid() {
 }
 
 // ------------------------------------------------------------ cancelling
+
+#[tokio::test]
+async fn update_success_keeps_recovery_data_until_its_result_is_durable() {
+    let keys = keys();
+    let device = Device::new();
+    install_update(&device, &keys, "t1").await;
+    let blocked = device.state.path().join("jobs.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let coordinator = FakeCoordinator::start().await;
+    let (client, platform) = device.start(&coordinator, NEW, &keys);
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("t1").await;
+    assert_eq!(connection.expect_result("t1").await.status, JobStatus::Succeeded);
+    tokio::time::sleep(QUIET).await;
+    assert!(device.marker().is_some());
+    assert!(device.old_exe().exists());
+    assert!(platform.update_calls().is_empty(), "backup cleanup must wait for durable success");
+    assert!(device.ledger_entry("t1")["result"].is_null());
+
+    std::fs::remove_dir(blocked).unwrap();
+    wait_for("durable success and recovery cleanup after disk repair", || device.marker().is_none()).await;
+    assert_eq!(device.ledger_entry("t1")["result"]["status"], "succeeded");
+    assert!(!device.old_exe().exists());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_rollback_result_waiting_for_disk_repair() {
+    let keys = keys();
+    let device = Device::new();
+    client::update::write_marker(device.state.path(), &Marker {
+        job_target_id: "rolled-back".into(),
+        previous_version: RUNNING.into(),
+        new_version: NEW.into(),
+        starts: 4,
+        rolled_back: true,
+        failure: None,
+    }).unwrap();
+    std::fs::create_dir(device.state.path().join("jobs.json.tmp")).unwrap();
+    let coordinator = FakeCoordinator::start().await;
+    let (client, _) = device.start(&coordinator, RUNNING, &keys);
+    tokio::time::sleep(QUIET).await;
+    client.stop().await;
+    assert!(device.marker().is_some(), "shutdown keeps the unpersisted rollback result recoverable");
+}
+
+#[tokio::test]
+async fn a_failed_restart_record_cannot_replace_the_executable() {
+    let keys = keys();
+    let device = Device::new();
+    let updates = UpdateServer::start().await;
+    publish(&updates, &keys, NEW_EXE);
+    let coordinator = FakeCoordinator::with_updates(&updates).await;
+    let platform = device.platform();
+    platform.hold_update_probe();
+    let config = device.config(format!("ws://{}", coordinator.addr), RUNNING, &keys);
+    let client = start_client(config, platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    connection.send_job("t1", "client.update", payload(NEW, NEW_EXE)).await;
+    connection.expect_started("t1").await;
+    // The start is durable, but disk writes fail before the update may commit
+    // its restart state. A normal signed download is still allowed to finish.
+    let blocked = device.state.path().join("jobs.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    platform.release();
+    let result = connection.expect_result("t1").await;
+    assert_failed(&result, reason::ERROR);
+    assert!(result.message.as_deref().unwrap().contains("cannot persist the update restart state"));
+    device.assert_untouched(&platform);
+    assert_ne!(device.ledger_entry("t1")["awaiting_restart"], true);
+    std::fs::remove_dir(blocked).unwrap();
+    client.stop().await;
+}
 
 #[tokio::test]
 async fn an_update_cancelled_while_downloading_leaves_nothing_behind() {

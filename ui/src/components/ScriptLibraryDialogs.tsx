@@ -112,7 +112,7 @@ export function SaveToLibraryDialog({
   }
 
   return (
-    <Modal title="Save to library" onClose={onClose}>
+    <Modal title="Save to library" onClose={onClose} busy={busy}>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <div className="field">
           <label htmlFor={`${id}-name`}>Name</label>
@@ -122,6 +122,7 @@ export function SaveToLibraryDialog({
             data-autofocus
             autoComplete="off"
             value={name}
+            disabled={busy}
             onChange={(e) => setName(e.target.value)}
             aria-invalid={nameError ? true : undefined}
             aria-describedby={nameError ? `${id}-name-error` : undefined}
@@ -138,7 +139,7 @@ export function SaveToLibraryDialog({
         </p>
         <ErrorNote message={error} />
         <div className="modal-actions">
-          <button type="button" onClick={onClose}>
+          <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
           <button type="submit" className="primary" disabled={busy}>

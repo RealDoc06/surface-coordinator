@@ -234,6 +234,25 @@ async fn stop_closes_connections_and_the_listener() {
 }
 
 #[tokio::test]
+async fn a_client_that_stops_reading_cannot_hold_shutdown_open() {
+    let mut server = TestServer::start().await;
+    let key = server.new_key();
+    let _client = FakeClient::connect(&server, &key, "device-a").await;
+    // Enough output to fill TCP's send buffer while the client never reads.
+    let script = "#".repeat(512 * 1024);
+    for _ in 0..16 {
+        let (status, _) = server.create_job(
+            "script.run",
+            serde_json::json!({"shell": "powershell", "body": script}),
+            serde_json::json!({"type": "devices", "device_ids": ["device-a"]}),
+        ).await;
+        assert_eq!(status, 201);
+    }
+    tokio::time::timeout(Duration::from_secs(3), server.stop()).await
+        .expect("a stalled client prevented shutdown");
+}
+
+#[tokio::test]
 async fn devices_survive_a_restart_and_come_back_offline() {
     let mut server = TestServer::start().await;
     let key = server.new_key();

@@ -26,6 +26,8 @@ export type State = {
    * socket (re)connects and when the server says events were dropped.
    */
   syncEpoch: number
+  /** Changes affecting rollout counts or the available client version. */
+  updatesEpoch: number
 
   devices: Record<string, Device>
   devicesLoaded: boolean
@@ -52,10 +54,10 @@ export type State = {
   /** How much of the newest-first job list has been paged in. */
   jobList: { loaded: boolean; cursor: number | null; hasMore: boolean }
 
-  /** Output by job target id, only for jobs whose detail is being viewed. */
+  /** Output for the selected job target only, retained during its refresh. */
   outputs: Record<string, OutputState>
-  /** Output events received while a job detail request is in flight, by job id. */
-  pendingOutput: Record<string, { requests: number; events: JobOutputEvent[] }>
+  /** Selected target events received while its output snapshot is in flight. */
+  pendingOutput: Record<string, { targetId: string; events: JobOutputEvent[] }>
 
   /** Recent targets by device id, only for devices whose detail is being viewed. */
   deviceTargets: Record<string, DeviceTarget[]>
@@ -69,6 +71,7 @@ export type State = {
 export const initialState: State = {
   connection: 'connecting',
   syncEpoch: 0,
+  updatesEpoch: 0,
   devices: {},
   devicesLoaded: false,
   keys: null,
@@ -89,6 +92,7 @@ export const initialState: State = {
 
 export type Action =
   | { type: 'event'; event: unknown }
+  | { type: 'events'; events: unknown[] }
   | { type: 'connection'; status: ConnectionStatus }
   | { type: 'sync' }
   | { type: 'base.requested' }
@@ -101,10 +105,11 @@ export type Action =
   | { type: 'rejected.loaded'; rejected: Rejected[] }
   | { type: 'rejected.seen' }
   | { type: 'jobs.loaded'; jobs: Job[]; pageSize: number; append: boolean }
-  | { type: 'job.detail.requested'; jobId: string }
   | { type: 'job.detail.loaded'; job: Job }
-  | { type: 'job.detail.failed'; jobId: string }
   | { type: 'job.detail.released'; jobId: string }
+  | { type: 'job.output.requested'; jobId: string; targetId: string }
+  | { type: 'job.output.loaded'; jobId: string; targetId: string; output: string; truncated: boolean }
+  | { type: 'job.output.failed'; jobId: string; targetId: string }
   | { type: 'device.detail.loaded'; device: Device; targets: DeviceTarget[] }
   | { type: 'device.detail.released'; deviceId: string }
 
@@ -251,8 +256,16 @@ export function applyEvent(state: State, raw: unknown): State {
 
 function applyKnownEvent(state: State, event: ServerEvent): State {
   switch (event.type) {
-    case 'device.updated':
-      return { ...state, devices: { ...state.devices, [event.device.id]: event.device } }
+    case 'device.updated': {
+      const known = state.devices[event.device.id]
+      const changed = !known || known.client_version !== event.device.client_version
+        || known.online !== event.device.online || known.update_available !== event.device.update_available
+      return {
+        ...state,
+        devices: { ...state.devices, [event.device.id]: event.device },
+        updatesEpoch: state.updatesEpoch + Number(changed),
+      }
+    }
 
     case 'device.removed': {
       const id = event.device_id
@@ -271,7 +284,7 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
         const targets = job.targets.filter((t) => t.device_id !== id)
         if (targets.length > 0) jobs[jobId] = { ...job, targets }
       }
-      return { ...state, devices, deviceTargets, jobs }
+      return { ...state, devices, deviceTargets, jobs, updatesEpoch: state.updatesEpoch + 1 }
     }
 
     case 'job.created': {
@@ -288,7 +301,10 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
           }),
         }
       }
-      return { ...state, jobs: { ...state.jobs, [job.id]: job }, deviceTargets }
+      return {
+        ...state, jobs: { ...state.jobs, [job.id]: job }, deviceTargets,
+        updatesEpoch: state.updatesEpoch + Number(job.kind === 'client.update'),
+      }
     }
 
     case 'job.target.updated': {
@@ -314,14 +330,16 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
           }
         }
       }
-      if (jobs === state.jobs && deviceTargets === state.deviceTargets) return state
-      return { ...state, jobs, deviceTargets }
+      // An older in-flight update may not be in this browser's job cache.
+      const updatesEpoch = state.updatesEpoch + Number(!job || job.kind === 'client.update')
+      if (jobs === state.jobs && deviceTargets === state.deviceTargets && updatesEpoch === state.updatesEpoch) return state
+      return { ...state, jobs, deviceTargets, updatesEpoch }
     }
 
     case 'job.output': {
       let next = state
       const pending = state.pendingOutput[event.job_id]
-      if (pending) {
+      if (pending?.targetId === event.job_target_id) {
         next = {
           ...next,
           pendingOutput: {
@@ -367,19 +385,13 @@ function applyKnownEvent(state: State, event: ServerEvent): State {
   }
 }
 
-function finishDetailRequest(state: State, jobId: string): State['pendingOutput'] {
-  const pending = state.pendingOutput[jobId]
-  if (!pending) return state.pendingOutput
-  const next = { ...state.pendingOutput }
-  if (pending.requests <= 1) delete next[jobId]
-  else next[jobId] = { ...pending, requests: pending.requests - 1 }
-  return next
-}
-
 export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case 'event':
       return applyEvent(state, action.event)
+
+    case 'events':
+      return action.events.reduce<State>(applyEvent, state)
 
     case 'connection':
       return {
@@ -457,46 +469,48 @@ export function reducer(state: State, action: Action): State {
       }
     }
 
-    case 'job.detail.requested': {
-      const pending = state.pendingOutput[action.jobId]
+    case 'job.output.requested': {
+      const current = state.outputs[action.targetId]
       return {
         ...state,
+        outputs: current ? { [action.targetId]: current } : {},
         pendingOutput: {
-          ...state.pendingOutput,
-          [action.jobId]: pending
-            ? { ...pending, requests: pending.requests + 1 }
-            : { requests: 1, events: [] },
+          [action.jobId]: { targetId: action.targetId, events: [] },
         },
       }
     }
 
-    case 'job.detail.loaded': {
-      const job = action.job
-      const jobs = { ...state.jobs, [job.id]: storeJob(state.jobs, job) }
-      const pending = state.pendingOutput[job.id]
-      // Not requested, or the view was left before the response came.
-      if (!pending) return { ...state, jobs }
-      const outputs = { ...state.outputs }
-      for (const target of job.targets) {
-        const chunks = pending.events.filter((e) => e.job_target_id === target.id)
-        outputs[target.id] = {
-          text: mergeBufferedEvents(target.output ?? '', chunks),
-          truncated: target.output_truncated || chunks.some((c) => c.truncated),
-        }
-      }
-      return { ...state, jobs, outputs, pendingOutput: finishDetailRequest(state, job.id) }
-    }
-
-    case 'job.detail.failed':
-      return { ...state, pendingOutput: finishDetailRequest(state, action.jobId) }
-
-    case 'job.detail.released': {
-      const job = state.jobs[action.jobId]
-      const outputs = { ...state.outputs }
-      for (const target of job?.targets ?? []) delete outputs[target.id]
+    case 'job.output.loaded': {
+      const pending = state.pendingOutput[action.jobId]
+      if (pending?.targetId !== action.targetId) return state
       const pendingOutput = { ...state.pendingOutput }
       delete pendingOutput[action.jobId]
-      return { ...state, outputs, pendingOutput }
+      return {
+        ...state,
+        outputs: {
+          [action.targetId]: {
+            text: mergeBufferedEvents(action.output, pending.events),
+            truncated: action.truncated || pending.events.some((e) => e.truncated),
+          },
+        },
+        pendingOutput,
+      }
+    }
+
+    case 'job.output.failed': {
+      if (state.pendingOutput[action.jobId]?.targetId !== action.targetId) return state
+      const pendingOutput = { ...state.pendingOutput }
+      delete pendingOutput[action.jobId]
+      return { ...state, pendingOutput }
+    }
+
+    case 'job.detail.loaded':
+      return { ...state, jobs: { ...state.jobs, [action.job.id]: storeJob(state.jobs, action.job) } }
+
+    case 'job.detail.released': {
+      const pendingOutput = { ...state.pendingOutput }
+      delete pendingOutput[action.jobId]
+      return { ...state, outputs: {}, pendingOutput }
     }
 
     case 'device.detail.loaded': {

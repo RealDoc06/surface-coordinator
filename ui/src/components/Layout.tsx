@@ -1,5 +1,6 @@
-import { useState, type ReactNode } from 'react'
-import { NavLink, useLocation } from 'react-router-dom'
+import { useLayoutEffect, useState, type ReactNode } from 'react'
+import { errorMessage } from '../api/client'
+import { NavLink, useLocation, useNavigationType } from 'react-router-dom'
 import { useSession, useSessionContext } from '../session/SessionProvider'
 import { useStore } from '../state/StoreProvider'
 import { ErrorNote } from './bits'
@@ -12,9 +13,16 @@ function rejectedBadge(count: number): string {
 export function Layout({ children }: { children: ReactNode }) {
   const session = useSession()
   const { logout } = useSessionContext()
-  const { state, loadError, reload } = useStore()
+  const { state, loadError, reload, reconnect } = useStore()
   const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | null>(null)
   const { pathname } = useLocation()
+  const navigationType = useNavigationType()
+
+  useLayoutEffect(() => {
+    // New pages start at their heading; back/forward keeps browser restoration.
+    if (navigationType !== 'POP') window.scrollTo(0, 0)
+  }, [pathname, navigationType])
 
   const outdated = Object.values(state.devices).filter((d) => d.update_available === true).length
 
@@ -36,8 +44,11 @@ export function Layout({ children }: { children: ReactNode }) {
 
   async function onLogout() {
     setLoggingOut(true)
+    setLogoutError(null)
     try {
       await logout()
+    } catch (err) {
+      setLogoutError(errorMessage(err))
     } finally {
       setLoggingOut(false)
     }
@@ -46,7 +57,7 @@ export function Layout({ children }: { children: ReactNode }) {
   return (
     <div className="app">
       <header className="app-header">
-        <span className="brand">Surface Coordinator</span>
+        <NavLink className="brand" to="/">Surface Coordinator</NavLink>
         <nav aria-label="Main">
           <NavLink to="/" end>
             Devices
@@ -76,6 +87,10 @@ export function Layout({ children }: { children: ReactNode }) {
           />
         </nav>
         <span className="header-spacer" />
+        <span className={`connection-state ${state.connection === 'open' ? 'is-live' : ''}`} title="Connection between this browser and the coordinator">
+          <span className={`dot ${state.connection === 'open' ? 'dot-online' : 'dot-offline'}`} aria-hidden="true" />
+          {state.connection === 'open' ? 'Live' : state.connection === 'connecting' ? 'Connecting' : 'Reconnecting'}
+        </span>
         <span className="muted version" title={`Protocol ${session.protocol_version}`}>
           v{session.version}
         </span>
@@ -90,10 +105,12 @@ export function Layout({ children }: { children: ReactNode }) {
       </header>
       {state.connection === 'reconnecting' ? (
         <div className="banner" role="status">
-          Live updates paused, reconnecting&hellip;
+          <span>Live updates paused, reconnecting&hellip; Device status may be out of date.</span>
+          <button type="button" onClick={reconnect}>Reconnect now</button>
         </div>
       ) : null}
       <main className="app-main">
+        <ErrorNote message={logoutError} />
         <ErrorNote message={loadError} onRetry={reload} />
         {children}
       </main>

@@ -6,8 +6,9 @@ against this key, so only whoever holds the matching private key can ship
 updates to devices. The client runs as LocalSystem, which is why this check
 matters.
 
-The file is absent until the repository owner generates the key pair. Until it
-is committed, builds have no update key and refuse every client update.
+This repository includes the project's public client key. Keep its existing
+private half when packaging updates for enrolled devices. Builds made without
+the public file have no update key and refuse client updates.
 
 ## Create the key pair (once, by the owner)
 
@@ -17,14 +18,18 @@ is committed, builds have no update key and refuse every client update.
    cargo run -p release-tool -- keygen --public-out release-keys/client-update.pub
    ```
 
-2. The command prints the private key once. Store it as the GitHub Actions
-   repository secret `SC_UPDATE_SIGNING_KEY` and nowhere else. The tool never
-   writes it to a file; do not put it in the repository.
+2. The command prints the private key once. Store it outside the repository in
+   a protected key file or secret manager, and use the GitHub Actions repository
+   secret `SC_UPDATE_SIGNING_KEY` for CI. The tool never writes the private key
+   to a file automatically. Never include it in source or release artifacts.
 3. Commit `release-keys/client-update.pub`.
 
 CI can check that the secret still matches the committed key:
 `release-tool public-key` (with `SC_UPDATE_SIGNING_KEY` set) prints the public
 key for comparison with the file.
+
+The Manager uses a separate Tauri updater key. Its public half is committed at
+`crates/manager/updater.pub`; see the [Manager signing instructions](../crates/manager/README.md).
 
 ## Rotate the key
 

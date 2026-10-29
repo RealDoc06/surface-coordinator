@@ -15,6 +15,8 @@ There are three components:
 The web UI (`ui/`, React and Vite) is built into the coordinator binary, so the
 coordinator and the manager show the same UI.
 
+- Start here: [usage instructions](docs/usage.md)
+- Release validation and screenshots: [0.2.4 validation](docs/validation-0.2.4.md)
 - Design: [docs/superpowers/specs/2026-10-01-surface-coordinator-design.md](docs/superpowers/specs/2026-10-01-surface-coordinator-design.md)
 - HTTP API: [docs/api.md](docs/api.md)
 - Plans, with the deviations from the design: [milestone 1](docs/superpowers/plans/2026-10-01-milestone-1-core-loop.md),
@@ -26,36 +28,28 @@ coordinator and the manager show the same UI.
 
 ## Status
 
-All five milestones are implemented and covered by automated tests, and the
-core was exercised end to end on one Windows 11 machine (coordinator, two
-clients, the web UI driven through a browser, the manager window).
+Version 0.2.4 fixes selected targets being lost when opening library scripts,
+prevents pending dialogs from hiding unfinished writes, restores CMD scripts in
+installed clients, and reports native Windows power failures in job results.
+Sleep jobs remain running until resume. The earlier hardening remains: active Wi-Fi is preserved
+during coordinator outages, reconnects and cancellation are resilient, hotspot
+starts are idempotent, the UI recovers promptly, and release builds have test
+gates. Fleet dispatch uses bounded notifications and durable grouped database
+commits. Streamed output is appended in storage, and the UI loads only the
+selected device's output. Standalone Windows binaries include their C runtime.
+Service updates validate the candidate before replacement and roll
+back if the new client cannot confirm its connection. See [validation evidence](docs/validation-0.2.4.md) for the exact checks
+performed and the remaining hardware and release limitations.
 
-**Built but NOT verified on real hardware or a real release.** None of this
-has run outside the automated tests and the checks below, and every item is on
-[docs/manual-tests.md](docs/manual-tests.md):
+The networking fix must be installed on each Surface; updating the coordinator
+alone cannot change the behavior of an older client. Existing manually selected
+Wi-Fi is now preserved even if Windows hides its SSID. Hotspot discovery runs
+when Wi-Fi is disconnected; explicit Wi-Fi jobs can still move a device.
 
-- The Windows Mobile Hotspot, the Linux (NetworkManager) hotspot and the macOS
-  manual hotspot instructions.
-- A device finding the hotspot, joining it, and the Wi-Fi handoff (`wifi.join`).
-- The client as a Windows service: `client.exe install` and `uninstall`,
-  restart after a crash, running at the sign-in screen.
-- Jobs that need the service identity: scripts and apps run as the logged-in
-  user, user-scope settings, and everything with nobody logged in.
-- Power jobs (restart, shut down, sleep) and every setting other than
-  `audio.volume` and `audio.mute`.
-- Client updates (download, signature check, swap, rollback), the release
-  workflow, and the manager installers and self-update. Until the signing keys
-  exist (see "Releases and updates") builds have updates disabled.
-- The coordinator behind Caddy on a Linux server, and the macOS and Linux
-  managers.
-
-| Milestone | Scope | State |
-|---|---|---|
-| 1 Core loop | Protocol, enrollment-key handshake, heartbeats, `script.run` with streamed output | Done; verified live on localhost |
-| 2 UI and manager | Accounts and login, web UI, device list, jobs, the manager shell | Done; UI and manager verified live on Windows |
-| 3 Hotspot | Hotspot control, client network state machine, `wifi.join` | Built; hotspot and Wi-Fi steps not verified on hardware |
-| 4 Full job set | Script library, groups, app launch, settings catalogue, power, cancel | Done; script, launch, volume and cancel verified live; the rest not verified on hardware |
-| 5 Packaging and updates | Client as a service, signed updates, release workflow, installers, Linux deployment | Built; not verified on real machines or a real release |
+Upgrade the coordinator against a backed-up database: this release adds persistent
+cancellation state, query indexes and append-only storage for active output.
+For rollback, restore the matching backup
+and previous binary together. See the [deployment guide](deploy/README.md).
 
 ## Repository layout
 
@@ -68,7 +62,7 @@ crates/manager           desktop app (Tauri), not a default workspace member
 crates/release-tool      generates keys, signs and verifies client update files
 ui/                      the web UI (built into the coordinator)
 deploy/                  Linux deployment files (see deploy/README.md)
-release-keys/            the client update public key, once generated
+release-keys/            the client update public key and signing instructions
 scripts/                 the demo script and helpers
 docs/                    API reference, manual checklist, design and plans
 ```
@@ -99,6 +93,12 @@ cargo build -p manager
 
 The binaries are in `target\debug\`: `coordinator.exe`, `client.exe`,
 `release-tool.exe` and `manager.exe`.
+
+Development and test builds retain file/line backtraces but omit full debugger
+symbols and incremental caches to keep disk usage down. Compiled dependencies
+are still reused; rebuilding changed code can take longer. For a build with
+full debugger symbols, use `cargo --config 'profile.dev.debug=2' build` (add
+`-p manager` for the manager).
 
 Tests:
 
@@ -136,7 +136,7 @@ In PowerShell, from the repository root, after building. Everything lives in
 
    ```powershell
    $env:SC_KEY_SECRET = '<key secret>'
-   .\target\debug\client.exe --coordinator-url ws://127.0.0.1:8080 --key-id <key id> --state-dir demo-data\client
+   .\target\debug\client.exe run --no-hotspot-discovery --coordinator-url ws://127.0.0.1:8080 --key-id <key id> --state-dir demo-data\client
    ```
 
 4. Open <http://127.0.0.1:8080>, sign in, and the device is listed as online.
@@ -172,8 +172,9 @@ hotspot. `--install-dir` and `--state-dir` change the two locations. Running
 ```
 
 The service writes `client.log` in the state directory (rotated at 5 MiB).
-Installing and running as a service is **not verified on real hardware**; it is
-on the manual checklist, group 4.
+Installation, service execution, signed updates and rollback are verified in a
+clean Windows 11 VM. Physical Surface Wi-Fi checks and the exact validation
+scope are recorded in [the release report](docs/validation-0.2.3.md).
 
 ## The manager
 
@@ -191,21 +192,26 @@ choices:
   stops the coordinator and the hotspot.
 
 Hotspot flow (for places with no network): create an enrollment key under
-**Enrollment keys**, open **Hotspot**, pick the key and **Start**. The SSID is
+**Enrollment keys**, open **Hotspot**, pick the key and **Start hotspot**. The SSID is
 `SC-` plus the start of the key id and the passphrase is derived from the key
 secret; both are shown. On Windows and on Linux with NetworkManager the manager
 turns the hotspot on itself; on macOS it shows the steps for Internet Sharing.
-Devices enrolled with that key and with no reachable coordinator scan every 30
-seconds, join the hotspot and appear in the device list.
+Devices enrolled with that key and disconnected from Wi-Fi search for the
+hotspot and appear in the device list. Devices already on another Wi-Fi stay
+there, even while the coordinator is unavailable.
 
 Wi-Fi handoff: select the devices and choose **Move to Wi-Fi...** with the
 SSID, the password and, if it differs, the address of the coordinator they
 should use on that network. The device joins the network and reconnects there.
-If it cannot reach a coordinator within 60 seconds it goes back to searching,
-rejoins the hotspot and reports the job as failed. When the new coordinator is
-a different one, the job that started on the hotspot is marked succeeded once
-the device has been gone for two minutes. Only WPA2-PSK and open networks are
-supported. This flow is **not verified on hardware**.
+If it cannot reach a coordinator within 60 seconds it reports failure and can
+recover to the hotspot when that does not override a later manual network
+choice. When Windows hides the current SSID, the client preserves that network
+rather than guessing it is safe to leave. If the source coordinator cannot
+confirm the destination after two minutes offline, it shows **Destination
+unconfirmed**. Check the destination coordinator for actual success. Only
+WPA2-PSK and open networks are supported. See the physical transfer results in
+[the release report](docs/validation-0.2.3.md) and the broader hardware checklist
+in [docs/manual-tests.md](docs/manual-tests.md).
 
 ## Deploying the coordinator on Linux
 
@@ -215,26 +221,17 @@ systemd unit, an environment file and a Caddy example for TLS. Follow
 
 ## Releases and updates
 
-Until the owner has done the one-time steps below, builds carry no update key:
-the coordinator does not look for releases, clients refuse every update, and
-the manager says "Updates are not configured in this build". Everything else
-works.
+Both public update keys are present in this repository. Preserve their matching
+private keys outside the repository: installed clients and Managers trust those
+public keys. Key generation is only needed for a new project or a planned rotation.
 
-1. **Client update key.** Generate it once with `release-tool` and commit the
-   public half; the tool prints the private half once and never writes it to a
-   file. Details and key rotation are in [release-keys/README.md](release-keys/README.md).
+1. **Client update key.** Use the existing private key matching
+   `release-keys/client-update.pub`. Packaging and rotation instructions are in
+   [release-keys/README.md](release-keys/README.md).
 
-   ```
-   cargo run -p release-tool -- keygen --public-out release-keys/client-update.pub
-   ```
-
-2. **Manager updater key.** Generate a Tauri updater key pair outside the
-   repository and commit the public key as `crates/manager/updater.pub`; see
-   [crates/manager/README.md](crates/manager/README.md):
-
-   ```
-   npx @tauri-apps/cli@2 signer generate -w <somewhere safe>/surface-coordinator-updater.key
-   ```
+2. **Manager updater key.** Use the separate Tauri key matching
+   `crates/manager/updater.pub`. The signed Windows packaging command and
+   verification steps are in [crates/manager/README.md](crates/manager/README.md).
 
 3. **GitHub secrets** in the repository settings (never commit these):
 
@@ -250,7 +247,8 @@ works.
    has succeeded: the signed client, the Linux coordinator tarball, and the
    manager installers and `latest.json`.
 
-The release workflow has never run for real. Do the dry run on a fork first
+This candidate has been packaged locally. The updated release workflow has not
+been run on GitHub; verify its signing secrets before pushing a release tag
 ([docs/manual-tests.md](docs/manual-tests.md), group 8).
 
 ## Demo

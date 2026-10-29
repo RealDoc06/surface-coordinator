@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use client::platform::{PlatformError, WifiJoinRequest};
+use client::platform::{PlatformError, WifiJoinPolicy, WifiJoinRequest};
 use client::ClientConfig;
 use common::{
     client_config, start_client, wifi_on, FakeCoordinator, FakePlatform, Unreachable, KEY_ID,
@@ -79,11 +79,10 @@ async fn no_scan_or_join_happens_while_a_session_is_up() {
 }
 
 #[tokio::test]
-async fn an_unreachable_coordinator_leads_to_the_hotspot_after_the_threshold() {
+async fn an_unreachable_coordinator_discovers_the_hotspot_after_wifi_disconnects() {
     let remote = Unreachable::start().await;
     let gateway = FakeCoordinator::start().await;
     let platform = FakePlatform::with_wifi();
-    platform.set_current(Some(wifi_on(OFFICE)));
     platform.set_visible(&[OFFICE, &hotspot_ssid()]);
     platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
     let config = config(Some(remote.addr), &gateway);
@@ -105,6 +104,7 @@ async fn an_unreachable_coordinator_leads_to_the_hotspot_after_the_threshold() {
             ssid: hotspot_ssid(),
             passphrase: Some(hotspot::passphrase(SECRET)),
             auto_connect: false,
+            policy: WifiJoinPolicy::Disconnected,
         }]
     );
     let network = hello.network.expect("hello carries the network");
@@ -127,6 +127,74 @@ async fn without_a_configured_coordinator_searching_starts_at_once() {
     assert_eq!(hello.network.unwrap().ssid, Some(hotspot_ssid()));
     assert_eq!(platform.scans().len(), 1);
     assert_eq!(platform.joins().len(), 1);
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_coordinator_outage_never_replaces_manually_selected_wifi() {
+    let remote = Unreachable::start().await;
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.set_current(Some(wifi_on(OFFICE)));
+    platform.set_visible(&[OFFICE, &hotspot_ssid()]);
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let client = start_client(config(Some(remote.addr), &gateway), platform.clone());
+
+    // Well beyond both the recovery threshold and multiple search rounds.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(platform.current(), Some(wifi_on(OFFICE)));
+    assert!(platform.scans().is_empty());
+    assert!(platform.joins().is_empty());
+    assert!(gateway.no_connection_within(QUIET).await);
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_wifi_query_error_is_not_permission_to_change_networks() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.set_current(Some(wifi_on(OFFICE)));
+    platform.fail_wifi_current(PlatformError::Failed("temporary adapter query failure".into()));
+    platform.set_visible(&[&hotspot_ssid()]);
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let client = start_client(config(None, &gateway), platform.clone());
+
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(platform.current(), Some(wifi_on(OFFICE)));
+    assert!(platform.scans().is_empty());
+    assert!(platform.joins().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn a_manual_connection_during_a_scan_wins_over_hotspot_discovery() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.set_visible(&[&hotspot_ssid()]);
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    platform.connect_during_scan(wifi_on(OFFICE));
+    let client = start_client(config(None, &gateway), platform.clone());
+
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(platform.scans().len(), 1);
+    assert_eq!(platform.current(), Some(wifi_on(OFFICE)));
+    assert!(platform.joins().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn disabling_hotspot_discovery_never_scans_or_joins_even_while_disconnected() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.set_visible(&[&hotspot_ssid()]);
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let mut config = config(None, &gateway);
+    config.hotspot_discovery = false;
+    let client = start_client(config, platform.clone());
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(platform.scans().is_empty());
+    assert!(platform.joins().is_empty());
     client.stop().await;
 }
 
@@ -238,6 +306,7 @@ async fn wifi_join_moves_the_device_to_the_new_coordinator_and_reports_success_t
             ssid: OFFICE.into(),
             passphrase: Some(OFFICE_PASSWORD.into()),
             auto_connect: true,
+            policy: WifiJoinPolicy::Replace,
         }]
     );
     let stored: Value =
@@ -334,6 +403,33 @@ async fn wifi_join_without_a_coordinator_on_the_new_network_returns_to_the_hotsp
 }
 
 #[tokio::test]
+async fn failed_handoff_does_not_undo_a_later_manual_network_selection() {
+    let gateway = FakeCoordinator::start().await;
+    let platform = FakePlatform::with_wifi();
+    platform.set_current(Some(wifi_on(&hotspot_ssid())));
+    platform.set_visible(&[&hotspot_ssid()]);
+    platform.on_join(OFFICE, Ok(wifi_on(OFFICE)));
+    platform.on_join(&hotspot_ssid(), Ok(wifi_on(&hotspot_ssid())));
+    let config = config(None, &gateway);
+    let timeout = config.handoff_timeout;
+    let client = start_client(config, platform.clone());
+
+    let (mut first, _) = gateway.accept().await;
+    let nowhere = Unreachable::start().await;
+    first.send_job("move", "wifi.join", wifi_join(OFFICE, None, Some(nowhere.url()))).await;
+    first.expect_started("move").await;
+    assert!(first.closed_by_client().await);
+    platform.set_current(Some(wifi_on("Manually-Selected")));
+
+    tokio::time::sleep(timeout + QUIET).await;
+    assert_eq!(platform.current(), Some(wifi_on("Manually-Selected")));
+    assert_eq!(platform.joins().len(), 1);
+    assert!(platform.scans().is_empty());
+    assert!(gateway.no_connection_within(QUIET).await);
+    client.stop().await;
+}
+
+#[tokio::test]
 async fn wifi_join_with_an_invalid_payload_does_not_touch_the_network() {
     let remote = FakeCoordinator::start().await;
     let gateway = FakeCoordinator::start().await;
@@ -397,6 +493,7 @@ async fn with_wifi_names_withheld_the_hotspot_is_joined_without_seeing_it() {
             ssid: hotspot_ssid(),
             passphrase: Some(hotspot::passphrase(SECRET)),
             auto_connect: false,
+            policy: WifiJoinPolicy::Disconnected,
         }]
     );
     // The client cannot name the network, but still reports its address.
@@ -407,29 +504,24 @@ async fn with_wifi_names_withheld_the_hotspot_is_joined_without_seeing_it() {
 }
 
 #[tokio::test]
-async fn blind_joins_are_spaced_out_while_the_device_is_on_another_network() {
+async fn hidden_wifi_names_never_allow_blind_joins_over_an_existing_connection() {
     let gateway = FakeCoordinator::start().await;
     let platform = FakePlatform::with_wifi();
     platform.withhold_wifi_names();
-    // On some network (Windows will not say which): every attempt costs it.
+    // Windows cannot name the network and DHCP may still be in progress.
     // No gateway, so nothing there is mistaken for the hotspot.
     let mut elsewhere = wifi_on(OFFICE);
     elsewhere.gateway = None;
+    elsewhere.ip = None;
     platform.set_current(Some(elsewhere));
     // No outcome for the hotspot: every join fails, as when out of range.
     let mut config = config(None, &gateway);
     config.search_interval = Duration::from_millis(40);
-    config.blind_join_interval = Duration::from_millis(400);
     let client = start_client(config, platform.clone());
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    // Several search rounds have passed, but the device was taken off its
-    // network only once.
-    assert!(platform.scans().len() >= 3, "{} scans", platform.scans().len());
-    assert_eq!(platform.joins().len(), 1);
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(platform.joins().len(), 2);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(platform.scans().is_empty());
+    assert!(platform.joins().is_empty());
     client.stop().await;
 }
 
@@ -474,7 +566,6 @@ async fn a_device_on_no_network_tries_the_hotspot_every_round() {
     // Not connected to anything and the hotspot is not up yet.
     let mut config = config(None, &gateway);
     config.offline_search_interval = Duration::from_millis(40);
-    config.blind_join_interval = Duration::from_secs(600);
     let client = start_client(config, platform.clone());
 
     tokio::time::sleep(Duration::from_millis(400)).await;

@@ -8,34 +8,43 @@ type ModalProps = {
   wide?: boolean
   children: ReactNode
   onClose: () => void
+  busy?: boolean
 }
 
 /** A modal dialog: focus moves in, Tab stays inside, Escape closes, focus returns. */
-export function Modal({ title, wide = false, children, onClose }: ModalProps) {
+export function Modal({ title, wide = false, children, onClose, busy = false }: ModalProps) {
   const titleId = useId()
   const panel = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const previous = document.activeElement
-    const first = panel.current?.querySelector<HTMLElement>(`[data-autofocus], ${FOCUSABLE}`)
+    const first = panel.current?.querySelector<HTMLElement>(`[data-autofocus]:not([disabled]), ${FOCUSABLE}`)
     ;(first ?? panel.current)?.focus()
     return () => {
       if (previous instanceof HTMLElement) previous.focus()
     }
   }, [])
 
+  useEffect(() => {
+    if (busy) panel.current?.focus()
+  }, [busy])
+
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === 'Escape') {
       event.stopPropagation()
-      onClose()
+      if (!busy) onClose()
       return
     }
     if (event.key !== 'Tab' || !panel.current) return
     const items = Array.from(panel.current.querySelectorAll<HTMLElement>(FOCUSABLE))
     const first = items[0]
     const last = items[items.length - 1]
-    if (!first || !last) return
-    if (event.shiftKey && document.activeElement === first) {
+    if (!first || !last) {
+      event.preventDefault()
+      panel.current.focus()
+      return
+    }
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === panel.current)) {
       event.preventDefault()
       last.focus()
     } else if (!event.shiftKey && document.activeElement === last) {
@@ -45,12 +54,13 @@ export function Modal({ title, wide = false, children, onClose }: ModalProps) {
   }
 
   return (
-    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="modal-backdrop" onMouseDown={(e) => !busy && e.target === e.currentTarget && onClose()}>
       <div
         ref={panel}
         className={wide ? 'modal modal-wide' : 'modal'}
         role="dialog"
         aria-modal="true"
+        aria-busy={busy || undefined}
         aria-labelledby={titleId}
         tabIndex={-1}
         onKeyDown={onKeyDown}
@@ -84,7 +94,7 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmProps) {
   return (
-    <Modal title={title} onClose={onCancel}>
+    <Modal title={title} onClose={onCancel} busy={busy}>
       <div className="modal-body">{children}</div>
       {error ? (
         <p className="error" role="alert">
@@ -92,7 +102,7 @@ export function ConfirmDialog({
         </p>
       ) : null}
       <div className="modal-actions">
-        <button type="button" data-autofocus onClick={onCancel}>
+        <button type="button" data-autofocus disabled={busy} onClick={onCancel}>
           Cancel
         </button>
         <button type="button" className={danger ? 'danger' : 'primary'} disabled={busy} onClick={onConfirm}>

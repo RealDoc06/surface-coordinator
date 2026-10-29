@@ -164,7 +164,7 @@ function DeviceDetail({ id }: { id: string }) {
           <div>
             <dt>Last seen</dt>
             <dd title={formatDateTime(device.last_seen_at)}>
-              {device.online ? 'now' : relativeTime(device.last_seen_at, now)}
+              {device.online && state.connection === 'open' ? 'now' : relativeTime(device.last_seen_at, now)}
             </dd>
           </div>
           <div>

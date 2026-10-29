@@ -1,0 +1,4 @@
+# Standalone Windows clients and their updater must start on clean Windows
+# without requiring a separately installed Visual C++ runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -69,11 +69,11 @@ pub struct Config {
     /// How long a job may stay queued for an offline device.
     pub queued_expiry: Duration,
     /// How often queued targets are checked for expiry and `wifi.join`
-    /// targets for a presumed handoff.
+    /// targets for an unconfirmed handoff.
     pub expiry_sweep_interval: Duration,
     /// How long a device with a running `wifi.join` job may stay offline
-    /// before the job is presumed to have succeeded (the device joined a
-    /// network from which it reports to another coordinator).
+    /// before the handoff is marked unconfirmed. A later actual result can
+    /// still confirm whether joining the destination network succeeded.
     pub handoff_grace: Duration,
     /// Serve the web UI from this directory instead of the copy built into
     /// the library.
@@ -171,6 +171,9 @@ pub async fn start(config: Config) -> Result<Coordinator, Error> {
     if config.heartbeat_interval.is_zero() {
         return Err(Error::InvalidConfig("the heartbeat interval must not be zero".into()));
     }
+    if config.expiry_sweep_interval.is_zero() {
+        return Err(Error::InvalidConfig("the expiry sweep interval must not be zero".into()));
+    }
     updates::validate_config(&config)?;
 
     let data_dir = config.data_dir.clone();
@@ -266,7 +269,7 @@ impl Coordinator {
 
 /// Periodic housekeeping: expires targets that stayed queued too long, takes
 /// the next step of the automatic update rollout, and settles `wifi.join`
-/// targets whose device has left for good.
+/// targets whose device has left without confirming its new network.
 async fn sweep(state: Arc<AppState>) {
     // After a restart devices get a full grace period to reconnect: the time
     // this coordinator was not running says nothing about them.
@@ -300,19 +303,19 @@ async fn sweep(state: Arc<AppState>) {
         // the connection table and having its last-seen time stored.
         let presence = state.presence.lock().await;
         let live = state.clone();
-        let presumed = state
+        let unconfirmed = state
             .store
             .call(move |conn| {
-                store::presume_wifi_joins_succeeded(conn, gone_since, |id| live.connection(id).is_some())
+                store::mark_wifi_handoffs_unconfirmed(conn, gone_since, |id| live.connection(id).is_some())
             })
             .await;
         drop(presence);
-        match presumed {
-            Ok(presumed) => {
-                if !presumed.is_empty() {
-                    tracing::info!(presumed = presumed.len(), "wifi.join targets presumed to have joined");
+        match unconfirmed {
+            Ok(unconfirmed) => {
+                if !unconfirmed.is_empty() {
+                    tracing::info!(unconfirmed = unconfirmed.len(), "wifi.join handoffs not confirmed");
                 }
-                for change in presumed {
+                for change in unconfirmed {
                     state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
                 }
             }

@@ -12,12 +12,18 @@ the `coordinator` binary:
 | `Caddyfile.example` | TLS reverse proxy |
 | `README.md` | this file |
 
+The complete `surface-coordinator-0.2.4.zip` bundle places the native Linux
+files in `linux/`. Use that directory for the native installation steps below,
+or follow the bundle's `START-HERE.md` for its prebuilt Docker image.
+
 The server speaks plain HTTP and WebSocket and listens on `127.0.0.1:8080`.
 Clients (WebSocket) and the web UI and API (HTTP) share that one port. You put
 a TLS-terminating reverse proxy in front of it; the steps below use Caddy.
 
 Everything below runs as root (use `sudo -i` or prefix each command with
-`sudo`). The binary is built on Ubuntu 22.04 and needs glibc 2.35 or newer.
+`sudo`). GitHub release binaries built on Ubuntu 22.04 need glibc 2.35 or newer.
+The locally validated 0.2.4 bundle is built on Debian Bookworm and needs glibc
+2.36 or newer. Its included Docker image supplies the matching runtime.
 
 ## 1. Install
 
@@ -55,9 +61,11 @@ setup below. The settings, taken from `coordinator serve --help`:
 | `SC_AUTH` | `accounts` or `token` | `accounts` |
 | `SC_API_TOKEN` | the token with `SC_AUTH=token` | random per start, printed to the journal |
 | `SC_SECURE_COOKIES` | mark the session cookie Secure; `true` behind HTTPS | `false` in the unit, `true` in the example file |
+| `SC_HEARTBEAT_INTERVAL_SECS` | heartbeat interval; offline after three missed intervals | `30` in the binary, `10` in the example file |
+| `SC_NO_UPDATE_CHECK` | use uploaded client builds without polling GitHub | `true` in the example file |
 | `SC_UI_DIR` | serve the UI from a directory instead of the built-in copy | unset |
 
-`--heartbeat-interval-secs`, `--queued-expiry-hours` and `--verbose` exist
+`--queued-expiry-hours` and `--verbose` exist
 only as command-line flags. To change them, run `systemctl edit coordinator`
 and override `ExecStart=` (first an empty `ExecStart=` line, then the full
 command, for example
@@ -132,9 +140,9 @@ configuration. Check with `curl -i https://<hostname>/api/v1/health`.
 - Without a proxy (a test setup) clients can connect to `ws://<host>:8080`
   directly, which sends all job data and web UI logins unencrypted. Do not do
   that over the internet.
-- The coordinator only makes outbound connections for the client update
-  cache, which needs HTTPS to github.com. It runs fine without that, but
-  devices cannot be updated from it.
+- With GitHub update checks enabled, the client update cache needs outbound
+  HTTPS to github.com and its download hosts. Signed client builds uploaded
+  from the UI or `scripts/publish-client.ps1` work without that connection.
 
 ## 5. Upgrade
 

@@ -16,12 +16,12 @@ type Props = {
 }
 
 const ACTIONS: { action: PowerAction; help: string }[] = [
-  { action: 'restart', help: 'The device restarts and reconnects by itself.' },
+  { action: 'restart', help: 'The device restarts after a 5-second delay and reconnects by itself.' },
   {
     action: 'shutdown',
-    help: 'The device turns off. Someone has to switch it on again at the device; it cannot be woken from here.',
+    help: 'The device turns off after a 5-second delay. Someone has to switch it on again at the device; it cannot be woken from here.',
   },
-  { action: 'sleep', help: 'The device goes to sleep; it reconnects when it wakes up.' },
+  { action: 'sleep', help: 'The device goes to sleep. The job stays running while it is asleep and completes after it wakes up.' },
 ]
 
 const VERB: Record<PowerAction, string> = { restart: 'Restart', shutdown: 'Shut down', sleep: 'Put to sleep' }
@@ -37,7 +37,7 @@ export function powerConfirmation(action: PowerAction, count: number): Confirmat
         confirmLabel: label,
         body: (
           <p>
-            Each device restarts at once, whoever is using it. Unsaved work on the device is lost. Offline devices
+            Each device restarts after a 5-second delay, whoever is using it. Unsaved work on the device is lost. Offline devices
             restart when they reconnect.
           </p>
         ),
@@ -49,7 +49,7 @@ export function powerConfirmation(action: PowerAction, count: number): Confirmat
         danger: true,
         body: (
           <p>
-            Each device turns off at once, whoever is using it, and unsaved work is lost.{' '}
+            Each device turns off after a 5-second delay, whoever is using it, and unsaved work is lost.{' '}
             <strong>Someone has to switch it on again at the device.</strong> Offline devices shut down when they
             reconnect.
           </p>
@@ -59,7 +59,7 @@ export function powerConfirmation(action: PowerAction, count: number): Confirmat
       return {
         title: `Put ${devices} to sleep?`,
         confirmLabel: label,
-        body: <p>Each device goes to sleep at once and reconnects when it wakes up.</p>,
+        body: <p>Each device goes to sleep and reconnects when it wakes up. The job stays running while devices are asleep and completes after they wake up.</p>,
       }
   }
 }

@@ -9,6 +9,7 @@ export const REASONS: Record<string, string> = {
   nonzero_exit: 'Non-zero exit code',
   invalid_payload: 'Client rejected the job parameters',
   interrupted: 'Interrupted',
+  handoff_unconfirmed: 'Destination unconfirmed',
   error: 'Error',
   cancelled: 'Cancelled',
   no_user_session: 'Nobody is logged in on the device, so there was no user session to run it in',

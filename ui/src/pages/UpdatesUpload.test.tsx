@@ -262,7 +262,7 @@ describe('Move to the manager Wi-Fi dialog', () => {
   it('says the devices go to the online coordinator and leave this one', async () => {
     const dialog = await openDialog({ coordinator: 'online' })
     expect(dialog).toHaveTextContent(
-      'They will connect to the online coordinator at wss://sc.example.org from then on and leave this local one; this job is marked as succeeded once they have been gone for two minutes.',
+      'They will connect to the online coordinator at wss://sc.example.org from then on and leave this local one. If they cannot report back, the job shows “Destination unconfirmed” after two minutes. Check the destination coordinator before retrying.',
     )
   })
 

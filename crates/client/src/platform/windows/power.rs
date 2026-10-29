@@ -13,7 +13,7 @@ use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
-use windows_sys::Win32::System::Power::SetSuspendState;
+use windows_sys::Win32::System::Power::{GetPwrCapabilities, SetSuspendState, SYSTEM_POWER_CAPABILITIES};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::session::CREATE_NO_WINDOW;
@@ -49,13 +49,37 @@ pub(crate) fn power_command(action: PowerAction) -> PowerCommand {
     }
 }
 
-/// Whether `action` can be attempted here, before success is reported.
+/// Whether `action` can be attempted here. This does not perform it.
 pub(crate) fn check(action: PowerAction) -> Result<(), PlatformError> {
     match power_command(action) {
         PowerCommand::Run { program, .. } if !program.is_file() => {
             Err(PlatformError::Failed(format!("{} is missing", program.display())))
         }
-        PowerCommand::Run { .. } | PowerCommand::Suspend => Ok(()),
+        PowerCommand::Run { .. } => Ok(()),
+        PowerCommand::Suspend => check_sleep_capabilities(&capabilities()?),
+    }
+}
+
+fn capabilities() -> Result<SYSTEM_POWER_CAPABILITIES, PlatformError> {
+    // SAFETY: the API initializes this correctly sized, writable structure.
+    let mut capabilities = unsafe { std::mem::zeroed() };
+    if unsafe { GetPwrCapabilities(&mut capabilities) } == 0 {
+        return Err(PlatformError::Failed(format!(
+            "GetPwrCapabilities failed: {}", std::io::Error::last_os_error()
+        )));
+    }
+    Ok(capabilities)
+}
+
+fn check_sleep_capabilities(capabilities: &SYSTEM_POWER_CAPABILITIES) -> Result<(), PlatformError> {
+    // AoAc is Modern Standby (S0 low-power idle). S4 alone is hibernation,
+    // which must not be substituted for the requested sleep action.
+    if [capabilities.SystemS1, capabilities.SystemS2, capabilities.SystemS3, capabilities.AoAc]
+        .iter().any(|supported| *supported != 0)
+    {
+        Ok(())
+    } else {
+        Err(PlatformError::Unsupported("Windows reports no supported sleep state on this device".into()))
     }
 }
 
@@ -159,10 +183,35 @@ mod tests {
     }
 
     #[test]
-    fn every_action_can_be_attempted_on_this_machine() {
+    fn shutdown_programs_exist_on_this_machine() {
         // Only checks that the programs are there; nothing is run.
-        for action in [PowerAction::Restart, PowerAction::Shutdown, PowerAction::Sleep] {
+        for action in [PowerAction::Restart, PowerAction::Shutdown] {
             assert_eq!(check(action), Ok(()), "{action:?}");
         }
+    }
+
+    #[test]
+    fn sleep_requires_traditional_sleep_or_modern_standby_not_just_hibernation() {
+        // SAFETY: this FFI data structure contains only integer fields.
+        let mut caps: SYSTEM_POWER_CAPABILITIES = unsafe { std::mem::zeroed() };
+        assert!(matches!(check_sleep_capabilities(&caps), Err(PlatformError::Unsupported(_))));
+        caps.SystemS4 = 1;
+        assert!(matches!(check_sleep_capabilities(&caps), Err(PlatformError::Unsupported(_))));
+        for field in 0..4 {
+            let mut supported = caps;
+            match field {
+                0 => supported.SystemS1 = 1,
+                1 => supported.SystemS2 = 1,
+                2 => supported.SystemS3 = 1,
+                _ => supported.AoAc = 1,
+            }
+            assert_eq!(check_sleep_capabilities(&supported), Ok(()));
+        }
+    }
+
+    #[test]
+    fn native_sleep_capability_query_does_not_perform_a_power_action() {
+        let caps = capabilities().expect("query Windows power capabilities");
+        assert_eq!(check(PowerAction::Sleep), check_sleep_capabilities(&caps));
     }
 }

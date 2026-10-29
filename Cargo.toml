@@ -19,7 +19,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.4"
 edition = "2021"
 repository = "https://github.com/RealDoc06/surface-coordinator"
 
@@ -53,3 +53,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4"] }
+
+# Tests inherit dev settings. Keep file/line backtraces without full debugger
+# symbols or the incremental caches that grow with repeated local builds.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false

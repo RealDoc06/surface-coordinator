@@ -16,7 +16,6 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use protocol::handshake::{self, Role};
 use protocol::{reject_reason, ClientMessage, Hello, JobStatus, ServerMessage};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::events::Event;
@@ -25,6 +24,8 @@ use crate::store::{self, DeviceInfo, TargetResult};
 use crate::{rollout, updates};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Largest message accepted from a client. Output chunks are far smaller.
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_ID_LEN: usize = 64;
@@ -46,7 +47,7 @@ async fn upgrade(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| async move {
+    ws.max_message_size(MAX_MESSAGE_BYTES).max_frame_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| async move {
         let tracker = state.tasks.clone();
         // Tracked so that `stop` waits for the connection to wind down.
         let _ = tracker.track_future(serve(state, socket, peer)).await;
@@ -57,7 +58,32 @@ type Sink = SplitSink<WebSocket, Message>;
 type Stream = SplitStream<WebSocket>;
 
 async fn send(sink: &mut Sink, message: &ServerMessage) -> Result<(), axum::Error> {
-    sink.send(Message::Text(message.to_json().into())).await
+    tokio::time::timeout(WRITE_TIMEOUT, sink.send(Message::Text(message.to_json().into())))
+        .await
+        .map_err(|_| axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "client stopped reading",
+        )))?
+}
+
+async fn close(sink: &mut Sink) {
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await;
+}
+
+/// A stalled receiver cannot keep a replaced connection or shutdown alive.
+async fn send_connected(
+    connection: &crate::state::Connection,
+    sink: &mut Sink,
+    message: &ServerMessage,
+) -> Result<(), axum::Error> {
+    tokio::select! {
+        biased;
+        _ = connection.close.cancelled() => Err(axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "connection closed by coordinator",
+        ))),
+        result = send(sink, message) => result,
+    }
 }
 
 /// Next text frame, or `None` when the peer is gone.
@@ -101,18 +127,17 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
             if let Some(reject) = failure.reject {
                 let _ = send(&mut sink, &ServerMessage::Reject { reason: reject.to_owned() }).await;
             }
-            let _ = sink.close().await;
+            close(&mut sink).await;
             return;
         }
         Err(_) => {
             tracing::warn!(%peer, reason = "timed out", "client handshake failed");
-            let _ = sink.close().await;
+            close(&mut sink).await;
             return;
         }
     };
 
     let device_id = hello.device_id.clone();
-    let (outbound, outbound_rx) = mpsc::unbounded_channel();
     let connection = {
         let _presence = state.presence.lock().await;
         let stored = {
@@ -143,10 +168,10 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
         };
         if let Err(error) = stored {
             tracing::error!(%device_id, %error, "failed to record device");
-            let _ = sink.close().await;
+            close(&mut sink).await;
             return;
         }
-        state.register(&device_id, outbound, restricted)
+        state.register(&device_id, restricted)
     };
     if restricted {
         tracing::warn!(%peer, %device_id, hostname = %hello.hostname, protocol_version = hello.protocol_version,
@@ -161,16 +186,15 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
         heartbeat_interval_ms: u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
         restricted,
     };
-    if send(&mut sink, &welcome).await.is_ok() {
-        repeat_cancels(&state, &device_id, &connection).await;
-        // Registered before this query, so a job created from now on is
-        // either picked up here or dispatched to this connection directly.
-        state.dispatch(&device_id, true).await;
+    if send_connected(&connection, &mut sink, &welcome).await.is_ok() {
+        // The session replays unresolved jobs and cancellations directly
+        // from storage, one at a time, even when the offline backlog is large.
+        connection.pending.notify_one();
         // The device may be one the update rollout is waiting for. In its own
         // task, so this connection starts serving at once.
         let rollout_state = state.clone();
         state.tasks.spawn(async move { rollout::run(&rollout_state).await });
-        let ended = session(&state, &device_id, &connection, sink, stream, outbound_rx).await;
+        let ended = session(&state, &device_id, &connection, sink, stream).await;
         tracing::info!(%device_id, reason = ended, "device connection ended");
     }
 
@@ -178,29 +202,16 @@ async fn serve(state: Arc<AppState>, socket: WebSocket, peer: SocketAddr) {
     if state.unregister(&device_id, connection.id) {
         let last_seen = connection.last_seen.load(Ordering::Relaxed);
         let id = device_id.clone();
-        if let Err(error) =
-            state.store.call(move |conn| store::set_device_offline(conn, &id, last_seen)).await
-        {
-            tracing::error!(%device_id, %error, "failed to mark device offline");
+        match state.store.call(move |conn| store::set_device_offline(conn, &id, last_seen)).await {
+            Ok(changes) => {
+                for change in changes {
+                    state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+                }
+            }
+            Err(error) => tracing::error!(%device_id, %error, "failed to mark device offline"),
         }
         tracing::info!(%device_id, "device offline");
         state.publish_device(&device_id).await;
-    }
-}
-
-/// Tells a device that just connected to stop targets cancelled recently.
-/// One cancelled while the device was offline may still be running there;
-/// the device ignores ids it does not know or has already finished.
-async fn repeat_cancels(state: &AppState, device_id: &str, connection: &crate::state::Connection) {
-    let device = device_id.to_owned();
-    let since = store::now_ms() - REPEAT_CANCELS_FOR.as_millis() as i64;
-    match state.store.call(move |conn| store::cancelled_targets_since(conn, &device, since)).await {
-        Ok(targets) => {
-            for job_target_id in targets {
-                let _ = connection.outbound.send(ServerMessage::JobCancel { job_target_id });
-            }
-        }
-        Err(error) => tracing::error!(device_id, %error, "failed to load cancelled targets"),
     }
 }
 
@@ -344,6 +355,59 @@ async fn handshake(
     Ok(Authenticated { hello, restricted })
 }
 
+/// Per-connection replay positions, independent of the size of the backlog.
+#[derive(Default, Clone, Copy)]
+struct DeliveryCursor {
+    job_rowid: i64,
+    cancellation: (i64, i64),
+}
+
+enum Delivery {
+    Cancel(store::Cancellation),
+    Job(Box<(store::Dispatch, Option<store::TargetChange>)>),
+}
+
+/// The socket owns delivery order, so a cancel can never overtake the job
+/// that was just loaded. Only one payload per connection is held in memory.
+async fn next_delivery(
+    state: &AppState,
+    device_id: &str,
+    connection: &crate::state::Connection,
+    cursor: &mut DeliveryCursor,
+) -> Result<Option<ServerMessage>, crate::Error> {
+    let device = device_id.to_owned();
+    let after = *cursor;
+    let only_kind = connection.restricted.then_some(protocol::job_kind::CLIENT_UPDATE);
+    let since = store::now_ms() - REPEAT_CANCELS_FOR.as_millis() as i64;
+    let delivery = state.store.call(move |conn| {
+        if let Some(cancel) = store::next_cancellation(conn, &device, since, after.cancellation)? {
+            return Ok(Some(Delivery::Cancel(cancel)));
+        }
+        Ok(store::take_next_dispatchable(conn, &device, after.job_rowid, only_kind)?
+            .map(|job| Delivery::Job(Box::new(job))))
+    }).await?;
+    Ok(match delivery {
+        Some(Delivery::Cancel(cancel)) => {
+            cursor.cancellation = (cancel.requested_at, cancel.rowid);
+            Some(ServerMessage::JobCancel { job_target_id: cancel.target_id })
+        }
+        Some(Delivery::Job(job)) => {
+            let (dispatch, change) = *job;
+            cursor.job_rowid = cursor.job_rowid.max(dispatch.rowid);
+            if let Some(change) = change {
+                state.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
+            }
+            Some(ServerMessage::Job {
+                job_target_id: dispatch.job_target_id,
+                job_id: dispatch.job_id,
+                kind: dispatch.kind,
+                payload: dispatch.payload,
+            })
+        }
+        None => None,
+    })
+}
+
 /// Runs an authenticated connection until it ends; returns why.
 async fn session(
     state: &AppState,
@@ -351,8 +415,8 @@ async fn session(
     connection: &crate::state::Connection,
     mut sink: Sink,
     mut stream: Stream,
-    mut outbound: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> &'static str {
+    let mut cursor = DeliveryCursor::default();
     let silence_limit = state.config.heartbeat_interval * protocol::MISSED_HEARTBEATS_BEFORE_OFFLINE;
     let silence = tokio::time::sleep(silence_limit);
     tokio::pin!(silence);
@@ -361,10 +425,19 @@ async fn session(
         tokio::select! {
             _ = connection.close.cancelled() => break "closed by coordinator",
             _ = &mut silence => break "missed heartbeats",
-            message = outbound.recv() => {
-                let Some(message) = message else { break "closed by coordinator" };
-                if send(&mut sink, &message).await.is_err() {
-                    break "connection lost";
+            _ = connection.pending.notified() => {
+                match next_delivery(state, device_id, connection, &mut cursor).await {
+                    Ok(Some(message)) => {
+                        if send_connected(connection, &mut sink, &message).await.is_err() {
+                            break "connection lost";
+                        }
+                        connection.pending.notify_one();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(device_id, %error, "failed to load queued work");
+                        break "database error";
+                    }
                 }
             }
             text = next_text(&mut stream) => {
@@ -373,9 +446,22 @@ async fn session(
                 connection.last_seen.store(store::now_ms(), Ordering::Relaxed);
                 match ClientMessage::from_json(&text) {
                     Ok(message) => {
-                        if let Some(reply) = handle_message(state, device_id, message).await {
-                            if send(&mut sink, &reply).await.is_err() {
-                                break "connection lost";
+                        match handle_message(state, device_id, message).await {
+                            Ok(Some(reply)) => {
+                                if send_connected(connection, &mut sink, &reply).await.is_err() {
+                                    break "connection lost";
+                                }
+                                if matches!(reply, ServerMessage::JobResultAck { .. }) {
+                                    connection.pending.notify_one();
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                // The client replays retained results/output
+                                // when reconnecting, so do not strand a full
+                                // delivery window after a transient DB error.
+                                tracing::error!(device_id, %error, "failed to store a client message");
+                                break "database error";
                             }
                         }
                     }
@@ -384,7 +470,7 @@ async fn session(
             }
         }
     };
-    let _ = sink.close().await;
+    close(&mut sink).await;
     reason
 }
 
@@ -414,10 +500,10 @@ async fn handle_message(
     state: &AppState,
     device_id: &str,
     message: ClientMessage,
-) -> Option<ServerMessage> {
+) -> Result<Option<ServerMessage>, crate::Error> {
     let device = device_id.to_owned();
-    let outcome = match message {
-        ClientMessage::Heartbeat => return Some(ServerMessage::HeartbeatAck),
+    match message {
+        ClientMessage::Heartbeat => Ok(Some(ServerMessage::HeartbeatAck)),
         ClientMessage::JobStarted { job_target_id } => state
             .store
             .call(move |conn| store::mark_target_started(conn, &job_target_id, &device))
@@ -489,13 +575,5 @@ async fn handle_message(
         // Handshake messages after the handshake, and types this version
         // does not know, are ignored.
         ClientMessage::Hello(_) | ClientMessage::Auth { .. } | ClientMessage::Unknown => Ok(None),
-    };
-    match outcome {
-        Ok(reply) => reply,
-        Err(error) => {
-            // No acknowledgement: the client keeps the result and retries.
-            tracing::error!(device_id, %error, "failed to store a client message");
-            None
-        }
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, errorMessage } from '../api/client'
 import type { Updates } from '../api/types'
@@ -48,23 +48,62 @@ export function UpdatesPage() {
   const [error, setError] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
   const [checkError, setCheckError] = useState<string | null>(null)
+  const refreshUpdates = useRef<(() => void) | null>(null)
+  const updatesRevision = useRef(0)
+
+  function acceptUpdates(next: Updates) {
+    // A response to an operator action supersedes an older background read.
+    updatesRevision.current += 1
+    setUpdates(next)
+    setError(null)
+  }
 
   useEffect(() => {
     let cancelled = false
-    api.getUpdates().then(
-      (next) => {
-        if (cancelled) return
-        setUpdates(next)
-        setError(null)
-      },
-      (err: unknown) => {
-        if (!cancelled) setError(errorMessage(err))
-      },
-    )
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let loading = false
+    let dirty = false
+
+    // Coalesce fleet event bursts and keep at most one request in flight.
+    function schedule() {
+      dirty = true
+      if (cancelled || loading || timer !== null) return
+      timer = setTimeout(() => {
+        timer = null
+        void load()
+      }, 250)
+    }
+
+    async function load() {
+      loading = true
+      dirty = false
+      const revision = updatesRevision.current
+      try {
+        const next = await api.getUpdates()
+        if (!cancelled && revision === updatesRevision.current) {
+          setUpdates(next)
+          setError(null)
+        }
+      } catch (err) {
+        if (!cancelled && revision === updatesRevision.current) setError(errorMessage(err))
+      } finally {
+        loading = false
+        if (dirty && !cancelled) schedule()
+      }
+    }
+
+    refreshUpdates.current = schedule
+    void load()
     return () => {
       cancelled = true
+      if (timer !== null) clearTimeout(timer)
+      refreshUpdates.current = null
     }
   }, [state.syncEpoch])
+
+  useEffect(() => {
+    if (state.updatesEpoch > 0) refreshUpdates.current?.()
+  }, [state.updatesEpoch])
 
   // Older coordinators do not say; they always check.
   const checksReleases = updates?.checking !== false
@@ -76,12 +115,12 @@ export function UpdatesPage() {
     setChecking(true)
     setCheckError(null)
     try {
-      setUpdates(await api.checkUpdates())
+      acceptUpdates(await api.checkUpdates())
     } catch (err) {
       setCheckError(errorMessage(err))
       // The coordinator records the error too (last_error): show what it now holds.
       try {
-        setUpdates(await api.getUpdates())
+        acceptUpdates(await api.getUpdates())
       } catch {
         // Keep what is shown.
       }
@@ -123,7 +162,7 @@ export function UpdatesPage() {
           {updates.auto_update !== undefined ? (
             <section className="panel" aria-labelledby="auto">
               <h2 id="auto">Automatic updates</h2>
-              <AutoUpdateSwitch enabled={updates.auto_update} onChanged={setUpdates} />
+              <AutoUpdateSwitch enabled={updates.auto_update} onChanged={acceptUpdates} />
             </section>
           ) : null}
 
@@ -172,7 +211,7 @@ export function UpdatesPage() {
           <section className="panel" aria-labelledby="upload">
             <h2 id="upload">Upload a client build</h2>
             {updates.enabled ? (
-              <ClientUploadForm onUploaded={setUpdates} />
+              <ClientUploadForm onUploaded={acceptUpdates} />
             ) : (
               <p className="muted">
                 Uploads are off: this coordinator has no update key built in, so it cannot verify client builds or

@@ -50,7 +50,7 @@ describe('WifiJoinForm', () => {
     setup()
     const warning = screen.getByRole('note')
     expect(warning).toHaveTextContent(/These devices will leave the network they are on now/)
-    expect(warning).toHaveTextContent(/succeeded once the device has left and has not returned for two minutes/)
+    expect(warning).toHaveTextContent(/Destination unconfirmed.*after two minutes/)
   })
 
   it('summarises the targets and counts them on the button', () => {

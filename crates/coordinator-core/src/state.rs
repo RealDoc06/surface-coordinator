@@ -4,8 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use protocol::{job_kind, ServerMessage};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, Notify};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -25,6 +24,10 @@ pub struct AppState {
     /// Live events for the UI.
     pub events: broadcast::Sender<Event>,
     pub login_throttle: LoginThrottle,
+    /// Bounds memory-hard password work independently of the database lock.
+    pub password_work: Arc<tokio::sync::Semaphore>,
+    /// Wakes UI sockets when a session may have been revoked.
+    pub auth_changes: tokio::sync::watch::Sender<()>,
     /// Verified against when a login names an unknown account, so that
     /// attempt takes as long as one for a real account.
     pub dummy_password_hash: String,
@@ -41,7 +44,8 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct Connection {
     pub id: u64,
-    pub outbound: mpsc::UnboundedSender<ServerMessage>,
+    /// Coalesces queued work into one wakeup; payloads stay in SQLite until sent.
+    pub pending: Arc<Notify>,
     /// Unix milliseconds of the last message received.
     pub last_seen: Arc<AtomicI64>,
     /// Cancelled to make the connection task close the socket.
@@ -60,6 +64,8 @@ impl AppState {
             tasks: TaskTracker::new(),
             events: broadcast::channel(EVENT_BUFFER).0,
             login_throttle: LoginThrottle::default(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(2)),
+            auth_changes: tokio::sync::watch::channel(()).0,
             dummy_password_hash: auth::hash_password("no account has this password"),
             connections: Mutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
@@ -94,12 +100,11 @@ impl AppState {
     pub fn register(
         &self,
         device_id: &str,
-        outbound: mpsc::UnboundedSender<ServerMessage>,
         restricted: bool,
     ) -> Connection {
         let connection = Connection {
             id: self.next_connection_id.fetch_add(1, Ordering::Relaxed),
-            outbound,
+            pending: Arc::new(Notify::new()),
             last_seen: Arc::new(AtomicI64::new(store::now_ms())),
             close: self.shutdown.child_token(),
             restricted,
@@ -137,47 +142,21 @@ impl AppState {
     /// Asks a device to stop a job target. Returns false if the device has no
     /// live connection, or the connection is already winding down and will
     /// not deliver the message.
-    pub fn signal_cancel(&self, device_id: &str, job_target_id: &str) -> bool {
+    pub fn signal_cancel(&self, device_id: &str, _job_target_id: &str) -> bool {
         self.connection(device_id).is_some_and(|connection| {
-            connection
-                .outbound
-                .send(ServerMessage::JobCancel { job_target_id: job_target_id.to_owned() })
-                .is_ok()
+            if connection.close.is_cancelled() {
+                return false;
+            }
+            connection.pending.notify_one();
+            true
         })
     }
 
-    /// Sends pending job targets to a device if it is connected. With
-    /// `include_unresolved`, targets it may already have are sent again. A
-    /// restricted connection is only sent `client.update`; everything else
-    /// stays queued until the device returns on a supported version.
-    pub async fn dispatch(&self, device_id: &str, include_unresolved: bool) {
-        let Some(connection) = self.connection(device_id) else {
-            return;
-        };
-        let device = device_id.to_owned();
-        let only_kind = connection.restricted.then_some(job_kind::CLIENT_UPDATE);
-        let taken = self
-            .store
-            .call(move |conn| store::take_dispatchable(conn, &device, include_unresolved, only_kind))
-            .await;
-        match taken {
-            Ok((dispatches, changes)) => {
-                for dispatch in dispatches {
-                    tracing::debug!(device_id, job_target_id = %dispatch.job_target_id, "dispatching job");
-                    // If the connection is gone the target stays `sent` and
-                    // is delivered again when the device reconnects.
-                    let _ = connection.outbound.send(ServerMessage::Job {
-                        job_target_id: dispatch.job_target_id,
-                        job_id: dispatch.job_id,
-                        kind: dispatch.kind,
-                        payload: dispatch.payload,
-                    });
-                }
-                for change in changes {
-                    self.publish(Event::JobTargetUpdated { job_id: change.job_id, target: change.target });
-                }
-            }
-            Err(error) => tracing::error!(device_id, %error, "failed to load jobs to dispatch"),
+    /// Wakes a connected device without copying its backlog into memory or
+    /// making the API wait for a database round trip for every target.
+    pub fn dispatch(&self, device_id: &str) {
+        if let Some(connection) = self.connection(device_id) {
+            connection.pending.notify_one();
         }
     }
 

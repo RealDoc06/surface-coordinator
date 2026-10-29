@@ -83,14 +83,12 @@ export function WifiJoinForm({ targets, devices, groups, initial, targetActions,
     <form className="composer" onSubmit={onSubmit} noValidate>
       <div className="notice warning" role="note">
         <p>
-          <strong>These devices will leave the network they are on now.</strong> Each one disconnects from this
-          coordinator, joins the network below and, unless you give another coordinator address, tries to reach this one
-          from there. If the network cannot be joined (wrong password, out of range) or this coordinator cannot be
-          reached from it, the device may stay out of reach until someone is at the device.
+          <strong>These devices will leave the network they are on now.</strong> Make sure the coordinator address
+          is reachable from the destination network. Devices already connected manually do not need a Wi-Fi job.
         </p>
         <p>
-          A device that is moved away from a local (hotspot) coordinator never reports back here, so the job is marked
-          succeeded once the device has left and has not returned for two minutes.
+          If a device moves to another coordinator and cannot report back here, the job shows “Destination
+          unconfirmed” after two minutes. Check the destination coordinator or device before retrying.
         </p>
       </div>
 

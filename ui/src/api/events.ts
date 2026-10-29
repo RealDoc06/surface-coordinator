@@ -12,6 +12,8 @@ export function eventsUrl(loc: Pick<Location, 'protocol' | 'host'> = window.loca
 
 const BASE_DELAY_MS = 1000
 const MAX_DELAY_MS = 30_000
+const CONNECT_TIMEOUT_MS = 10_000
+const IDLE_TIMEOUT_MS = 35_000
 
 /** Delay before reconnect attempt number `attempt` (0-based), with jitter. */
 export function backoffDelay(attempt: number, random: () => number = Math.random): number {
@@ -29,6 +31,10 @@ export class EventStream {
   private readonly opts: EventStreamOptions
   private socket: WebSocket | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
+  private openingTimer: ReturnType<typeof setTimeout> | null = null
+  private activityTimer: ReturnType<typeof setTimeout> | null = null
+  private lastActivity = 0
+  private connected = false
   private attempt = 0
   private stopped = true
 
@@ -40,20 +46,70 @@ export class EventStream {
     if (!this.stopped) return
     this.stopped = false
     this.attempt = 0
+    window.addEventListener('online', this.onOnline)
+    document.addEventListener('visibilitychange', this.onVisible)
     this.opts.onStatus('connecting')
     this.connect()
   }
 
   stop(): void {
     this.stopped = true
+    window.removeEventListener('online', this.onOnline)
+    document.removeEventListener('visibilitychange', this.onVisible)
     if (this.timer !== null) clearTimeout(this.timer)
     this.timer = null
+    this.closeSocket()
+  }
+
+  /** Retry immediately after a network change or an operator request. */
+  reconnect(): void {
+    if (this.stopped) return
+    if (this.timer !== null) clearTimeout(this.timer)
+    this.timer = null
+    this.attempt = 0
+    this.closeSocket()
+    this.opts.onStatus('reconnecting')
+    this.connect()
+  }
+
+  private readonly onOnline = (): void => this.reconnect()
+
+  private readonly onVisible = (): void => {
+    if (document.visibilityState === 'visible' && (!this.connected || Date.now() - this.lastActivity >= IDLE_TIMEOUT_MS)) {
+      this.reconnect()
+    }
+  }
+
+  private closeSocket(): void {
+    this.clearOpeningTimer()
+    this.clearActivityTimer()
+    this.connected = false
     const socket = this.socket
     this.socket = null
     if (socket) {
       socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null
       socket.close()
     }
+  }
+
+  private clearOpeningTimer(): void {
+    if (this.openingTimer !== null) clearTimeout(this.openingTimer)
+    this.openingTimer = null
+  }
+
+  private clearActivityTimer(): void {
+    if (this.activityTimer !== null) clearTimeout(this.activityTimer)
+    this.activityTimer = null
+  }
+
+  /** The coordinator sends a heartbeat every 10 s even when no devices change. */
+  private recordActivity(): void {
+    this.lastActivity = Date.now()
+    this.clearActivityTimer()
+    this.activityTimer = setTimeout(() => {
+      this.closeSocket()
+      this.scheduleReconnect()
+    }, IDLE_TIMEOUT_MS)
   }
 
   private connect(): void {
@@ -65,7 +121,15 @@ export class EventStream {
       return
     }
     this.socket = socket
+    // A half-open handshake otherwise leaves the UI "connecting" indefinitely.
+    this.openingTimer = setTimeout(() => {
+      this.closeSocket()
+      this.scheduleReconnect()
+    }, CONNECT_TIMEOUT_MS)
     socket.onopen = () => {
+      this.clearOpeningTimer()
+      this.connected = true
+      this.recordActivity()
       this.attempt = 0
       this.opts.onStatus('open')
     }
@@ -77,10 +141,15 @@ export class EventStream {
       } catch {
         return
       }
+      this.recordActivity()
+      if (typeof parsed === 'object' && parsed !== null && 'type' in parsed && parsed.type === 'heartbeat') return
       this.opts.onEvent(parsed)
     }
     socket.onclose = () => {
       if (this.socket !== socket) return
+      this.clearOpeningTimer()
+      this.clearActivityTimer()
+      this.connected = false
       this.socket = null
       this.scheduleReconnect()
     }

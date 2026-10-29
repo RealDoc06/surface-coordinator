@@ -45,35 +45,37 @@ Add-Type -Language CSharp -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
+// These methods return HRESULT directly. PreserveSig keeps failure codes
+// available to the explicit checks and avoids adding a synthetic retval.
 [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IScAudioEndpointVolume
 {
-    int RegisterControlChangeNotify(IntPtr notify);
-    int UnregisterControlChangeNotify(IntPtr notify);
-    int GetChannelCount(out uint count);
-    int SetMasterVolumeLevel(float levelDb, IntPtr context);
-    int SetMasterVolumeLevelScalar(float level, IntPtr context);
-    int GetMasterVolumeLevel(out float levelDb);
-    int GetMasterVolumeLevelScalar(out float level);
-    int SetChannelVolumeLevel(uint channel, float levelDb, IntPtr context);
-    int SetChannelVolumeLevelScalar(uint channel, float level, IntPtr context);
-    int GetChannelVolumeLevel(uint channel, out float levelDb);
-    int GetChannelVolumeLevelScalar(uint channel, out float level);
-    int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, IntPtr context);
-    int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+    [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+    [PreserveSig] int GetChannelCount(out uint count);
+    [PreserveSig] int SetMasterVolumeLevel(float levelDb, IntPtr context);
+    [PreserveSig] int SetMasterVolumeLevelScalar(float level, IntPtr context);
+    [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+    [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+    [PreserveSig] int SetChannelVolumeLevel(uint channel, float levelDb, IntPtr context);
+    [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, IntPtr context);
+    [PreserveSig] int GetChannelVolumeLevel(uint channel, out float levelDb);
+    [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+    [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, IntPtr context);
+    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
 }
 
 [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IScMMDevice
 {
-    int Activate(ref Guid iid, int context, IntPtr parameters, [MarshalAs(UnmanagedType.IUnknown)] out object endpoint);
+    [PreserveSig] int Activate(ref Guid iid, int context, IntPtr parameters, [MarshalAs(UnmanagedType.IUnknown)] out object endpoint);
 }
 
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IScMMDeviceEnumerator
 {
-    int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
-    int GetDefaultAudioEndpoint(int dataFlow, int role, out IScMMDevice endpoint);
+    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IScMMDevice endpoint);
 }
 
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]

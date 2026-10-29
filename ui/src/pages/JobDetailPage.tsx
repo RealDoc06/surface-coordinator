@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, ApiError, errorMessage } from '../api/client'
-import type { Target } from '../api/types'
+import type { Device, Target } from '../api/types'
 import { ErrorNote, StateBadge, StateCounts } from '../components/bits'
 import { ConfirmDialog } from '../components/Modal'
 import { OutputPane } from '../components/OutputPane'
@@ -42,30 +42,63 @@ export function JobDetailPage() {
 }
 
 type Status = 'loading' | 'ready' | 'missing'
+const hostnameOrder = new Intl.Collator(undefined, { numeric: true })
+
+// Output chunks change frequently; the fleet table only needs device/state changes
+// and its own one-second duration clock.
+const TargetTable = memo(function TargetTable({ targets, devices, selectedId, onSelect }: {
+  targets: Target[]
+  devices: Record<string, Device>
+  selectedId: string | undefined
+  onSelect: (id: string) => void
+}) {
+  const now = useNow(1000)
+  return (
+    <section aria-label="Devices">
+      <table className="table">
+        <thead>
+          <tr><th>Device</th><th>State</th><th>Exit code</th><th>Duration</th><th>Detail</th></tr>
+        </thead>
+        <tbody>
+          {targets.map((target) => (
+            <tr key={target.id} className={target.id === selectedId ? 'selected' : undefined}>
+              <td>
+                <button type="button" className="link" aria-pressed={target.id === selectedId} onClick={() => onSelect(target.id)}>
+                  {devices[target.device_id]?.hostname || shortId(target.device_id)}
+                </button>
+              </td>
+              <td><StateBadge state={target.state} reason={target.reason} /></td>
+              <td className="mono">{target.exit_code ?? ''}</td>
+              <td className="nowrap">{duration(target, now)}</td>
+              <td>{reasonText(target)}</td>
+            </tr>
+          ))}
+          {targets.length === 0 ? <tr><td colSpan={5} className="table-empty">This job has no devices left.</td></tr> : null}
+        </tbody>
+      </table>
+    </section>
+  )
+})
 
 function JobDetail({ id }: { id: string }) {
   const { state, dispatch, reload } = useStore()
   const navigate = useNavigate()
-  const now = useNow(1000)
   const [status, setStatus] = useState<Status>('loading')
   const [error, setError] = useState<string | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [cancelBusy, setCancelBusy] = useState(false)
   const [cancelError, setCancelError] = useState<string | null>(null)
-  /** Finished targets as of the last load, to spot ones that finish while watching. */
-  const finishedSeen = useRef(0)
+  const [outputError, setOutputError] = useState<{ targetId: string; message: string } | null>(null)
+  const [outputRetry, setOutputRetry] = useState(0)
 
   const load = useCallback(async () => {
-    dispatch({ type: 'job.detail.requested', jobId: id })
     try {
       const { job } = await api.getJob(id)
-      finishedSeen.current = Math.max(finishedSeen.current, job.targets.filter((t) => isTerminal(t.state)).length)
       dispatch({ type: 'job.detail.loaded', job })
       setStatus('ready')
       setError(null)
     } catch (err) {
-      dispatch({ type: 'job.detail.failed', jobId: id })
       if (err instanceof ApiError && err.status === 404) setStatus('missing')
       else setError(errorMessage(err))
     }
@@ -79,18 +112,37 @@ function JobDetail({ id }: { id: string }) {
 
   const job = state.jobs[id]
   const context = useMemo(() => ({ settings: state.catalogue }), [state.catalogue])
-  const finished = job ? job.targets.filter((t) => isTerminal(t.state)).length : 0
+  const hostname = useCallback((deviceId: string) => state.devices[deviceId]?.hostname || shortId(deviceId), [state.devices])
+  const targets = useMemo(() => job?.targets.slice().sort((a, b) =>
+    hostnameOrder.compare(hostname(a.device_id), hostname(b.device_id))) ?? [], [job?.targets, hostname])
+  const selected = targets.find((t) => t.id === selectedId) ?? targets[0]
+  const targetId = selected?.id
+  const finished = selected ? isTerminal(selected.state) : false
 
-  // Events from a coordinator that sends no output offsets are placed by
-  // content when they cross a load in flight, which can rarely misplace one.
-  // When a device finishes, read back what the coordinator stored so the final
-  // output is exactly that (with offsets this is only a cheap confirmation).
+  // A snapshot for one device, reconciled with events that cross the request.
+  // Completing other targets never reloads output. Reconnects and this target's
+  // completion read back stored output to recover missed or legacy events.
   useEffect(() => {
-    if (status === 'ready' && finished > finishedSeen.current) {
-      finishedSeen.current = finished
-      void load()
+    if (!targetId) return
+    let cancelled = false
+    setOutputError(null)
+    dispatch({ type: 'job.output.requested', jobId: id, targetId })
+    api.getJobOutput(id, targetId).then(
+      ({ output, output_truncated }) => {
+        if (cancelled) return
+        dispatch({ type: 'job.output.loaded', jobId: id, targetId, output, truncated: output_truncated })
+      },
+      (err: unknown) => {
+        if (cancelled) return
+        dispatch({ type: 'job.output.failed', jobId: id, targetId })
+        setOutputError({ targetId, message: errorMessage(err) })
+      },
+    )
+    return () => {
+      cancelled = true
+      dispatch({ type: 'job.output.failed', jobId: id, targetId })
     }
-  }, [finished, status, load])
+  }, [dispatch, id, targetId, finished, state.syncEpoch, outputRetry])
 
   // Also when the job was there and is gone: its last device was forgotten.
   if (status === 'missing' || (status === 'ready' && !job)) {
@@ -107,11 +159,6 @@ function JobDetail({ id }: { id: string }) {
     return error ? <ErrorNote message={error} onRetry={reload} /> : <p className="muted">Loading job&hellip;</p>
   }
 
-  const hostname = (deviceId: string) => state.devices[deviceId]?.hostname || shortId(deviceId)
-  const targets = job.targets
-    .slice()
-    .sort((a, b) => hostname(a.device_id).localeCompare(hostname(b.device_id), undefined, { numeric: true }))
-  const selected = targets.find((t) => t.id === selectedId) ?? targets[0]
   const output = selected ? state.outputs[selected.id] : undefined
   const rerun = rerunRequest(job, context)
   const active = job.targets.filter((t) => !isTerminal(t.state)).length
@@ -163,48 +210,7 @@ function JobDetail({ id }: { id: string }) {
       </section>
 
       <div className="split">
-        <section aria-label="Devices">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Device</th>
-                <th>State</th>
-                <th>Exit code</th>
-                <th>Duration</th>
-                <th>Detail</th>
-              </tr>
-            </thead>
-            <tbody>
-              {targets.map((target) => (
-                <tr key={target.id} className={target.id === selected?.id ? 'selected' : undefined}>
-                  <td>
-                    <button
-                      type="button"
-                      className="link"
-                      aria-pressed={target.id === selected?.id}
-                      onClick={() => setSelectedId(target.id)}
-                    >
-                      {hostname(target.device_id)}
-                    </button>
-                  </td>
-                  <td>
-                    <StateBadge state={target.state} reason={target.reason} />
-                  </td>
-                  <td className="mono">{target.exit_code ?? ''}</td>
-                  <td className="nowrap">{duration(target, now)}</td>
-                  <td>{reasonText(target)}</td>
-                </tr>
-              ))}
-              {targets.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="table-empty">
-                    This job has no devices left.
-                  </td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
-        </section>
+        <TargetTable targets={targets} devices={state.devices} selectedId={selected?.id} onSelect={setSelectedId} />
 
         {selected ? (
           <section aria-label="Output">
@@ -219,12 +225,13 @@ function JobDetail({ id }: { id: string }) {
               </h2>
               <StateBadge state={selected.state} reason={selected.reason} />
             </div>
+            <ErrorNote message={outputError?.targetId === selected.id ? outputError.message : null} onRetry={() => setOutputRetry((n) => n + 1)} />
             <OutputPane
               streamKey={selected.id}
               label={`Output of ${hostname(selected.device_id)}`}
               text={output?.text ?? ''}
               truncated={output?.truncated ?? selected.output_truncated}
-              placeholder={outputPlaceholder(selected, output !== undefined)}
+              placeholder={outputError?.targetId === selected.id && !output ? 'Output could not be loaded.' : outputPlaceholder(selected, output !== undefined)}
             />
           </section>
         ) : null}

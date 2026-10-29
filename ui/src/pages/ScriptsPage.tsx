@@ -133,7 +133,9 @@ export function ScriptsPage() {
             {scripts.map((script) => (
               <tr key={script.id}>
                 <td>
-                  <Link to={`/scripts/${encodeURIComponent(script.id)}`}>{script.name}</Link>{' '}
+                  <Link to={`/scripts/${encodeURIComponent(script.id)}`} state={{ targets: request.targets }}>
+                    {script.name}
+                  </Link>{' '}
                   {script.built_in ? <span className="badge">built-in</span> : null}
                 </td>
                 <td>{SHELL_LABELS[script.shell]}</td>

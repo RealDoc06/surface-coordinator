@@ -359,6 +359,7 @@ fieldset.choice label {
 .brand {
   font-weight: 700;
   white-space: nowrap;
+  color: var(--text);
 }
 
 .app-header nav {
@@ -412,6 +413,10 @@ fieldset.choice label {
 }
 
 .banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   background: var(--amber-soft);
   color: var(--amber);
   border-bottom: 1px solid var(--border);
@@ -796,6 +801,8 @@ fieldset.choice label {
   padding: 16px 18px;
   width: 440px;
   max-width: 100%;
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
 }
 
@@ -1345,4 +1352,156 @@ fieldset.choice.stacked {
 
 .arg-footer {
   margin-top: 8px;
+}
+
+.connection-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.connection-state.is-live {
+  color: var(--green);
+}
+
+.selection-toolbar {
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  margin-bottom: 0;
+}
+
+.selection-hint {
+  margin: 0 0 10px;
+}
+
+.selection-count,
+.device-table .col-status,
+.device-table th {
+  white-space: nowrap;
+}
+
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.device-table {
+  min-width: 900px;
+}
+
+.device-table tbody td {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.device-table .col-status {
+  font-size: 12px;
+}
+
+.device-table td:nth-child(3) a {
+  font-weight: 600;
+}
+
+.fields dd {
+  overflow-wrap: anywhere;
+}
+
+.copy-row input,
+.app-main,
+.split > * {
+  min-width: 0;
+}
+
+@media (max-width: 1150px) {
+  .app-header {
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    padding-top: 10px;
+  }
+
+  .app-header nav {
+    order: 1;
+    width: 100%;
+    min-height: 38px;
+    flex-wrap: wrap;
+  }
+
+  .app-header nav .menu {
+    left: auto;
+    right: 0;
+  }
+
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 700px) {
+  .app-header {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .app-header nav a,
+  .app-header nav button.nav-menu {
+    padding: 8px;
+  }
+
+  .app-header .version {
+    display: none;
+  }
+
+  .app-main {
+    padding: 14px 12px 28px;
+  }
+
+  .toolbar-actions {
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+
+  .toolbar input[type='search'] {
+    width: min(300px, 100%);
+  }
+
+  .field-inline,
+  .toolbar-group,
+  input,
+  textarea {
+    max-width: 100%;
+  }
+
+  .table:not(.device-table) {
+    display: block;
+    overflow-x: auto;
+  }
+
+  .modal-backdrop {
+    padding: 12px;
+  }
+
+  .modal {
+    max-height: calc(100dvh - 24px);
+    padding: 14px;
+  }
+
+  .output-pane {
+    height: 340px;
+  }
+
+  .form-actions {
+    flex-wrap: wrap;
+  }
+
+  .menu {
+    min-width: min(220px, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+  }
+
+  .menu .menu-item {
+    white-space: normal;
+  }
 }

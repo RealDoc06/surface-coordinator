@@ -7,8 +7,12 @@
 //! operator has to dismiss: in hotspot mode there is no internet, and the
 //! manager keeps working on its current version.
 
+use std::path::Path;
+
 use serde::Serialize;
 use tauri_plugin_updater::Error;
+
+use crate::embedded::{Embedded, Options};
 
 /// Release notes longer than this are cut; the full text is on the release
 /// page, and the launcher banner is no place for a changelog of every
@@ -111,7 +115,59 @@ pub fn install_error_message(error: &Error) -> String {
             "The downloaded update is not signed with this build's key and was not installed."
                 .to_owned()
         }
+        Error::SignedVersionMismatch { .. } => {
+            "The downloaded update's signed version does not match the announced release and was not installed."
+                .to_owned()
+        }
+        Error::MissingSignedVersion => {
+            "The downloaded update has no signed version and was not installed. Wait for a corrected release."
+                .to_owned()
+        }
         other => format!("The update could not be installed: {other}"),
+    }
+}
+
+/// Closes the local database before running an already verified installer.
+/// If the installer fails to start, restores the coordinator with its data
+/// and client port. Hotspot activation remains an explicit operator action:
+/// its OS state may have changed outside the manager.
+pub async fn install_with_recovery(
+    embedded: &mut Option<Embedded>,
+    data_dir: &Path,
+    options: Options,
+    install: impl FnOnce() -> Result<(), Error>,
+    report: impl Fn(&str),
+) -> Result<(), String> {
+    let was_running = embedded.is_some();
+    if let Some(running) = embedded.take() {
+        report("Stopping the local coordinator…");
+        running.stop().await;
+    }
+    report("Installing the update…");
+    let Err(error) = install() else { return Ok(()) };
+    tracing::error!(%error, "update install failed");
+    let message = install_error_message(&error);
+    if !was_running {
+        return Err(message);
+    }
+
+    report("Restoring the local coordinator…");
+    match Embedded::start(data_dir, options).await {
+        Ok(restored) => {
+            tracing::info!(clients = %restored.client_addr(), "local coordinator restored after failed update");
+            *embedded = Some(restored);
+            Err(format!(
+                "{message} The local coordinator is running again. \
+                 If you were using its hotspot, open the local coordinator and start the hotspot again."
+            ))
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not restore local coordinator after failed update");
+            Err(format!(
+                "{message} The local coordinator could not be restarted: {error}. \
+                 Use Start local coordinator to try again."
+            ))
+        }
     }
 }
 
@@ -239,6 +295,19 @@ mod tests {
         assert!(message.contains("not signed with this build's key"), "{message}");
         let message = install_error_message(&Error::Network("timed out".into()));
         assert!(message.contains(UNREACHABLE), "{message}");
+    }
+
+    #[test]
+    fn an_untrusted_release_version_is_refused_without_suggesting_bypassing_verification() {
+        let mismatch = install_error_message(&Error::SignedVersionMismatch {
+            signed: "0.1.0".to_owned(),
+            announced: "9.9.9".to_owned(),
+        });
+        assert!(mismatch.contains("signed version does not match"), "{mismatch}");
+        assert!(mismatch.contains("was not installed"), "{mismatch}");
+        let missing = install_error_message(&Error::MissingSignedVersion);
+        assert!(missing.contains("no signed version"), "{missing}");
+        assert!(missing.contains("Wait for a corrected release"), "{missing}");
     }
 
     #[test]

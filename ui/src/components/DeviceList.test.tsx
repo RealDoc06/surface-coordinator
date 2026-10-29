@@ -120,13 +120,46 @@ describe('DeviceList', () => {
 
   it('offers to run on all devices regardless of the selection', async () => {
     const { onRun, user } = setup()
-    await user.click(screen.getByRole('button', { name: 'Run on all devices' }))
+    await user.click(screen.getByRole('button', { name: 'All devices' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Run on all devices' }))
     expect(onRun).toHaveBeenCalledExactlyOnceWith({ type: 'all' })
   })
 
   it('does not count selected devices that no longer exist', () => {
     setup({ initialSelected: ['a1', 'gone'] })
     expect(screen.getByText('1 selected')).toBeInTheDocument()
+  })
+
+  it('selects only online devices in the current filter', async () => {
+    const { user, onRun } = setup({ initialSelected: ['b2'] })
+    await user.type(screen.getByRole('searchbox'), 'lab')
+    await user.click(screen.getByRole('button', { name: 'Select online' }))
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    await user.click(runButton())
+    expect(onRun).toHaveBeenCalledExactlyOnceWith({ type: 'devices', device_ids: ['a1'] })
+  })
+
+  it('searches by network and IP, and resets all filters without clearing selection', async () => {
+    const { user } = setup({ devices: [
+      device('a', { hostname: 'ROOM-01', network: { ssid: 'Classroom', ip: '10.0.0.21' } }),
+      device('b', { hostname: 'ROOM-02', network: { ssid: 'Office', ip: '10.0.1.22' }, online: false }),
+    ] })
+    await user.type(screen.getByRole('searchbox'), 'classroom')
+    expect(rowNames()).toEqual(['ROOM-01'])
+    await user.click(checkbox('ROOM-01'))
+    await user.clear(screen.getByRole('searchbox'))
+    await user.type(screen.getByRole('searchbox'), '10.0.1.')
+    expect(rowNames()).toEqual(['ROOM-02'])
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Show' }), 'offline')
+    await user.click(screen.getByRole('button', { name: 'Reset filters' }))
+    expect(rowNames()).toEqual(['ROOM-01', 'ROOM-02'])
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+  })
+
+  it('does not claim a stale online device was seen now when live updates are disconnected', () => {
+    setup({ devices: [device('a', { hostname: 'ROOM-01', last_seen_at: NOW - 3 * 60_000 })], live: false })
+    expect(within(screen.getByRole('row', { name: /ROOM-01/ })).getByText('3 min ago')).toBeInTheDocument()
+    expect(screen.queryByText('now')).not.toBeInTheDocument()
   })
 
   it('explains how to enroll a device when there are none', () => {
@@ -182,7 +215,8 @@ describe('DeviceList', () => {
 
     it('moves all devices', async () => {
       const { onMove, user } = setup()
-      await user.click(screen.getByRole('button', { name: /^Move all to Wi-Fi/ }))
+      await user.click(screen.getByRole('button', { name: 'All devices' }))
+      await user.click(screen.getByRole('menuitem', { name: /^Move all to Wi-Fi/ }))
       expect(onMove).toHaveBeenCalledWith({ type: 'all' })
     })
   })

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ledger::Ledger;
 use crate::network::Network;
 use crate::platform::{
-    OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, WifiJoinRequest,
+    OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, WifiJoinPolicy, WifiJoinRequest,
 };
 
 /// Longest SSID 802.11 allows, in bytes.
@@ -241,14 +241,23 @@ impl JobManager {
     }
 
     /// Takes a job out of the waiting set and records it as started.
-    /// Returns `None` for a job cancelled while waiting, which is skipped.
+    /// Returns `None` for a cancelled job or one whose start could not be
+    /// persisted. Neither may perform side effects.
     fn begin(&self, job_target_id: &str) -> Option<CancellationToken> {
         let mut inner = self.lock();
         if !inner.waiting.remove(job_target_id) {
             return None;
         }
         // On disk before the job runs, so it can never run twice.
-        inner.ledger.start(job_target_id);
+        if let Err(error) = inner.ledger.start(job_target_id) {
+            tracing::error!(job_target_id, %error, "refusing to run a job without a durable start record");
+            let result = failed(job_target_id, reason::ERROR, Some(format!(
+                "the job was not run because its start could not be saved: {error}; repair the state directory before submitting a new job",
+            )));
+            inner.ledger.record_not_started(result.clone());
+            inner.send(ClientMessage::JobResult(result));
+            return None;
+        }
         inner.send(ClientMessage::JobStarted { job_target_id: job_target_id.to_owned() });
         let cancel = CancellationToken::new();
         inner.running =
@@ -296,8 +305,12 @@ impl JobManager {
 
     /// The running job completes after a restart of the client: it stays
     /// unfinished, and the restart does not make it `interrupted`.
-    pub(crate) fn await_restart(&self, job_target_id: &str) {
-        self.lock().ledger.await_restart(job_target_id);
+    pub(crate) fn await_restart(&self, job_target_id: &str) -> std::io::Result<()> {
+        self.lock().ledger.await_restart(job_target_id)
+    }
+
+    pub(crate) fn persist(&self) -> std::io::Result<()> {
+        self.lock().ledger.persist()
     }
 
     /// The running job is no longer the worker's to finish.
@@ -321,7 +334,8 @@ pub struct WorkerContext {
     /// How long a `wifi.join` waits for a coordinator on the new network.
     pub handoff_timeout: Duration,
     /// How long a `power` job waits for the coordinator to acknowledge its
-    /// result before carrying out the action anyway.
+    /// result before letting the next queued job start. The native power
+    /// call has already succeeded; restart/shutdown may still be scheduled.
     pub power_ack_timeout: Duration,
     pub update: UpdateContext,
 }
@@ -329,6 +343,9 @@ pub struct WorkerContext {
 /// What `client.update` needs.
 #[derive(Clone)]
 pub struct UpdateContext {
+    /// Provisional update confirmation/rollback owns this until it settles.
+    /// A queued second update must not race its marker or backup cleanup.
+    pub lifecycle: Arc<tokio::sync::Mutex<()>>,
     pub client_version: String,
     /// Base64 Ed25519 key that update signatures must verify against; empty
     /// if this build has none, which refuses every update.
@@ -343,8 +360,9 @@ pub struct UpdateContext {
 pub(crate) enum Outcome {
     Finished {
         result: JobResult,
-        /// A power action to carry out once the result is out.
-        then: Option<PowerAction>,
+        /// Let a successful power result reach the coordinator before the
+        /// worker starts another job.
+        wait_for_ack: bool,
     },
     /// `client.update` has replaced the executable: the job is finished by
     /// the next start, and the client has to restart now.
@@ -353,7 +371,7 @@ pub(crate) enum Outcome {
 
 impl From<JobResult> for Outcome {
     fn from(result: JobResult) -> Outcome {
-        Outcome::Finished { result, then: None }
+        Outcome::Finished { result, wait_for_ack: false }
     }
 }
 
@@ -393,10 +411,10 @@ pub async fn run_worker<P: Platform>(
             Err(error) => failed(&id, reason::ERROR, Some(format!("job task failed: {error}"))).into(),
         };
         match outcome {
-            Outcome::Finished { result, then } => {
+            Outcome::Finished { result, wait_for_ack } => {
                 jobs.finish(result);
-                if let Some(action) = then {
-                    carry_out_power(&jobs, platform.as_ref(), &context, &id, action).await;
+                if wait_for_ack {
+                    wait_for_power_result(&jobs, &context, &id).await;
                 }
             }
             Outcome::Restart => {
@@ -417,31 +435,21 @@ pub async fn run_worker<P: Platform>(
     }
 }
 
-/// The second half of a `power` job, after its result has been reported:
-/// wait until the coordinator has stored it (so that the device going away
-/// is not taken for a failure) or the timeout has passed, then act. The
-/// worker waits here, so no other job starts just before the device goes
-/// down.
-async fn carry_out_power<P: Platform>(
+/// The native call has succeeded and its result is durable. Give the
+/// coordinator time to acknowledge it before another job starts. If the
+/// connection is already gone, the ledger replays it after reconnecting.
+async fn wait_for_power_result(
     jobs: &JobManager,
-    platform: &P,
     context: &WorkerContext,
     id: &str,
-    action: PowerAction,
 ) {
     let timeout = context.power_ack_timeout;
     if tokio::time::timeout(timeout, jobs.wait_for_ack(id)).await.is_err() {
         tracing::warn!(
             job_target_id = %id,
-            "power result not acknowledged within {}; carrying out the action anyway",
+            "power result not acknowledged within {}; it will be replayed on reconnect",
             describe(timeout)
         );
-    }
-    tracing::info!(job_target_id = %id, ?action, "carrying out power action");
-    // The job has already been reported as succeeded; all that can be done
-    // with a failure now is to log it.
-    if let Err(error) = platform.power(action).await {
-        tracing::error!(job_target_id = %id, ?action, %error, "power action failed after it was reported");
     }
 }
 
@@ -523,7 +531,7 @@ async fn execute<P: Platform>(
             Err(result) => result,
         },
         job_kind::POWER => match parse::<PowerPayload>(id, payload) {
-            Ok(payload) => return power(&jobs, platform, id, payload.action),
+            Ok(payload) => return power(&jobs, platform, id, payload.action).await,
             Err(result) => result,
         },
         job_kind::CLIENT_UPDATE => match parse(id, payload) {
@@ -636,23 +644,28 @@ async fn apply_setting<P: Platform>(
     }
 }
 
-/// The spec has the device act after acknowledging the job, so the result
-/// is reported first and the action carried out by the worker afterwards.
-/// Whether the platform can do it at all is asked before: once success has
-/// been reported a failure can only be logged.
-fn power<P: Platform>(jobs: &JobManager, platform: &P, id: &str, action: PowerAction) -> Outcome {
+/// Commit before invoking the OS so neither cancellation nor redelivery can
+/// repeat a disruptive action. Only report success after the native call
+/// succeeds: restart/shutdown accept a delayed request, while sleep can stay
+/// running until the device resumes. A process restart in the meantime is
+/// recovered by the ledger as interrupted, never as permission to run again.
+async fn power<P: Platform>(jobs: &JobManager, platform: &P, id: &str, action: PowerAction) -> Outcome {
     if let Err(error) = platform.check_power(action) {
         return platform_failure(id, error).into();
     }
     if !jobs.commit(id) {
         return cancelled(id).into();
     }
+    tracing::info!(job_target_id = %id, ?action, "requesting native power action");
+    if let Err(error) = platform.power(action).await {
+        return platform_failure(id, error).into();
+    }
     let message = match action {
-        PowerAction::Restart => "restarting",
-        PowerAction::Shutdown => "shutting down",
-        PowerAction::Sleep => "going to sleep",
+        PowerAction::Restart => "restart scheduled by Windows",
+        PowerAction::Shutdown => "shutdown scheduled by Windows",
+        PowerAction::Sleep => "sleep request completed",
     };
-    Outcome::Finished { result: succeeded(id, message.into()), then: Some(action) }
+    Outcome::Finished { result: succeeded(id, message.into()), wait_for_ack: true }
 }
 
 fn validate_wifi_join(payload: &WifiJoinPayload) -> Result<(), String> {
@@ -699,6 +712,7 @@ async fn wifi_join<P: Platform>(
         passphrase: payload.password,
         // The operator chose this network for good.
         auto_connect: true,
+        policy: WifiJoinPolicy::Replace,
     };
     let joined = {
         let _wifi = network.wifi_lock().await;
@@ -730,7 +744,7 @@ async fn wifi_join<P: Platform>(
             network.set_override(previous);
             drop(handoff);
             // Searching rejoins the hotspot if it is still there.
-            network.search_now();
+            network.search_now(&ssid);
             failed(
                 id,
                 reason::TIMEOUT,

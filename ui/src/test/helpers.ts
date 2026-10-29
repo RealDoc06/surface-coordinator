@@ -45,6 +45,23 @@ export function apiError(status: number, code: string, message = code): Reply {
   return { status, body: { error: { code, message } } }
 }
 
+/** Job metadata and the independently loaded output of one target. */
+export function jobRead(path: string, jobs: Record<string, Job>): Reply | undefined {
+  const url = new URL(path, 'http://coordinator.test')
+  const route = /^\/jobs\/([^/]+)(?:\/targets\/([^/]+)\/output)?$/.exec(url.pathname)
+  if (!route?.[1]) return undefined
+  const found = jobs[decodeURIComponent(route[1])]
+  if (!found) return undefined
+  if (route[2]) {
+    const target = found.targets.find((t) => t.id === decodeURIComponent(route[2]!))
+    return target ? { body: { output: target.output ?? '', output_truncated: target.output_truncated } } : undefined
+  }
+  const targets = url.searchParams.get('include_output') === 'false'
+    ? found.targets.map(({ output: _output, ...target }) => target)
+    : found.targets
+  return { body: { job: { ...found, targets } } }
+}
+
 export class FakeWebSocket {
   static instances: FakeWebSocket[] = []
 

@@ -21,9 +21,10 @@ use crate::AuthMode;
 pub const SESSION_COOKIE: &str = "sc_session";
 pub const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MIN_PASSWORD_LEN: usize = 10;
-const MAX_PASSWORD_LEN: usize = 1024;
+pub const MAX_PASSWORD_LEN: usize = 1024;
 const MAX_FAILED_LOGINS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(30);
+const MAX_THROTTLED_USERS: usize = 4096;
 
 /// The authenticated caller, available to handlers as a request extension.
 #[derive(Debug, Clone)]
@@ -62,7 +63,7 @@ pub fn valid_username(username: &str) -> bool {
 }
 
 pub fn valid_password(password: &str) -> bool {
-    password.chars().count() >= MIN_PASSWORD_LEN && password.len() <= MAX_PASSWORD_LEN
+    password.len() <= MAX_PASSWORD_LEN && password.chars().count() >= MIN_PASSWORD_LEN
 }
 
 // ---------------------------------------------------------------- sessions
@@ -194,7 +195,13 @@ pub async fn same_origin(request: Request, next: Next) -> Response {
 /// username, further attempts are refused for a while.
 #[derive(Default)]
 pub struct LoginThrottle {
-    entries: Mutex<HashMap<String, Attempts>>,
+    state: Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    entries: HashMap<String, Attempts>,
+    last_pruned: Option<Instant>,
 }
 
 struct Attempts {
@@ -204,27 +211,35 @@ struct Attempts {
 }
 
 impl LoginThrottle {
-    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempts>> {
-        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn state(&self) -> std::sync::MutexGuard<'_, ThrottleState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Whether a login for this username may be attempted now.
     pub fn allowed(&self, username: &str) -> bool {
         let now = Instant::now();
-        let mut entries = self.entries();
-        // Forget stale entries so the table cannot grow without bound.
-        entries.retain(|_, attempts| now.duration_since(attempts.last) < LOCKOUT * 20);
-        match entries.get(&username.to_ascii_lowercase()) {
+        let mut state = self.state();
+        // Bound both the table and pruning work when callers rotate usernames.
+        if state.last_pruned.is_none_or(|last| now.duration_since(last) >= LOCKOUT) {
+            state.entries.retain(|_, attempts| now.duration_since(attempts.last) < LOCKOUT * 20);
+            state.last_pruned = Some(now);
+        }
+        match state.entries.get(&username.to_ascii_lowercase()) {
             Some(Attempts { locked_until: Some(until), .. }) => now >= *until,
-            _ => true,
+            Some(_) => true,
+            None => state.entries.len() < MAX_THROTTLED_USERS,
         }
     }
 
     pub fn record_failure(&self, username: &str) {
         let now = Instant::now();
-        let mut entries = self.entries();
-        let attempts = entries
-            .entry(username.to_ascii_lowercase())
+        let mut state = self.state();
+        let username = username.to_ascii_lowercase();
+        if state.entries.len() >= MAX_THROTTLED_USERS && !state.entries.contains_key(&username) {
+            return;
+        }
+        let attempts = state.entries
+            .entry(username)
             .or_insert(Attempts { failures: 0, locked_until: None, last: now });
         attempts.last = now;
         attempts.failures += 1;
@@ -235,7 +250,7 @@ impl LoginThrottle {
     }
 
     pub fn record_success(&self, username: &str) {
-        self.entries().remove(&username.to_ascii_lowercase());
+        self.state().entries.remove(&username.to_ascii_lowercase());
     }
 }
 
@@ -314,5 +329,43 @@ mod tests {
         assert!(throttle.allowed("bob"));
         throttle.record_success("alice");
         assert!(throttle.allowed("alice"));
+    }
+
+    #[test]
+    fn throttle_bounds_rotating_usernames_and_recovers_stale_capacity() {
+        let throttle = LoginThrottle::default();
+        for index in 0..MAX_THROTTLED_USERS + 1 {
+            throttle.record_failure(&format!("user-{index}"));
+        }
+        assert_eq!(throttle.state().entries.len(), MAX_THROTTLED_USERS);
+        assert!(!throttle.allowed("another-user"));
+        assert!(throttle.allowed("user-0"));
+        {
+            let mut state = throttle.state();
+            for attempts in state.entries.values_mut() {
+                attempts.last = Instant::now() - LOCKOUT * 21;
+            }
+            state.last_pruned = None;
+        }
+        assert!(throttle.allowed("another-user"));
+        assert!(throttle.state().entries.is_empty());
+    }
+
+    #[test]
+    fn a_password_reset_or_account_deletion_wins_over_an_in_flight_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| {
+            let account = store::create_account(conn, "operator", "old-hash")?.unwrap();
+            let expires = store::now_ms() + 60_000;
+            assert!(store::create_account_session(conn, "first", &account.id, "old-hash", expires)?);
+            store::set_account_password(conn, &account.id, "new-hash")?;
+            assert!(store::get_session(conn, "first")?.is_none());
+            assert!(!store::create_account_session(conn, "racing-login", &account.id, "old-hash", expires)?);
+            assert!(store::create_account_session(conn, "new-login", &account.id, "new-hash", expires)?);
+            store::delete_account(conn, &account.id)?;
+            assert!(!store::create_account_session(conn, "deleted-login", &account.id, "new-hash", expires)?);
+            Ok(())
+        }).unwrap();
     }
 }

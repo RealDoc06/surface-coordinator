@@ -96,10 +96,13 @@ jobs:
         with:
           node-version: 24
 
-      - name: Build the web UI
+      - name: Validate and build the web UI
         working-directory: ui
         run: |
           npm ci
+          npm run typecheck
+          npm test
+          node --test ../crates/manager/tests/launcher.test.mjs
           npm run build
           test -f dist/index.html
 
@@ -157,8 +160,20 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Require the repository Windows runtime configuration
+        shell: pwsh
+        run: |
+          foreach ($name in @('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS')) {
+            if (Test-Path -LiteralPath "Env:$name") {
+              throw "$name overrides the repository's static Windows runtime configuration. Remove the override before releasing."
+            }
+          }
+
+      - name: Test the Windows client and coordinator
+        run: cargo test --locked
+
       - name: Build
-        run: cargo build --release -p client -p release-tool
+        run: cargo build --locked --release -p client -p release-tool
 
       - name: Check that the signing secret matches the committed public key
         env:
@@ -221,8 +236,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Test the Linux coordinator and shared code
+        run: cargo test --locked
+
       - name: Build
-        run: cargo build --release -p coordinator
+        run: cargo build --locked --release -p coordinator
 
       - name: Assemble the tarball
         run: |
@@ -276,8 +294,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # The CLI checks every signature it makes against the configured public
-      # key; the committed tauri.conf.json leaves it empty, so supply it here.
+      - name: Require the repository Windows runtime configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($name in @('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS')) {
+            if (Test-Path -LiteralPath "Env:$name") {
+              throw "$name overrides the repository's static Windows runtime configuration. Remove the override before releasing."
+            }
+          }
+
+      - name: Test the manager on this platform
+        run: cargo test --locked -p manager
+
+      # Both the bundled app and the signing tool use the committed public
+      # key. Verify every artifact independently below before publishing.
       - name: Updater public key for the build
         shell: bash
         run: |
@@ -291,12 +322,31 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/manager
-          tauriScript: npx --yes @tauri-apps/cli@2
+          tauriScript: npx --yes @tauri-apps/cli@2.12.1
           releaseId: ${{ needs.prepare.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          args: --config tauri.release.conf.json
+          args: --config tauri.release.conf.json -- --locked
+
+      - name: Verify updater signatures and signed versions
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cargo build --locked -p manager --example verify-update
+          verifier=./target/debug/examples/verify-update
+          if [ "$RUNNER_OS" = "Windows" ]; then verifier="$verifier.exe"; fi
+          found=0
+          while IFS= read -r -d '' signature; do
+            found=1
+            "$verifier" --file "${signature%.sig}" --signature "$signature" \
+              --public-key crates/manager/updater.pub --version "$VERSION"
+          done < <(find target/release/bundle -type f -name '*.sig' -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No signed manager updater artifacts were produced."
+            exit 1
+          fi
 
   publish:
     name: Publish release
@@ -334,7 +384,10 @@ jobs:
           jq -e --arg version "$VERSION" '
             .version == $version
             and (.platforms | has("windows-x86_64") and has("darwin-aarch64") and has("linux-x86_64"))
-            and ([.platforms[].url] | all(contains("/untagged-") | not))
+            and ([.platforms[]] | all(
+              (.signature | type == "string" and length > 0)
+              and (.url | type == "string" and startswith("https://github.com/") and (contains("/untagged-") | not))
+            ))
           ' manifest/latest.json
 
       - name: Publish

@@ -80,6 +80,40 @@ async fn wrong_credentials_are_refused_and_repeated_failures_are_throttled() {
 }
 
 #[tokio::test]
+async fn concurrent_password_work_is_bounded_and_capacity_is_released() {
+    let server = TestServer::start_accounts(USER, PASSWORD).await;
+    let responses = futures_util::future::join_all((0..16).map(|index| {
+        let server = &server;
+        async move { login(server, &format!("unknown-{index}"), PASSWORD).await }
+    })).await;
+    let mut busy = 0;
+    let mut verified = 0;
+    for response in responses {
+        match response.status().as_u16() {
+            401 => verified += 1,
+            429 => {
+                assert_eq!(response.json::<Value>().await.unwrap()["error"]["code"], "auth_busy");
+                busy += 1;
+            }
+            status => panic!("unexpected login response {status}"),
+        }
+    }
+    assert!(busy > 0, "the simultaneous attempts should exceed the password work limit");
+    assert!(verified > 0, "some password work should still complete");
+    assert_eq!(login(&server, USER, PASSWORD).await.status(), 200);
+}
+
+#[tokio::test]
+async fn oversized_login_credentials_are_rejected_without_locking_the_account() {
+    let server = TestServer::start_accounts(USER, PASSWORD).await;
+    for _ in 0..6 {
+        assert_eq!(login(&server, USER, &"x".repeat(1025)).await.status(), 401);
+    }
+    assert_eq!(login(&server, &"x".repeat(65), PASSWORD).await.status(), 401);
+    assert_eq!(login(&server, USER, PASSWORD).await.status(), 200);
+}
+
+#[tokio::test]
 async fn the_bearer_token_means_nothing_in_accounts_mode() {
     let server = TestServer::start_accounts(USER, PASSWORD).await;
     let response =

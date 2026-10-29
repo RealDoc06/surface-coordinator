@@ -1,7 +1,7 @@
 //! Windows implementation of [`Platform`].
 
 use std::ffi::{c_void, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,32 @@ const MAX_SETTING_ERROR_CHARS: usize = 2000;
 /// pipes. Paths are passed in environment variables, so no path character
 /// needs escaping for `cmd`.
 const POWERSHELL_COMMAND_LINE: &str = r#"/d /s /c ""%SC_CHCP%" 65001 >nul & "%SC_POWERSHELL%" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%SC_SCRIPT%"""#;
-const CMD_COMMAND_LINE: &str = r#"/d /s /c ""%SC_CHCP%" 65001 >nul & call "%SC_SCRIPT%"""#;
+// Do not use CALL: its second expansion interprets literal `%...%` in paths.
+// Disable delayed expansion too, so a literal `!` is preserved.
+const CMD_COMMAND_LINE: &str = r#"/d /v:off /s /c ""%SC_CHCP%" 65001 >nul & "%SC_SCRIPT%"""#;
+
+/// CMD cannot open verbatim paths returned by Windows canonicalization.
+/// Convert only disk/UNC prefixes, preserving the complete OS string. This
+/// is an invocation adapter; installation and filesystem paths stay canonical.
+fn cmd_path(path: &Path) -> Result<PathBuf, PlatformError> {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Err(PlatformError::Failed("CMD requires an absolute script path".into()));
+    };
+    let mut converted = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            PathBuf::from(unc)
+        }
+        Prefix::Disk(_) | Prefix::UNC(_, _) if path.is_absolute() => return Ok(path.to_owned()),
+        _ => return Err(PlatformError::Unsupported("CMD cannot use this script path namespace".into())),
+    };
+    converted.push(path.strip_prefix(prefix.as_os_str()).expect("the path starts with its prefix"));
+    Ok(converted)
+}
 
 pub struct WindowsPlatform {
     work_dir: PathBuf,
@@ -245,11 +270,31 @@ impl WindowsPlatform {
             .await
             .map_err(|e| failed("cannot write the script file", e))?;
 
+        let invocation_script = if request.shell == Shell::Cmd {
+            let canonical = tokio::fs::canonicalize(&script)
+                .await
+                .map_err(|e| failed("cannot resolve the script file", e))?;
+            let compatible = cmd_path(&canonical)?;
+            // Removing a verbatim prefix must not redirect names that normal
+            // Win32 paths interpret differently (for example trailing dots).
+            let resolved = tokio::fs::canonicalize(&compatible)
+                .await
+                .map_err(|e| failed("CMD cannot address the script directory", e))?;
+            if resolved != canonical {
+                return Err(PlatformError::Unsupported(
+                    "CMD cannot address this script directory without changing its meaning".into(),
+                ));
+            }
+            compatible
+        } else {
+            script.clone()
+        };
+
         let system32 = system32();
         let mut env = vec![
             ("SC_CHCP", system32.join("chcp.com").into_os_string()),
             ("SC_POWERSHELL", system32.join("WindowsPowerShell\\v1.0\\powershell.exe").into_os_string()),
-            ("SC_SCRIPT", script.clone().into_os_string()),
+            ("SC_SCRIPT", invocation_script.into_os_string()),
         ];
         env.extend(extra_env.iter().cloned());
         let shell = system32.join("cmd.exe");
@@ -409,6 +454,49 @@ impl Platform for WindowsPlatform {
         running_exe()
     }
 
+    async fn validate_update(&self, path: PathBuf, expected_version: String) -> Result<(), PlatformError> {
+        // Only signed candidates reach here. Probe the real executable,
+        // without starting its service or touching its state/network.
+        let mut child = tokio::process::Command::new(&path)
+            .arg("--version")
+            .creation_flags(session::CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| PlatformError::Failed(format!("the signed update cannot start: {error}")))?;
+        let output = child.stdout.take().expect("stdout is piped");
+        let probe = async {
+            let mut bytes = Vec::new();
+            output.take(4097).read_to_end(&mut bytes).await?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((status, bytes))
+        };
+        let probed = tokio::time::timeout(Duration::from_secs(10), probe).await;
+        let (status, bytes) = match probed {
+            Ok(result) => result.map_err(|error| PlatformError::Failed(format!(
+                "checking the signed update failed: {error}"
+            )))?,
+            Err(_) => {
+                // Wait for termination so the rejected download is unlocked
+                // before the caller removes it.
+                let _ = child.kill().await;
+                return Err(PlatformError::Failed(
+                    "the signed update did not answer --version within 10 s".into(),
+                ));
+            }
+        };
+        if !status.success() || bytes.len() > 4096
+            || String::from_utf8_lossy(&bytes).trim() != format!("client {expected_version}")
+        {
+            return Err(PlatformError::Failed(format!(
+                "the signed update did not identify itself as client {expected_version}; the installed client was kept"
+            )));
+        }
+        Ok(())
+    }
+
     async fn swap_executable(&self, new: PathBuf) -> Result<(), PlatformError> {
         exe_operation("replacing the executable", move |exe| executable::swap(exe, &new)).await
     }
@@ -453,7 +541,18 @@ mod tests {
 
     async fn run_with(shell: Shell, body: &str, timeout: Duration, run_as: RunAs) -> Run {
         let work_dir = tempfile::tempdir().unwrap();
-        let platform = WindowsPlatform::new(work_dir.path());
+        run_in(work_dir, shell, body, timeout, run_as).await
+    }
+
+    async fn run_in(
+        work_dir: tempfile::TempDir,
+        shell: Shell,
+        body: &str,
+        timeout: Duration,
+        run_as: RunAs,
+    ) -> Run {
+        // Installed services receive this verbatim form from the installer.
+        let platform = WindowsPlatform::new(work_dir.path().canonicalize().unwrap());
         let (sender, mut receiver) = mpsc::channel(16);
         let request = ScriptRequest { shell, body: body.to_owned(), timeout, run_as };
         let collect = async {
@@ -559,6 +658,44 @@ mod tests {
         let run = super::tests::run(Shell::Cmd, "@echo grüße ✓").await;
         assert_eq!(run.outcome, Ok(ScriptOutcome::Exited(0)));
         assert_eq!(run.stdout, "grüße ✓\r\n");
+    }
+
+    #[tokio::test]
+    async fn cmd_canonical_paths_preserve_literal_shell_characters_in_both_scopes() {
+        for run_as in [RunAs::System, RunAs::User] {
+            let directory = tempfile::Builder::new()
+                .prefix("cmd %PATH% &()!^ café ")
+                .tempdir()
+                .unwrap();
+            let run = run_in(
+                directory,
+                Shell::Cmd,
+                "@echo off\necho canonical-cmd-ok\necho diagnostic 1>&2\nexit /b 7",
+                Duration::from_secs(60),
+                run_as,
+            ).await;
+            assert_eq!(run.outcome, Ok(ScriptOutcome::Exited(7)), "{run_as:?}: {}", run.stderr);
+            assert_eq!(run.stdout, "canonical-cmd-ok\r\n");
+            assert_eq!(run.stderr.trim_end(), "diagnostic");
+            assert_eq!(std::fs::read_dir(run.work_dir.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn cmd_path_preserves_disk_unc_and_long_paths_without_reinterpreting_other_namespaces() {
+        for (source, expected) in [
+            (r"\\?\C:\state\scripts\job.cmd", r"C:\state\scripts\job.cmd"),
+            (r"\\?\UNC\server\share\space & %PATH%!\job.cmd", r"\\server\share\space & %PATH%!\job.cmd"),
+            (r"C:\state\job.cmd", r"C:\state\job.cmd"),
+            (r"\\server\share\job.cmd", r"\\server\share\job.cmd"),
+        ] {
+            assert_eq!(cmd_path(Path::new(source)).unwrap(), Path::new(expected));
+        }
+        let long = format!(r"C:\{}\job.cmd", "directory\\".repeat(40));
+        assert_eq!(cmd_path(Path::new(&format!(r"\\?\{long}"))).unwrap(), PathBuf::from(long));
+        for invalid in [r"relative\job.cmd", r"C:job.cmd", r"\\.\pipe\job", r"\\?\GLOBALROOT\Device\job"] {
+            assert!(cmd_path(Path::new(invalid)).is_err(), "{invalid}");
+        }
     }
 
     #[tokio::test]
@@ -782,6 +919,7 @@ mod tests {
     /// exactly. Volume and mute in one test so that two tests never change
     /// them at the same time.
     #[tokio::test]
+    #[ignore = "changes the real machine's volume and mute; run explicitly on a test device"]
     async fn audio_volume_and_mute_are_applied_and_then_restored() {
         let work_dir = tempfile::tempdir().unwrap();
         let platform = WindowsPlatform::new(work_dir.path());
@@ -846,6 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "scans real Wi-Fi and requires Windows Location access; run explicitly on a test device"]
     async fn wifi_scan_answers_on_this_machine() {
         let platform = WindowsPlatform::new(std::env::temp_dir());
         match platform.wifi_scan().await {

@@ -1,6 +1,7 @@
 //! Live events for the UI.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -17,10 +18,17 @@ use crate::store::{Device, Job, JobTarget, Rejected};
 
 /// Events a slow consumer may fall behind by before it is told to resync.
 pub const EVENT_BUFFER: usize = 1024;
+const AUTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Event {
+    /// Sent per socket so an idle UI can detect a silent network failure.
+    #[serde(rename = "heartbeat")]
+    Heartbeat,
     #[serde(rename = "device.updated")]
     DeviceUpdated { device: Device },
     #[serde(rename = "device.removed")]
@@ -59,32 +67,71 @@ pub async fn upgrade(
     }
     // Subscribe before the upgrade completes so nothing is missed in between.
     let events = state.events.subscribe();
-    ws.on_upgrade(move |socket| async move {
+    let auth_changes = state.auth_changes.subscribe();
+    // The UI sends only control frames, so it never needs large incoming messages.
+    ws.max_message_size(1024).max_frame_size(1024).on_upgrade(move |socket| async move {
         let tracker = state.tasks.clone();
-        let _ = tracker.track_future(forward(state, socket, events)).await;
+        let _ = tracker.track_future(forward(state, socket, events, headers, auth_changes)).await;
     })
 }
 
-/// The next event for a consumer. One that fell so far behind that events
-/// were dropped gets `resync` in their place.
-async fn next_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> Option<Event> {
-    match events.recv().await {
+/// The next event or an idle heartbeat. A consumer that fell behind gets
+/// `resync` in place of dropped events.
+async fn next_event(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    heartbeat: &mut tokio::time::Interval,
+) -> Option<Event> {
+    let received = tokio::select! {
+        biased;
+        received = events.recv() => received,
+        _ = heartbeat.tick() => return Some(Event::Heartbeat),
+    };
+    match received {
         Ok(event) => Some(event),
         Err(RecvError::Lagged(_)) => Some(Event::Resync),
         Err(RecvError::Closed) => None,
     }
 }
 
+fn heartbeat_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
 async fn forward(
     state: Arc<AppState>,
     socket: WebSocket,
     mut events: tokio::sync::broadcast::Receiver<Event>,
+    headers: HeaderMap,
+    mut auth_changes: tokio::sync::watch::Receiver<()>,
 ) {
     let (mut sink, mut stream) = socket.split();
+    // The first tick also closes the race between HTTP authentication and upgrade.
+    let mut auth_check = tokio::time::interval(AUTH_CHECK_INTERVAL);
+    auth_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = heartbeat_interval();
     loop {
         let event = tokio::select! {
+            biased;
             _ = state.shutdown.cancelled() => break,
-            received = next_event(&mut events) => match received {
+            _ = auth_changes.changed() => {
+                if !session_is_current(&state, &headers).await {
+                    break;
+                }
+                continue;
+            },
+            _ = auth_check.tick() => {
+                // Periodic checks cover expiry and revocation by the local admin CLI.
+                if !session_is_current(&state, &headers).await {
+                    break;
+                }
+                continue;
+            },
+            received = next_event(&mut events, &mut heartbeat) => match received {
                 Some(event) => event,
                 None => break,
             },
@@ -95,11 +142,24 @@ async fn forward(
             },
         };
         let json = serde_json::to_string(&event).expect("events always serialise");
-        if sink.send(Message::Text(json.into())).await.is_err() {
+        let sent = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            sent = tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Text(json.into()))) => sent,
+        };
+        if !matches!(sent, Ok(Ok(()))) {
             break;
         }
     }
-    let _ = sink.close().await;
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.close()).await;
+}
+
+async fn session_is_current(state: &AppState, headers: &HeaderMap) -> bool {
+    tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => false,
+        identity = auth::identify(state, headers) => matches!(identity, Ok(Some(_))),
+    }
 }
 
 #[cfg(test)]
@@ -121,18 +181,59 @@ mod tests {
     #[tokio::test]
     async fn a_consumer_that_falls_behind_is_told_to_resync_and_then_continues() {
         let (sender, mut receiver) = tokio::sync::broadcast::channel(2);
+        let mut heartbeat = heartbeat_interval();
         for id in ["a", "b", "c", "d"] {
             sender.send(removed(id)).unwrap();
         }
         // "a" and "b" were dropped: the consumer learns that first, then
         // gets what is still buffered and whatever follows.
-        assert_eq!(id_of(next_event(&mut receiver).await), "resync");
-        assert_eq!(id_of(next_event(&mut receiver).await), "c");
-        assert_eq!(id_of(next_event(&mut receiver).await), "d");
+        assert_eq!(id_of(next_event(&mut receiver, &mut heartbeat).await), "resync");
+        assert_eq!(id_of(next_event(&mut receiver, &mut heartbeat).await), "c");
+        assert_eq!(id_of(next_event(&mut receiver, &mut heartbeat).await), "d");
         sender.send(removed("e")).unwrap();
-        assert_eq!(id_of(next_event(&mut receiver).await), "e");
+        assert_eq!(id_of(next_event(&mut receiver, &mut heartbeat).await), "e");
         drop(sender);
-        assert!(next_event(&mut receiver).await.is_none());
+        assert!(next_event(&mut receiver, &mut heartbeat).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_socket_gets_regular_heartbeats_without_broadcasting_them() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(2);
+        let mut other_socket = sender.subscribe();
+        let mut heartbeat = heartbeat_interval();
+        let started = tokio::time::Instant::now();
+        for beat in 1..=3 {
+            let event = next_event(&mut receiver, &mut heartbeat).await.unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), serde_json::json!({"type": "heartbeat"}));
+            assert_eq!(started.elapsed(), HEARTBEAT_INTERVAL * beat);
+            assert!(matches!(other_socket.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+        }
+        sender.send(removed("a")).unwrap();
+        assert_eq!(id_of(next_event(&mut receiver, &mut heartbeat).await), "a");
+        assert_eq!(started.elapsed(), HEARTBEAT_INTERVAL * 3);
+        drop(sender);
+        assert!(next_event(&mut receiver, &mut heartbeat).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revalidation_rejects_an_expired_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::Config::new(
+            "127.0.0.1:0".parse().unwrap(), dir.path(), crate::AuthMode::Token("fixture-token".into()),
+        );
+        config.updates.enabled = false;
+        let store = crate::store::Store::open(dir.path()).unwrap();
+        let updates = crate::updates::UpdateState::new(&config, None, false).unwrap();
+        let state = AppState::new(config, store, updates);
+        let (token, hash) = auth::new_session_token();
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", format!("{}={token}", auth::SESSION_COOKIE).parse().unwrap());
+        state.store.call(move |conn| {
+            crate::store::create_session(conn, &hash, None, crate::store::now_ms() + 60_000)
+        }).await.unwrap();
+        assert!(session_is_current(&state, &headers).await);
+        state.store.call(|conn| conn.execute("UPDATE sessions SET expires = 0", [])).await.unwrap();
+        assert!(!session_is_current(&state, &headers).await);
     }
 
     #[test]

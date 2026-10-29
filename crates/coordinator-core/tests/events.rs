@@ -36,6 +36,20 @@ impl Events {
         connect(server, None, Some(API_TOKEN)).await.expect("events socket opens")
     }
 
+    async fn with_cookie(server: &TestServer, cookie: &str) -> Self {
+        let mut request = format!("ws://{}/api/v1/events", server.addr).into_client_request().unwrap();
+        request.headers_mut().insert("Cookie", cookie.parse().unwrap());
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        Self { socket }
+    }
+
+    async fn assert_closed(&mut self) {
+        let message = tokio::time::timeout(WAIT, self.socket.next())
+            .await
+            .expect("revoked event stream remained open");
+        assert!(matches!(message, Some(Ok(Message::Close(_))) | Some(Err(_)) | None), "{message:?}");
+    }
+
     async fn next(&mut self) -> Value {
         loop {
             let message = tokio::time::timeout(WAIT, self.socket.next())
@@ -72,6 +86,70 @@ async fn the_event_stream_requires_authentication_and_the_same_origin() {
     assert_eq!(connect(&server, Some("https://evil.example"), Some(API_TOKEN)).await.err(), Some(403));
     let own_origin = format!("http://{}", server.addr);
     assert!(connect(&server, Some(&own_origin), Some(API_TOKEN)).await.is_ok());
+}
+
+#[tokio::test]
+async fn logging_out_closes_the_existing_cookie_event_socket() {
+    let server = TestServer::start().await;
+    let response = server.http.post(server.url("/api/v1/auth/token"))
+        .json(&json!({"token": API_TOKEN})).send().await.unwrap();
+    assert_eq!(response.status(), 204);
+    let cookie = response.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let mut events = Events::with_cookie(&server, cookie).await;
+    assert_eq!(server.http.post(server.url("/api/v1/auth/logout")).send().await.unwrap().status(), 204);
+    events.assert_closed().await;
+}
+
+#[tokio::test]
+async fn resetting_a_password_and_deleting_an_account_close_its_event_sockets() {
+    let server = TestServer::start_accounts("admin", "admin-password").await;
+    let response = server.http.post(server.url("/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "admin-password"})).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let cookie = response.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+    let mut admin_events = Events::with_cookie(&server, cookie).await;
+    let (status, created) = server.post("/api/v1/accounts", json!({
+        "username": "operator", "password": "operator-password",
+    })).await;
+    assert_eq!(status, 201);
+    let id = created["account"]["id"].as_str().unwrap();
+    let other = TestServer::client();
+    for password in ["operator-password", "updated-password"] {
+        let response = other.post(server.url("/api/v1/auth/login"))
+            .json(&json!({"username": "operator", "password": password})).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let cookie = response.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap();
+        let mut events = Events::with_cookie(&server, cookie).await;
+        if password == "operator-password" {
+            let (status, _) = server.post(&format!("/api/v1/accounts/{id}/password"), json!({
+                "password": "updated-password",
+            })).await;
+            assert_eq!(status, 204);
+        } else {
+            assert_eq!(server.delete(&format!("/api/v1/accounts/{id}")).await.0, 204);
+        }
+        events.assert_closed().await;
+    }
+    server.create_group("Still authenticated").await;
+    assert_eq!(admin_events.next_of("groups.changed").await, json!({"type": "groups.changed"}));
+}
+
+#[tokio::test]
+async fn stopping_does_not_wait_for_an_event_consumer_that_never_reads() {
+    let mut server = TestServer::start().await;
+    let key = server.new_key();
+    FakeClient::connect(&server, &key, "offline-device").await.disconnect().await;
+    let _events = Events::open(&server).await;
+    // More than a socket's send buffer, with the browser deliberately not reading.
+    let script = "x".repeat(1024 * 1024);
+    for _ in 0..16 {
+        let (status, body) = server.create_job("script.run", json!({
+            "shell": "powershell", "body": script,
+        }), json!({"type": "all"})).await;
+        assert_eq!(status, 201, "{body}");
+    }
+    tokio::time::timeout(Duration::from_secs(3), server.stop())
+        .await.expect("slow event consumer blocked coordinator shutdown");
 }
 
 #[tokio::test]
@@ -240,7 +318,7 @@ async fn the_wifi_password_is_masked_in_job_events() {
 }
 
 #[tokio::test]
-async fn a_presumed_handoff_is_announced() {
+async fn an_unconfirmed_handoff_is_announced() {
     let server = TestServer::start_with(|c| c.handoff_grace = Duration::from_millis(200)).await;
     let key = server.new_key();
     let mut client = FakeClient::connect(&server, &key, "device-a").await;
@@ -265,14 +343,15 @@ async fn a_presumed_handoff_is_announced() {
     client.disconnect().await;
     let event = loop {
         let event = events.next_of("job.target.updated").await;
-        if event["target"]["state"] == "succeeded" {
+        if event["target"]["reason"] == "handoff_unconfirmed" {
             break event;
         }
     };
     assert_eq!(event["job_id"], body["job"]["id"]);
     assert_eq!(event["target"]["id"], target_id.as_str());
     assert!(event["target"]["exit_code"].is_null());
-    assert!(event["target"]["message"].as_str().unwrap().contains("presumed to have joined"));
+    assert_eq!(event["target"]["state"], "failed");
+    assert_eq!(event["target"]["reason"], "handoff_unconfirmed");
 }
 
 #[tokio::test]

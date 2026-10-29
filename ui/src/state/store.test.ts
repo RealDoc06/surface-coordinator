@@ -31,15 +31,16 @@ function rejected(id: number): Rejected {
   return { id, at: id * 1000, peer: '10.0.0.9:5000', device_id: null, hostname: null, key_id: null, reason: 'unknown key' }
 }
 
-/** A job detail that has been requested and loaded, as the job page does. */
+/** Metadata for a job and output for its first selected target. */
 function withLoadedJob(stored: Record<string, string>): State {
   const targets = Object.entries(stored).map(([id, text], i) =>
     target(id, `d${i + 1}`, { state: 'running', output: text }),
   )
   return run(
     initialState,
-    { type: 'job.detail.requested', jobId: 'j1' },
     { type: 'job.detail.loaded', job: job('j1', targets) },
+    { type: 'job.output.requested', jobId: 'j1', targetId: targets[0]!.id },
+    { type: 'job.output.loaded', jobId: 'j1', targetId: targets[0]!.id, output: targets[0]!.output ?? '', truncated: false },
   )
 }
 
@@ -54,13 +55,23 @@ describe('job output', () => {
     expect(state.outputs.t1).toEqual({ text: storedOnServer, truncated: false })
   })
 
-  it('keeps the outputs of different targets apart', () => {
+  it('ignores non-selected streams and discards the previous output on selection', () => {
     let state = withLoadedJob({ t1: '', t2: '' })
     state = applyEvent(state, output('t1', 'a1 '))
     state = applyEvent(state, output('t2', 'b1 '))
     state = applyEvent(state, output('t1', 'a2'))
     expect(state.outputs.t1?.text).toBe('a1 a2')
-    expect(state.outputs.t2?.text).toBe('b1 ')
+    expect(state.outputs.t2).toBeUndefined()
+    state = reducer(state, { type: 'job.output.requested', jobId: 'j1', targetId: 't2' })
+    expect(state.outputs).toEqual({})
+    const waiting = state
+    state = applyEvent(state, output('t1', 'ignored'))
+    expect(state).toBe(waiting)
+    state = run(state,
+      { type: 'event', event: outputAt('t2', 3, 'b2') },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't2', output: 'b1 ', truncated: false },
+    )
+    expect(state.outputs).toEqual({ t2: { text: 'b1 b2', truncated: false } })
   })
 
   it('records truncation, including the marker carried in data', () => {
@@ -69,11 +80,11 @@ describe('job output', () => {
     expect(state.outputs.t1).toEqual({ text: 'x\n[output truncated]\n', truncated: true })
   })
 
-  it('takes output_truncated from the loaded job', () => {
+  it('takes truncation from the output snapshot', () => {
     const state = run(
       initialState,
-      { type: 'job.detail.requested', jobId: 'j1' },
-      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: 'x', output_truncated: true })]) },
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: 'x', truncated: true },
     )
     expect(state.outputs.t1?.truncated).toBe(true)
   })
@@ -92,10 +103,10 @@ describe('job output', () => {
     // The response was produced after "one " was stored but before "two".
     const state = run(
       initialState,
-      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
       { type: 'event', event: output('t1', 'one ') },
       { type: 'event', event: output('t1', 'two') },
-      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: 'zero one ' })]) },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: 'zero one ', truncated: false },
     )
     expect(state.outputs.t1?.text).toBe('zero one two')
     expect(state.pendingOutput).toEqual({})
@@ -106,9 +117,9 @@ describe('job output', () => {
     state = applyEvent(state, output('t1', 'b'))
     state = run(
       state,
-      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
       { type: 'event', event: output('t1', 'c') },
-      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: 'abc' })]) },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: 'abc', truncated: false },
       { type: 'event', event: output('t1', 'd') },
     )
     expect(state.outputs.t1?.text).toBe('abcd')
@@ -119,6 +130,19 @@ describe('job output', () => {
     state = reducer(state, { type: 'job.detail.released', jobId: 'j1' })
     expect(state.outputs).toEqual({})
     expect(applyEvent(state, output('t1', 'more')).outputs).toEqual({})
+  })
+
+  it('keeps selected events across metadata reads and rejects an output response after leaving', () => {
+    let state = run(initialState,
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
+      { type: 'event', event: outputAt('t1', 1, 'b') },
+      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1'), target('t2', 'd2')]) },
+    )
+    expect(state.outputs).toEqual({})
+    expect(state.pendingOutput.j1?.events).toHaveLength(1)
+    state = reducer(state, { type: 'job.detail.released', jobId: 'j1' })
+    expect(state.pendingOutput).toEqual({})
+    expect(reducer(state, { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: 'a', truncated: false })).toBe(state)
   })
 })
 
@@ -174,9 +198,9 @@ describe('job output offsets', () => {
     // new and has the same content; matching by content would drop it.
     const state = run(
       initialState,
-      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
       { type: 'event', event: outputAt('t1', 1, 'a') },
-      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: 'a' })]) },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: 'a', truncated: false },
     )
     expect(state.outputs.t1?.text).toBe('aa')
   })
@@ -185,11 +209,11 @@ describe('job output offsets', () => {
     const stored = '😀😀b' // 3 code points
     const state = run(
       initialState,
-      { type: 'job.detail.requested', jobId: 'j1' },
+      { type: 'job.output.requested', jobId: 'j1', targetId: 't1' },
       { type: 'event', event: outputAt('t1', 1, '😀b') }, // included
       { type: 'event', event: outputAt('t1', 3, 'c') }, // new
       { type: 'event', event: outputAt('t1', 4, 'd') }, // new
-      { type: 'job.detail.loaded', job: job('j1', [target('t1', 'd1', { output: stored })]) },
+      { type: 'job.output.loaded', jobId: 'j1', targetId: 't1', output: stored, truncated: false },
       { type: 'event', event: outputAt('t1', 5, 'e') },
     )
     expect(state.outputs.t1?.text).toBe(stored + 'cde')
@@ -296,9 +320,10 @@ describe('events', () => {
     expect(state.jobs.j1?.targets[1]?.exit_code).toBe(3)
   })
 
-  it('ignores target updates for jobs it has not loaded', () => {
+  it('invalidates rollout state for unknown jobs without filling the job cache', () => {
     const state = applyEvent(initialState, { type: 'job.target.updated', job_id: 'old', target: target('t', 'a') })
-    expect(state).toBe(initialState)
+    expect(state.jobs).toBe(initialState.jobs)
+    expect(state.updatesEpoch).toBe(initialState.updatesEpoch + 1)
   })
 
   it('keeps the recent jobs of a viewed device up to date', () => {

@@ -41,7 +41,9 @@ it has to match `Host`, otherwise `403 cross_origin`.
 Failed logins are throttled per username only, not per address, and the
 username is compared ignoring ASCII case. After 5 consecutive failures for a
 username, further logins for it get `429 too_many_attempts` for 30 seconds.
-A successful login clears the count.
+A successful login clears the count. Password hashing and verification are
+limited to two concurrent operations; overload returns `429 auth_busy` so
+credential work cannot stall device traffic. The throttle table is bounded.
 
 | Route | Auth | Request | Response |
 |---|---|---|---|
@@ -154,7 +156,8 @@ groups and devices.
 |---|---|---|
 | `POST /jobs` | CreateJob | `201 {job: Job}` (targets without output); `400 unsupported_kind`, `invalid_payload`, `unknown_device`, `unknown_group`, `no_targets` |
 | `GET /jobs?limit=50&before=<created_at>` | | `{jobs: Job[]}` newest first, targets without `output`; `limit` 1 to 200 (default 50); `before` returns only jobs created earlier than that time |
-| `GET /jobs/{id}` | | `{job: Job}` targets with `output`; `404` |
+| `GET /jobs/{id}` | Optional `?include_output=false` | `{job: Job}`; includes target `output` by default, omits it when false; `404` |
+| `GET /jobs/{job_id}/targets/{target_id}/output` | | `{output: string, output_truncated: boolean}` for one target; `404` for a missing job/target or a target belonging to another job |
 | `POST /jobs/{id}/cancel` | | `200 {job: Job}` (targets without output); `404` |
 
 ```ts
@@ -197,7 +200,7 @@ type Target = {
   exit_code: number | null
   reason: string | null          // see Failure reasons
   message: string | null
-  output?: string                // stdout and stderr interleaved; absent in listings
+  output?: string                // stdout and stderr interleaved; absent in listings and metadata-only reads
   output_truncated: boolean
   created_at: number
   started_at: number | null
@@ -226,7 +229,10 @@ A target is `queued` until its device is online and the job is sent
   most 1024 characters each. NUL characters are refused.
 - `setting.apply`: `setting` must be a catalogue id and `value` must satisfy
   its type (see Settings catalogue).
-- `power`: `action` is `restart`, `shutdown` or `sleep`.
+- `power`: `action` is `restart`, `shutdown` or `sleep`. Native Windows errors
+  produce a failed result. Restart/shutdown success means Windows accepted a
+  five-second scheduled action; sleep stays running until resume. A client
+  restart before the native call returns reports `interrupted` without repeating it.
 - `client.update`: see Updates.
 
 All violations are `400 invalid_payload`. An unknown `kind` is
@@ -235,6 +241,12 @@ targets as `failed` with reason `unsupported`.
 
 Output is capped at 1 MiB per target. Beyond that it is cut and ends with
 the marker `[output truncated]`, and `output_truncated` is true.
+
+For large jobs, fetch metadata with `include_output=false`, then load only the
+selected target's output. Combine that snapshot with the offset-bearing
+`job.output` events below, discarding overlapping data and refreshing the
+selected snapshot after reconnect. This avoids downloading every device's
+output to display a single pane. The UI uses this approach.
 
 ### Failure reasons
 
@@ -259,12 +271,13 @@ A failed target's `reason` is one of:
 ### Wi-Fi handoff
 
 A `wifi.join` target that is still `running` after its device has been
-offline for the grace period (two minutes by default) becomes `succeeded`
-with `reason: null` and a `message` saying the device left and did not return
-(it is presumed to have joined the network and may now be reporting to
-another coordinator). The presumption is not applied until the coordinator
-itself has been running for the grace period, so a coordinator that has just
-started gives devices a full period to reconnect.
+offline for the grace period (two minutes by default) becomes `failed`
+with `reason: "handoff_unconfirmed"`. The source has no proof of a successful
+connection to a different coordinator; the operator should check the
+destination. A later authenticated result can replace this unconfirmed outcome
+without re-running the join. This rule is not applied until the coordinator
+itself has been running for the grace period, so a newly started coordinator
+gives devices a full period to reconnect.
 
 ### Cancel
 
@@ -274,13 +287,17 @@ finished ones untouched. Each change is announced with `job.target.updated`.
 - `queued` targets become `failed` with reason `cancelled` at once.
 - For `sent` and `running` targets the device is told to stop
   (`job.cancel`). The target becomes `failed`/`cancelled` when the device
-  confirms, or at once if the device is offline.
+  confirms, or at once if the device is offline. In-flight power targets stay
+  unresolved until the client responds, since it may already be asleep or committed
+  to a disruptive action. The cancellation request is
+  persisted before delivery and survives coordinator restart and reconnect;
+  a target awaiting cancellation is not dispatched again.
 - A device can only stop a job before its point of no return. After it, the
   cancel is ignored and the target ends with the job's own result, which may
   be `succeeded`. The point differs by kind: a script can be stopped at any
   time, along with its process tree; `app.launch` and `setting.apply` cannot
   be stopped once the process is started or the change begins; `power` cannot
-  be stopped once the device has reported success; `wifi.join` cannot be
+  be stopped once the client commits to calling Windows; `wifi.join` cannot be
   stopped once the device has joined the network.
 - A device that never received the job (its message was lost) reports the
   target as cancelled all the same, and will not run the job if it arrives
@@ -586,14 +603,34 @@ themselves, and `stop` only forgets the recorded key. With
 enrolled with the key find the SSID, join it and connect to the embedded
 coordinator on `client_port`.
 
+## Manager Wi-Fi shortcut
+
+These authenticated routes exist only in the embedded Manager coordinator.
+
+| Route | Request | Response |
+|---|---|---|
+| `GET /manager/wifi` | | Current SSID, availability, security type, destination coordinator URL and any route warning; never the password |
+| `POST /manager/wifi/move` | `{targets, expected_ssid, expected_coordinator_url}` | A normal `wifi.join` job response; `409 wifi_changed` if the network or destination differs from the reviewed values; `409 wifi_unavailable` if Windows cannot provide the network; `422` if confirmation fields are missing |
+
+`targets` uses the normal job target specification. Copy the two expected values
+from `GET /manager/wifi` and show them to the operator before submission. On
+`wifi_changed`, fetch them again and require a new confirmation. The Manager
+reads the saved password locally and submits the job only for that reviewed
+SSID and coordinator URL. Older clients that omit these fields fail closed.
+
 ## Live events
 
 `GET /events` upgrades to a WebSocket (same cookie; cross-origin upgrades are
 refused with `403 cross_origin`). The server sends JSON text messages; the
-client sends nothing.
+client sends nothing. Idle sockets receive a `heartbeat` every 10 seconds. The
+UI reconnects after 35 seconds without a valid message and checks freshness
+when a suspended tab becomes visible. Heartbeats do not change application state.
+Logout, password reset and account removal invalidate existing event streams;
+expiry and revocation through the CLI are rechecked within 30 seconds.
 
 ```ts
 type Event =
+  | { type: 'heartbeat' }                                 // connection liveness only
   | { type: 'device.updated'; device: Device }              // new, online/offline, changed
   | { type: 'device.removed'; device_id: string }
   | { type: 'job.created'; job: Job }                       // targets without output

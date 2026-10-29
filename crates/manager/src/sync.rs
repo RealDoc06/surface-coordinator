@@ -6,7 +6,7 @@
 //! API to the other in memory: they are never logged or written anywhere
 //! but the local coordinator's database.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::header::COOKIE;
@@ -32,6 +32,7 @@ pub struct SyncReport {
     pub imported: usize,
     pub already_present: usize,
     pub skipped_revoked: usize,
+    pub revoked: usize,
 }
 
 /// Why keys were not copied. The messages are shown in the launcher as they
@@ -70,7 +71,8 @@ struct Secret {
 /// Copies the active keys of the online coordinator at `remote_origin`,
 /// signed in with the session cookie value `remote_cookie`, into the local
 /// coordinator at `local_origin` through its own API. Keys the local one
-/// already has are left as they are, and their secrets are not fetched.
+/// already has do not need their secrets fetched again. Remote revocations
+/// are applied locally too, so an old cached key cannot keep enrolling devices.
 pub async fn pull_keys(
     remote_origin: &str,
     remote_cookie: &str,
@@ -80,6 +82,7 @@ pub async fn pull_keys(
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| SyncError::Local(error.to_string()))?;
     let session = format!("{SESSION_COOKIE}={remote_cookie}");
@@ -87,20 +90,30 @@ pub async fn pull_keys(
     let local_keys = format!("{local_origin}/api/v1/enrollment-keys");
 
     let online: KeyList = remote_json(remote("/enrollment-keys")).await?;
-    let present: HashSet<String> = local_json::<KeyList>(http.get(&local_keys).bearer_auth(local_token))
+    let present: HashMap<String, Option<i64>> = local_json::<KeyList>(http.get(&local_keys).bearer_auth(local_token))
         .await?
         .keys
         .into_iter()
-        .map(|key| key.id)
+        .map(|key| (key.id, key.revoked_at))
         .collect();
 
     let mut report = SyncReport::default();
     for key in online.keys {
         if key.revoked_at.is_some() {
+            if present.get(&key.id) == Some(&None) {
+                let response = send_local(
+                    http.post(format!("{local_keys}/{}/revoke", key.id)).bearer_auth(local_token),
+                )
+                .await?;
+                if response.status() != StatusCode::NO_CONTENT {
+                    return Err(SyncError::Local(response.status().to_string()));
+                }
+                report.revoked += 1;
+            }
             report.skipped_revoked += 1;
             continue;
         }
-        if present.contains(&key.id) {
+        if present.contains_key(&key.id) {
             report.already_present += 1;
             continue;
         }

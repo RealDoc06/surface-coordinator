@@ -208,6 +208,119 @@ async fn a_target_cancelled_while_its_device_was_offline_is_stopped_on_the_devic
 }
 
 #[tokio::test]
+async fn offline_power_cancellation_waits_for_the_native_result_for_sent_and_running_targets() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    for action in ["sleep", "restart", "shutdown"] {
+        for started in [false, true] {
+            let mut client = FakeClient::connect(&server, &key, "device-a").await;
+            let (status, body) = server.create_job("power", json!({"action": action}), one_device("device-a")).await;
+            assert_eq!(status, 201, "{body}");
+            let job_id = body["job"]["id"].as_str().unwrap();
+            let (target_id, ..) = client.expect_job().await;
+            let expected_state = if started { "running" } else { "sent" };
+            if started { client.started(&target_id).await; }
+            server.wait_for_target_state(job_id, expected_state).await;
+            client.disconnect().await;
+            assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+
+            let (status, cancelled) = server.cancel(job_id).await;
+            assert_eq!(status, 200, "{cancelled}");
+            assert_eq!(cancelled["job"]["targets"][0]["state"], expected_state);
+            assert!(cancelled["job"]["targets"][0]["finished_at"].is_null());
+
+            let mut client = FakeClient::connect(&server, &key, "device-a").await;
+            assert_eq!(client.expect_cancel().await, target_id);
+            assert!(client.try_recv(Duration::from_millis(50)).await.is_none(), "power job was redelivered");
+            if started {
+                client.result(&target_id, 0).await;
+            } else {
+                client.send(protocol::ClientMessage::JobResult(protocol::JobResult {
+                    job_target_id: target_id.clone(), status: protocol::JobStatus::Failed,
+                    exit_code: None, reason: Some(protocol::reason::UNSUPPORTED.into()),
+                    message: Some("native power operation failed".into()),
+                })).await;
+            }
+            client.expect_result_ack(&target_id).await;
+            let target = server.single_target(job_id).await;
+            assert_eq!(target["state"], if started { "succeeded" } else { "failed" });
+            if !started {
+                assert_eq!(target["reason"], "unsupported");
+                assert_eq!(target["message"], "native power operation failed");
+            }
+            client.disconnect().await;
+            assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_power_cancellation_survives_disconnect_and_restart_until_the_client_settles_it() {
+    for native_failed in [false, true] {
+        let mut server = TestServer::start().await;
+        let key = server.new_key();
+        let mut client = FakeClient::connect(&server, &key, "device-a").await;
+        let (status, body) = server.create_job("power", json!({"action": "sleep"}), one_device("device-a")).await;
+        assert_eq!(status, 201, "{body}");
+        let job_id = body["job"]["id"].as_str().unwrap();
+        let (target_id, ..) = client.expect_job().await;
+        client.started(&target_id).await;
+        server.wait_for_target_state(job_id, "running").await;
+        assert_eq!(server.cancel(job_id).await.0, 200);
+        assert_eq!(client.expect_cancel().await, target_id);
+        client.disconnect().await;
+        assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+        assert_eq!(server.single_target(job_id).await["state"], "running");
+        server.restart().await;
+        assert_eq!(server.single_target(job_id).await["state"], "running");
+
+        // Unresolved power cancellations must replay even after the normal
+        // one-day retention window for terminal cancellations has passed.
+        let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+        db.execute("UPDATE job_targets SET cancel_requested = 1 WHERE id = ?1", [&target_id]).unwrap();
+        drop(db);
+        let mut client = FakeClient::connect(&server, &key, "device-a").await;
+        assert_eq!(client.expect_cancel().await, target_id);
+        assert!(client.try_recv(Duration::from_millis(50)).await.is_none(), "power job was redelivered");
+        if native_failed {
+            client.send(protocol::ClientMessage::JobResult(protocol::JobResult {
+                job_target_id: target_id.clone(), status: protocol::JobStatus::Failed,
+                exit_code: None, reason: Some(protocol::reason::UNSUPPORTED.into()),
+                message: Some("native sleep failed after commit".into()),
+            })).await;
+        } else {
+            client.result_cancelled(&target_id).await;
+        }
+        client.expect_result_ack(&target_id).await;
+        let target = server.single_target(job_id).await;
+        assert_eq!(target["state"], "failed");
+        assert_eq!(target["reason"], if native_failed { "unsupported" } else { "cancelled" });
+        assert_eq!(target["message"], if native_failed { "native sleep failed after commit" } else { "cancelled by the operator" });
+        client.disconnect().await;
+        assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    }
+}
+
+#[tokio::test]
+async fn queued_power_targets_are_cancelled_immediately_without_dispatch() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    offline_device(&server, &key, "device-a").await;
+    for action in ["sleep", "restart", "shutdown"] {
+        let (status, body) = server.create_job("power", json!({"action": action}), one_device("device-a")).await;
+        assert_eq!(status, 201, "{body}");
+        let (status, cancelled) = server.cancel(body["job"]["id"].as_str().unwrap()).await;
+        assert_eq!(status, 200);
+        assert_eq!(cancelled["job"]["targets"][0]["state"], "failed");
+        assert_eq!(cancelled["job"]["targets"][0]["reason"], "cancelled");
+    }
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    while let Some(message) = client.try_recv(Duration::from_millis(50)).await {
+        assert!(matches!(message, ServerMessage::JobCancel { .. }), "unexpected {message:?}");
+    }
+}
+
+#[tokio::test]
 async fn cancellations_older_than_a_day_are_not_repeated() {
     let server = TestServer::start().await;
     let key = server.new_key();
@@ -269,6 +382,79 @@ async fn an_unknown_job_cannot_be_cancelled() {
     let (status, body) = server.cancel("no-such-job").await;
     assert_eq!(status, 404);
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn an_online_cancellation_survives_disconnect_before_the_device_confirms() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let job = server.create_script_job(one_device("device-a")).await;
+    let job_id = job["id"].as_str().unwrap();
+    let (target_id, ..) = client.expect_job().await;
+    client.started(&target_id).await;
+    server.wait_for_target_state(job_id, "running").await;
+    assert_eq!(server.cancel(job_id).await.0, 200);
+    assert_eq!(client.expect_cancel().await, target_id);
+    client.disconnect().await;
+    assert_eq!(server.wait_for_target_state(job_id, "failed").await["reason"], "cancelled");
+
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, target_id);
+    assert!(client.try_recv(Duration::from_millis(100)).await.is_none(), "cancelled job was redelivered");
+}
+
+#[tokio::test]
+async fn a_new_cancellation_is_delivered_after_the_clock_moves_backwards() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let first = server.create_script_job(one_device("device-a")).await;
+    let second = server.create_script_job(one_device("device-a")).await;
+    let (first_target, ..) = client.expect_job().await;
+    let (second_target, ..) = client.expect_job().await;
+    assert_eq!(server.cancel(second["id"].as_str().unwrap()).await.0, 200);
+    assert_eq!(client.expect_cancel().await, second_target);
+    client.disconnect().await;
+    server.wait_for_target_state(second["id"].as_str().unwrap(), "failed").await;
+    // The earlier request now appears to have happened ahead of the current
+    // clock; reconnect establishes that request as the replay cursor.
+    let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+    db.execute("UPDATE job_targets SET cancel_requested = cancel_requested + 60_000 WHERE id = ?1", [&second_target]).unwrap();
+    drop(db);
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, second_target);
+    assert_eq!(client.expect_job().await.0, first_target);
+    assert_eq!(server.cancel(first["id"].as_str().unwrap()).await.0, 200);
+    assert_eq!(client.expect_cancel().await, first_target);
+}
+
+#[tokio::test]
+async fn a_pending_online_cancellation_is_recovered_after_a_coordinator_restart() {
+    let mut server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let job = server.create_script_job(one_device("device-a")).await;
+    let job_id = job["id"].as_str().unwrap();
+    let (target_id, ..) = client.expect_job().await;
+    client.started(&target_id).await;
+    server.wait_for_target_state(job_id, "running").await;
+    assert_eq!(server.cancel(job_id).await.0, 200);
+    assert_eq!(client.expect_cancel().await, target_id);
+    server.stop().await;
+
+    // Recreate the state left by an abrupt coordinator crash before teardown.
+    let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+    db.execute(
+        "UPDATE job_targets SET state = 'running', reason = NULL, finished = NULL WHERE id = ?1",
+        [&target_id],
+    ).unwrap();
+    drop(db);
+    server.restart().await;
+    assert_eq!(server.single_target(job_id).await["reason"], "cancelled");
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_cancel().await, target_id);
+    assert!(client.try_recv(Duration::from_millis(100)).await.is_none());
 }
 
 #[tokio::test]

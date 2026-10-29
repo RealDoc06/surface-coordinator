@@ -133,7 +133,7 @@ a group, or all devices; the coordinator expands them into `job_targets` rows.
 | `app.launch` | path, arguments | Starts the process in the logged-in user's interactive session. |
 | `setting.apply` | setting id, value | Applies one entry from the built-in settings catalogue. |
 | `wifi.join` | SSID, password, optional coordinator URL | Adds the profile and connects; see Wi-Fi handoff. |
-| `power` | restart, shutdown or sleep | Performs the action after acknowledging. |
+| `power` | restart, shutdown or sleep | Commits once, asks Windows to perform the action, then reports its result. Restart/shutdown success means Windows accepted a five-second scheduled action; sleep finishes after resume. |
 
 - Output is streamed to the coordinator in chunks and capped per target (1 MB);
   excess is truncated with a marker.

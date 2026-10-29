@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/devices/{id}", get(get_device).delete(delete_device))
         .route("/jobs", get(list_jobs).post(create_job))
         .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/targets/{target_id}/output", get(get_target_output))
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/settings-catalogue", get(settings_catalogue))
         .route("/groups", get(groups::list).post(groups::create))
@@ -165,12 +166,12 @@ fn with_cookie(mut response: Response, cookie: String) -> Response {
     response
 }
 
-async fn open_session(state: &AppState, account_id: Option<String>) -> Result<String, crate::Error> {
+async fn open_token_session(state: &AppState) -> Result<String, crate::Error> {
     let (token, hash) = auth::new_session_token();
     let expires = store::now_ms() + auth::SESSION_LIFETIME.as_millis() as i64;
     state
         .store
-        .call(move |conn| store::create_session(conn, &hash, account_id.as_deref(), expires))
+        .call(move |conn| store::create_session(conn, &hash, None, expires))
         .await?;
     Ok(auth::session_cookie(&token, state.config.secure_cookies))
 }
@@ -181,9 +182,38 @@ struct Login {
     password: String,
 }
 
+/// Reject excess work instead of queueing unbounded memory-hard hashes.
+fn password_work(state: &AppState) -> ApiResult<tokio::sync::OwnedSemaphorePermit> {
+    state.password_work.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "auth_busy",
+            "authentication is busy; try again in a moment",
+        )
+    })
+}
+
+async fn hash_password(state: &AppState, password: String) -> ApiResult<String> {
+    let permit = password_work(state)?;
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit with the work even if the HTTP request is cancelled.
+        let _permit = permit;
+        auth::hash_password(&password)
+    })
+    .await
+    .map_err(|error| crate::Error::Internal(error.to_string()).into())
+}
+
 async fn login(State(state): State<Arc<AppState>>, Json(request): Json<Login>) -> ApiResult<Response> {
     if !matches!(state.config.auth, AuthMode::Accounts) {
         return Err(ApiError::bad_request("wrong_auth_mode", "this coordinator does not use accounts"));
+    }
+    if !auth::valid_username(&request.username) || request.password.len() > auth::MAX_PASSWORD_LEN {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "wrong username or password",
+        ));
     }
     if !state.login_throttle.allowed(&request.username) {
         return Err(ApiError::new(
@@ -192,6 +222,7 @@ async fn login(State(state): State<Arc<AppState>>, Json(request): Json<Login>) -
             "too many failed attempts; try again in a little while",
         ));
     }
+    let permit = password_work(&state)?;
     let username = request.username.clone();
     let found = state.store.call(move |conn| store::get_account_for_login(conn, &username)).await?;
     let password = request.password;
@@ -201,27 +232,34 @@ async fn login(State(state): State<Arc<AppState>>, Json(request): Json<Login>) -
         Some((account, hash)) => (Some(account), hash),
         None => (None, state.dummy_password_hash.clone()),
     };
-    let correct = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
-        .await
-        .unwrap_or(false);
-    match account {
-        Some(account) if correct => {
+    let (correct, verified_hash) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        (auth::verify_password(&password, &hash), hash)
+    })
+    .await
+    .map_err(|error| crate::Error::Internal(error.to_string()))?;
+    if let Some(account) = account.filter(|_| correct) {
+        let (token, token_hash) = auth::new_session_token();
+        let id = account.id.clone();
+        let expires = store::now_ms() + auth::SESSION_LIFETIME.as_millis() as i64;
+        let created = state.store.call(move |conn| {
+            store::create_account_session(conn, &token_hash, &id, &verified_hash, expires)
+        }).await?;
+        if created {
             state.login_throttle.record_success(&request.username);
-            let cookie = open_session(&state, Some(account.id.clone())).await?;
+            let cookie = auth::session_cookie(&token, state.config.secure_cookies);
             tracing::info!(username = %account.username, "login");
             let body = Json(json!({"account": {"id": account.id, "username": account.username}}));
-            Ok(with_cookie(body.into_response(), cookie))
-        }
-        _ => {
-            state.login_throttle.record_failure(&request.username);
-            tracing::warn!(username = %request.username, "failed login");
-            Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "invalid_credentials",
-                "wrong username or password",
-            ))
+            return Ok(with_cookie(body.into_response(), cookie));
         }
     }
+    state.login_throttle.record_failure(&request.username);
+    tracing::warn!(username = %request.username, "failed login");
+    Err(ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_credentials",
+        "wrong username or password",
+    ))
 }
 
 #[derive(Deserialize)]
@@ -239,14 +277,16 @@ async fn token_login(
     if !auth::token_matches(expected, &request.token) {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_token", "the token is not valid"));
     }
-    let cookie = open_session(&state, None).await?;
+    let cookie = open_token_session(&state).await?;
     Ok(with_cookie(no_content(), cookie))
 }
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     if let Some(token) = auth::session_token_from(&headers) {
         let hash = auth::hash_token(token);
-        state.store.call(move |conn| store::delete_session(conn, &hash)).await?;
+        if state.store.call(move |conn| store::delete_session(conn, &hash)).await? {
+            state.auth_changes.send_replace(());
+        }
     }
     Ok(with_cookie(no_content(), auth::clear_session_cookie(state.config.secure_cookies)))
 }
@@ -289,12 +329,10 @@ async fn create_account(
         ));
     }
     check_password(&request.password)?;
+    let hash = hash_password(&state, request.password).await?;
     let created = state
         .store
-        .call(move |conn| {
-            let hash = auth::hash_password(&request.password);
-            store::create_account(conn, &request.username, &hash)
-        })
+        .call(move |conn| store::create_account(conn, &request.username, &hash))
         .await?;
     match created {
         Some(account) => {
@@ -317,14 +355,17 @@ async fn set_password(
 ) -> ApiResult<Response> {
     require_accounts_mode(&state)?;
     check_password(&request.password)?;
+    let hash = hash_password(&state, request.password).await?;
     let changed = state
         .store
-        .call(move |conn| {
-            let hash = auth::hash_password(&request.password);
-            store::set_account_password(conn, &id, &hash)
-        })
+        .call(move |conn| store::set_account_password(conn, &id, &hash))
         .await?;
-    if changed { Ok(no_content()) } else { Err(ApiError::not_found("account")) }
+    if changed {
+        state.auth_changes.send_replace(());
+        Ok(no_content())
+    } else {
+        Err(ApiError::not_found("account"))
+    }
 }
 
 async fn delete_account(
@@ -337,7 +378,12 @@ async fn delete_account(
         return Err(ApiError::bad_request("cannot_delete_self", "you cannot delete your own account"));
     }
     let deleted = state.store.call(move |conn| store::delete_account(conn, &id)).await?;
-    if deleted { Ok(no_content()) } else { Err(ApiError::not_found("account")) }
+    if deleted {
+        state.auth_changes.send_replace(());
+        Ok(no_content())
+    } else {
+        Err(ApiError::not_found("account"))
+    }
 }
 
 // ---------------------------------------------------------------- devices
@@ -550,7 +596,7 @@ pub(crate) async fn submit_job(
     tracing::info!(job_id = %job.id, kind = %job.kind, targets = job.targets.len(), "job created");
     state.publish(Event::JobCreated { job: job.clone() });
     for target in &job.targets {
-        state.dispatch(&target.device_id, false).await;
+        state.dispatch(&target.device_id);
     }
     Ok(job)
 }
@@ -567,12 +613,33 @@ async fn list_jobs(State(state): State<Arc<AppState>>, Query(query): Query<JobsQ
     Ok(Json(json!({ "jobs": jobs })))
 }
 
-async fn get_job(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult {
-    let job = state.store.call(move |conn| store::get_job(conn, &id, true)).await?;
+#[derive(Deserialize)]
+struct JobQuery {
+    include_output: Option<bool>,
+}
+
+async fn get_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<JobQuery>,
+) -> ApiResult {
+    let job = state.store.call(move |conn| {
+        store::get_job(conn, &id, query.include_output.unwrap_or(true))
+    }).await?;
     match job {
         Some(job) => Ok(Json(json!({ "job": job }))),
         None => Err(ApiError::not_found("job")),
     }
+}
+
+async fn get_target_output(
+    State(state): State<Arc<AppState>>,
+    Path((job_id, target_id)): Path<(String, String)>,
+) -> ApiResult<Json<store::TargetOutput>> {
+    let output = state.store.call(move |conn| {
+        store::get_target_output(conn, &job_id, &target_id)
+    }).await?;
+    output.map(Json).ok_or_else(|| ApiError::not_found("job target"))
 }
 
 async fn cancel_job(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult {

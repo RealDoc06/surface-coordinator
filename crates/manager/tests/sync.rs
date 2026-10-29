@@ -76,7 +76,7 @@ async fn active_keys_are_copied_once_and_revoked_ones_are_left_behind() {
     let (embedded, local_dir) = local().await;
 
     let report = pull_keys(&online.origin, &cookie, &embedded.origin(), embedded.api_token()).await.unwrap();
-    assert_eq!(report, SyncReport { imported: 2, already_present: 0, skipped_revoked: 1 });
+    assert_eq!(report, SyncReport { imported: 2, already_present: 0, skipped_revoked: 1, revoked: 0 });
     // Same ids and secrets: devices enrolled online are accepted here, and
     // the hotspot for a key has the same name and passphrase.
     let mut expected = vec![(first.id.clone(), first.secret), (second.id, second.secret)];
@@ -87,9 +87,32 @@ async fn active_keys_are_copied_once_and_revoked_ones_are_left_behind() {
     assert!(labels.contains(&"Classroom".to_owned()), "{labels:?}");
 
     let again = pull_keys(&online.origin, &cookie, &embedded.origin(), embedded.api_token()).await.unwrap();
-    assert_eq!(again, SyncReport { imported: 0, already_present: 2, skipped_revoked: 1 });
+    assert_eq!(again, SyncReport { imported: 0, already_present: 2, skipped_revoked: 1, revoked: 0 });
     assert_eq!(keys(local_dir.path()), expected);
 
+    embedded.stop().await;
+    online.coordinator.stop().await;
+}
+
+#[tokio::test]
+async fn revoking_an_online_key_also_revokes_its_previously_synced_copy() {
+    let online = online().await;
+    let key = admin::create_enrollment_key(online.data_dir.path(), "Retired classroom").unwrap();
+    let cookie = log_in(&online.origin).await;
+    let (embedded, local_dir) = local().await;
+    pull_keys(&online.origin, &cookie, &embedded.origin(), embedded.api_token()).await.unwrap();
+    // Keys belonging only to this manager remain usable.
+    let local_key = admin::create_enrollment_key(local_dir.path(), "Offline classroom").unwrap();
+    admin::revoke_enrollment_key(online.data_dir.path(), &key.id).unwrap();
+
+    let report = pull_keys(&online.origin, &cookie, &embedded.origin(), embedded.api_token()).await.unwrap();
+    assert_eq!(report.revoked, 1);
+    let local_keys = admin::list_enrollment_keys(local_dir.path()).unwrap();
+    assert!(local_keys.iter().find(|local| local.id == key.id).unwrap().revoked.is_some());
+    assert!(local_keys.iter().find(|local| local.id == local_key.id).unwrap().revoked.is_none());
+
+    let again = pull_keys(&online.origin, &cookie, &embedded.origin(), embedded.api_token()).await.unwrap();
+    assert_eq!(again.revoked, 0);
     embedded.stop().await;
     online.coordinator.stop().await;
 }

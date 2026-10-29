@@ -39,7 +39,9 @@ pub struct Network {
     /// Wakes the connection loop for the two requests below.
     wake: Notify,
     reconnect: AtomicBool,
-    search: AtomicBool,
+    /// Failed handoff's SSID. Recovery may leave that network, but must not
+    /// undo a different network selected by the user in the meantime.
+    search: Mutex<Option<String>>,
     handoffs: AtomicUsize,
     /// Scanning or joining while another join is under way would undo it.
     wifi: tokio::sync::Mutex<()>,
@@ -66,7 +68,7 @@ impl Network {
             status: watch::Sender::new(Status { generation: 0, connected: false }),
             wake: Notify::new(),
             reconnect: AtomicBool::new(false),
-            search: AtomicBool::new(false),
+            search: Mutex::new(None),
             handoffs: AtomicUsize::new(0),
             wifi: tokio::sync::Mutex::new(()),
         })
@@ -108,7 +110,7 @@ impl Network {
     pub fn mark_connected(&self, url: &str) {
         *self.session_url.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url.to_owned());
         // A coordinator was reached; an earlier request to search is moot.
-        self.search.store(false, Ordering::SeqCst);
+        self.search.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         self.status.send_modify(|status| {
             status.generation += 1;
             status.connected = true;
@@ -151,19 +153,20 @@ impl Network {
         self.wake.notify_waiters();
     }
 
-    /// Makes the loop search for the hotspot on its next round, without
-    /// waiting for the usual threshold.
-    pub fn search_now(&self) {
-        self.search.store(true, Ordering::SeqCst);
+    /// Recovers a failed handoff on its next round. Only the named network
+    /// may be left; another active network belongs to the user.
+    pub fn search_now(&self, failed_ssid: &str) {
+        *self.search.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(failed_ssid.to_owned());
         self.wake.notify_waiters();
     }
 
     /// Called by the loop at the start of each round: a reconnect asked for
-    /// earlier is what this round does. Returns whether a search was asked
-    /// for.
-    pub(crate) fn start_round(&self) -> bool {
+    /// earlier is what this round does. Returns the failed handoff's SSID
+    /// when recovery was requested.
+    pub(crate) fn start_round(&self) -> Option<String> {
         self.reconnect.store(false, Ordering::SeqCst);
-        self.search.swap(false, Ordering::SeqCst)
+        self.search.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
     }
 
     async fn until(&self, condition: impl Fn() -> bool) {
@@ -187,7 +190,10 @@ impl Network {
 
     /// Resolves when the loop should stop waiting between attempts.
     pub(crate) async fn interrupted(&self) {
-        self.until(|| self.reconnect.load(Ordering::SeqCst) || self.search.load(Ordering::SeqCst))
+        self.until(|| {
+            self.reconnect.load(Ordering::SeqCst)
+                || self.search.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+        })
             .await;
     }
 
@@ -322,7 +328,7 @@ mod tests {
         // The wait at the end of the round is skipped too...
         tokio::time::timeout(SOON, network.interrupted()).await.unwrap();
         // ...and the next round starts afresh.
-        assert!(!network.start_round());
+        assert_eq!(network.start_round(), None);
         let wait = tokio::time::timeout(Duration::from_millis(100), network.interrupted());
         assert!(wait.await.is_err());
     }
@@ -335,18 +341,18 @@ mod tests {
             async move { network.interrupted().await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        network.search_now();
+        network.search_now("Office");
         tokio::time::timeout(SOON, waiting).await.unwrap().unwrap();
         // It does not end a session.
         let session = tokio::time::timeout(Duration::from_millis(100), network.reconnect_requested());
         assert!(session.await.is_err());
-        assert!(network.start_round());
-        assert!(!network.start_round());
+        assert_eq!(network.start_round().as_deref(), Some("Office"));
+        assert_eq!(network.start_round(), None);
 
         // A coordinator reached in the meantime makes the request moot.
-        network.search_now();
+        network.search_now("Office");
         network.mark_connected(CONFIGURED);
-        assert!(!network.start_round());
+        assert_eq!(network.start_round(), None);
     }
 
     #[test]

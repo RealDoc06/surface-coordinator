@@ -168,6 +168,141 @@ async fn queued_jobs_are_delivered_in_creation_order() {
 }
 
 #[tokio::test]
+async fn a_large_offline_backlog_streams_once_in_order_and_replays_only_unresolved_work() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    FakeClient::connect(&server, &key, "device-a").await.disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    let mut created = Vec::new();
+    for _ in 0..128 {
+        let job = server.create_script_job(json!({"type": "all"})).await;
+        created.push(job["id"].as_str().unwrap().to_owned());
+    }
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let mut received = 0;
+    let mut acknowledgements = 0;
+    // Finish enough work to keep advancing the delivery window; leave its
+    // last16 targets unresolved for the reconnect below.
+    while received < created.len() || acknowledgements < created.len() - 16 {
+        match client.recv().await {
+            Some(protocol::ServerMessage::Job { job_id, job_target_id, .. }) => {
+                assert_eq!(job_id, created[received]);
+                if received < created.len() - 16 {
+                    client.result(&job_target_id, 0).await;
+                }
+                received += 1;
+            }
+            Some(protocol::ServerMessage::JobResultAck { .. }) => acknowledgements += 1,
+            other => panic!("unexpected replay message {other:?}"),
+        }
+    }
+    assert!(client.try_recv(Duration::from_millis(50)).await.is_none());
+    client.disconnect().await;
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    for job_id in created.iter().skip(created.len() - 16) {
+        assert_eq!(&client.expect_job().await.1, job_id);
+    }
+    assert!(client.try_recv(Duration::from_millis(50)).await.is_none());
+}
+
+#[tokio::test]
+async fn the_delivery_window_refills_after_results_and_confirmed_cancellations() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let mut jobs = Vec::new();
+    for _ in 0..18 {
+        jobs.push(server.create_script_job(json!({"type": "all"})).await);
+    }
+    let mut targets = Vec::new();
+    for job in jobs.iter().take(16) {
+        let (target, id, ..) = client.expect_job().await;
+        assert_eq!(id, job["id"].as_str().unwrap());
+        targets.push(target);
+    }
+    assert!(client.try_recv(Duration::from_millis(50)).await.is_none());
+    assert_eq!(server.single_target(jobs[16]["id"].as_str().unwrap()).await["state"], "queued");
+    client.result(&targets[0], 0).await;
+    client.expect_result_ack(&targets[0]).await;
+    assert_eq!(client.expect_job().await.1, jobs[16]["id"].as_str().unwrap());
+    assert_eq!(server.cancel(jobs[1]["id"].as_str().unwrap()).await.0, 200);
+    assert_eq!(client.expect_cancel().await, targets[1]);
+    assert!(client.try_recv(Duration::from_millis(50)).await.is_none(), "an unconfirmed cancel freed a slot");
+    client.result_cancelled(&targets[1]).await;
+    client.expect_result_ack(&targets[1]).await;
+    assert_eq!(client.expect_job().await.1, jobs[17]["id"].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn reconnect_replays_legacy_work_beyond_the_window_before_admitting_new_work() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    FakeClient::connect(&server, &key, "device-a").await.disconnect().await;
+    assert!(wait_until(|| async { !server.is_online("device-a").await }).await);
+    for _ in 0..32 {
+        server.create_script_job(json!({"type": "all"})).await;
+    }
+    let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+    db.execute("UPDATE job_targets SET state = 'sent'", []).unwrap();
+    drop(db);
+    let new_job = server.create_script_job(json!({"type": "all"})).await;
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let mut targets = Vec::new();
+    for _ in 0..32 {
+        targets.push(client.expect_job().await.0);
+    }
+    assert!(client.try_recv(Duration::from_millis(50)).await.is_none());
+    for target in targets.iter().take(17) {
+        client.result(target, 0).await;
+        client.expect_result_ack(target).await;
+    }
+    assert_eq!(client.expect_job().await.1, new_job["id"].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn a_result_persistence_error_disconnects_so_the_client_can_replay_it() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let job = server.create_script_job(json!({"type": "all"})).await;
+    let (target, ..) = client.expect_job().await;
+    let db = rusqlite::Connection::open(server.data_dir.path().join("coordinator.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_result BEFORE UPDATE OF state ON job_targets
+        WHEN NEW.state = 'succeeded' BEGIN SELECT RAISE(FAIL, 'fixture persistence failure'); END;").unwrap();
+    client.result(&target, 0).await;
+    assert!(client.closed_by_server().await);
+    db.execute_batch("DROP TRIGGER fail_result").unwrap();
+    drop(db);
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert_eq!(client.expect_job().await.0, target);
+    client.result(&target, 0).await;
+    client.expect_result_ack(&target).await;
+    assert_eq!(server.single_target(job["id"].as_str().unwrap()).await["state"], "succeeded");
+}
+
+#[tokio::test]
+async fn a_stalled_device_keeps_its_backlog_on_disk_and_does_not_delay_another_device() {
+    let server = TestServer::start().await;
+    let key = server.new_key();
+    let _stalled = FakeClient::connect(&server, &key, "stalled").await;
+    let mut healthy = FakeClient::connect(&server, &key, "healthy").await;
+    for _ in 0..24 {
+        assert_eq!(server.create_job(
+            "script.run", json!({"shell": "powershell", "body": "x".repeat(512 * 1024)}),
+            json!({"type": "devices", "device_ids": ["stalled"]}),
+        ).await.0, 201);
+    }
+    let (_, listed) = server.get("/api/v1/jobs").await;
+    assert!(listed["jobs"].as_array().unwrap().iter().any(|job| {
+        job["targets"][0]["state"] == "queued"
+    }), "a stalled device's entire backlog was loaded into memory");
+    let job = server.create_script_job(json!({"type": "devices", "device_ids": ["healthy"]})).await;
+    let received = tokio::time::timeout(Duration::from_secs(2), healthy.expect_job()).await
+        .expect("a stalled peer delayed another device's work");
+    assert_eq!(received.1, job["id"].as_str().unwrap());
+}
+
+#[tokio::test]
 async fn unresolved_targets_are_sent_again_after_a_reconnect() {
     let server = TestServer::start().await;
     let key = server.new_key();

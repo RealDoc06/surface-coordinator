@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use protocol::handshake::{self, Role};
 use protocol::{ClientMessage, Hello, NetworkInfo, ServerMessage};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as SocketError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,7 @@ use crate::ClientConfig;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How a connection attempt ended.
 pub enum Ended {
@@ -38,7 +39,10 @@ fn lost(reason: impl Into<String>) -> Ended {
     Ended::Lost { reason: reason.into(), connected_for: None }
 }
 
-async fn send(socket: &mut Socket, message: &ClientMessage) -> Result<(), String> {
+async fn send(
+    socket: &mut (impl Sink<Message, Error = SocketError> + Unpin),
+    message: &ClientMessage,
+) -> Result<(), String> {
     socket
         .send(Message::text(message.to_json()))
         .await
@@ -47,7 +51,9 @@ async fn send(socket: &mut Socket, message: &ClientMessage) -> Result<(), String
 
 /// Next message of a known type. Unknown types and malformed messages are
 /// skipped; an error means the connection is gone.
-async fn receive(socket: &mut Socket) -> Result<ServerMessage, String> {
+async fn receive(
+    socket: &mut (impl Stream<Item = Result<Message, SocketError>> + Unpin),
+) -> Result<ServerMessage, String> {
     loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => match ServerMessage::from_json(text.as_str()) {
@@ -78,14 +84,17 @@ pub async fn run(config: &ClientConfig, attempt: Attempt<'_>, shutdown: &Cancell
     let Attempt { url: base_url, network_info, system, jobs, network } = attempt;
     let url = format!("{}{}", base_url.trim_end_matches('/'), protocol::CLIENT_WS_PATH);
     let handshake = async {
-        let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
+        // Job events and acknowledgements are small, latency-sensitive frames.
+        let (mut socket, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true)
             .await
             .map_err(|error| format!("connect failed: {error}"))?;
         let heartbeat = authenticate(config, system, network_info, &mut socket).await?;
         Ok::<_, String>((socket, heartbeat))
     };
     let connected = tokio::select! {
+        biased;
         _ = shutdown.cancelled() => return Ended::Shutdown,
+        _ = network.reconnect_requested() => return lost("reconnecting after a network change"),
         connected = tokio::time::timeout(config.handshake_timeout, handshake) => connected,
     };
     let (socket, heartbeat) = match connected {
@@ -138,7 +147,7 @@ async fn authenticate(
                 &mac,
             );
             if !genuine {
-                let _ = socket.close(None).await;
+                let _ = tokio::time::timeout(CLOSE_GRACE, socket.close(None)).await;
                 return Err("handshake failed: the coordinator did not prove knowledge of the \
                             enrollment key (wrong key or wrong coordinator)"
                     .into());
@@ -174,7 +183,9 @@ async fn authenticate(
 }
 
 async fn session(
-    mut socket: Socket,
+    socket: impl Sink<Message, Error = SocketError>
+        + Stream<Item = Result<Message, SocketError>>
+        + Unpin,
     heartbeat: Duration,
     jobs: &JobManager,
     network: &Network,
@@ -185,67 +196,216 @@ async fn session(
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
     jobs.attach(outbound);
 
-    let mut ticker = tokio::time::interval_at(Instant::now() + heartbeat, heartbeat);
     let silence_limit = heartbeat * protocol::MISSED_HEARTBEATS_BEFORE_OFFLINE;
     let mut last_heard = Instant::now();
+    let (mut writer, mut reader) = socket.split();
 
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                // What is already queued goes out first, such as the note of
-                // a `client.update` that is restarting the client; it is not
-                // replayed after the restart.
-                let flush = async {
-                    while let Ok(message) = outbound_rx.try_recv() {
-                        if send(&mut socket, &message).await.is_err() {
-                            return;
+    let ended = {
+        // Keep a write alive while reading acknowledgements and cancellations.
+        // Recreating this future on every received message would drop the job
+        // message it has already taken from the queue.
+        let writing = write_messages(&mut writer, &mut outbound_rx, heartbeat);
+        tokio::pin!(writing);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break Ended::Shutdown,
+                // A network change must interrupt even a blocked socket write.
+                _ = network.reconnect_requested() => {
+                    break lost("reconnecting after a network change");
+                }
+                _ = tokio::time::sleep_until(last_heard + silence_limit) => {
+                    break lost("coordinator stopped responding");
+                }
+                reason = &mut writing => break lost(reason),
+                received = receive(&mut reader) => {
+                    let message = match received {
+                        Ok(message) => message,
+                        Err(reason) => break lost(reason),
+                    };
+                    last_heard = Instant::now();
+                    match message {
+                        ServerMessage::Job { job_target_id, job_id: _, kind, payload } => {
+                            jobs.accept(Job { job_target_id, kind, payload });
                         }
+                        ServerMessage::JobResultAck { job_target_id } => jobs.acknowledge(&job_target_id),
+                        ServerMessage::HeartbeatAck => {}
+                        ServerMessage::JobCancel { job_target_id } => jobs.cancel(&job_target_id),
+                        // Handshake messages have no meaning here.
+                        ServerMessage::Challenge { .. }
+                        | ServerMessage::Welcome { .. }
+                        | ServerMessage::Reject { .. }
+                        | ServerMessage::Unknown => {}
                     }
-                    let _ = socket.close(None).await;
-                };
-                let _ = tokio::time::timeout(CLOSE_GRACE, flush).await;
-                return Ended::Shutdown;
-            }
-            // The device has moved to another network (or coordinator); this
-            // connection may look alive for a while but leads nowhere.
-            _ = network.reconnect_requested() => {
-                // The old network may already be gone; do not hang on it.
-                let _ = tokio::time::timeout(CLOSE_GRACE, socket.close(None)).await;
-                return lost("reconnecting after a network change");
-            }
-            _ = ticker.tick() => {
-                if last_heard.elapsed() >= silence_limit {
-                    let _ = socket.close(None).await;
-                    return lost("coordinator stopped responding");
-                }
-                if let Err(reason) = send(&mut socket, &ClientMessage::Heartbeat).await {
-                    return lost(reason);
                 }
             }
-            Some(message) = outbound_rx.recv() => {
-                if let Err(reason) = send(&mut socket, &message).await {
-                    return lost(reason);
+        }
+    };
+
+    // On shutdown, try to send queued results (notably the update/restart
+    // notice) before closing. A dead network must never hold shutdown or
+    // reconnection open indefinitely.
+    let close = async {
+        if matches!(ended, Ended::Shutdown) {
+            while let Ok(message) = outbound_rx.try_recv() {
+                if send(&mut writer, &message).await.is_err() {
+                    return;
                 }
             }
-            received = receive(&mut socket) => {
-                let message = match received {
-                    Ok(message) => message,
-                    Err(reason) => return lost(reason),
-                };
-                last_heard = Instant::now();
-                match message {
-                    ServerMessage::Job { job_target_id, job_id: _, kind, payload } => {
-                        jobs.accept(Job { job_target_id, kind, payload });
-                    }
-                    ServerMessage::JobResultAck { job_target_id } => jobs.acknowledge(&job_target_id),
-                    ServerMessage::HeartbeatAck => {}
-                    ServerMessage::JobCancel { job_target_id } => jobs.cancel(&job_target_id),
-                    // Handshake messages have no meaning here.
-                    ServerMessage::Challenge { .. }
-                    | ServerMessage::Welcome { .. }
-                    | ServerMessage::Reject { .. }
-                    | ServerMessage::Unknown => {}
+        }
+        let _ = writer.close().await;
+    };
+    let _ = tokio::time::timeout(CLOSE_GRACE, close).await;
+    ended
+}
+
+async fn write_messages(
+    socket: &mut (impl Sink<Message, Error = SocketError> + Unpin),
+    outbound: &mut mpsc::UnboundedReceiver<ClientMessage>,
+    heartbeat: Duration,
+) -> String {
+    let mut ticker = tokio::time::interval_at(Instant::now() + heartbeat, heartbeat);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let message = tokio::select! {
+            _ = ticker.tick() => ClientMessage::Heartbeat,
+            Some(message) = outbound.recv() => message,
+        };
+        match tokio::time::timeout(WRITE_TIMEOUT, send(socket, &message)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return reason,
+            Err(_) => return "send timed out".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::tungstenite::protocol::Role as SocketRole;
+
+    use super::*;
+    use crate::platform::OutputChunk;
+
+    #[tokio::test]
+    async fn a_network_change_interrupts_a_stalled_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let mut config =
+            ClientConfig::new(Some(url.clone()), "test-key", "test-secret", "test-device");
+        config.handshake_timeout = Duration::from_secs(30);
+        let system = SystemInfo { hostname: "test-host".into(), os: "test-os".into() };
+        let (jobs, _queue) = JobManager::new(None).unwrap();
+        let network = Network::load(Some(url.clone()), None).unwrap();
+        let shutdown = CancellationToken::new();
+        let attempt = Attempt {
+            url: &url,
+            network_info: None,
+            system: &system,
+            jobs: &jobs,
+            network: &network,
+        };
+
+        let coordinator = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+            // The old coordinator never sends a challenge. A new network
+            // should take effect without waiting out the handshake timeout.
+            network.reconnect_now();
+            let _ = socket.next().await;
+        };
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(run(&config, attempt, &shutdown), coordinator)
+        })
+        .await
+        .expect("a network change interrupts authentication promptly");
+        assert!(
+            matches!(ended, Ended::Lost { connected_for: None, reason } if reason == "reconnecting after a network change")
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_output_keeps_commands_and_session_deadlines_responsive() {
+        enum Stop {
+            Shutdown,
+            Reconnect,
+            Silence,
+        }
+
+        for stop in [Stop::Shutdown, Stop::Reconnect, Stop::Silence] {
+            // A small memory socket guarantees backpressure without relying
+            // on platform-dependent TCP buffer sizes or changing the network.
+            let (client, coordinator) = tokio::io::duplex(64);
+            let socket = WebSocketStream::from_raw_socket(client, SocketRole::Client, None).await;
+            let mut coordinator =
+                WebSocketStream::from_raw_socket(coordinator, SocketRole::Server, None).await;
+            let (jobs, mut queue) = JobManager::new(None).unwrap();
+            let network = Network::load(None, None).unwrap();
+            let shutdown = CancellationToken::new();
+            let heartbeat = match stop {
+                Stop::Silence => Duration::from_millis(100),
+                _ => Duration::from_secs(30),
+            };
+
+            let peer = async {
+                coordinator
+                    .send(Message::text(
+                        ServerMessage::Job {
+                            job_target_id: "first".into(),
+                            job_id: "job-first".into(),
+                            kind: "script.run".into(),
+                            payload: serde_json::json!({}),
+                        }
+                        .to_json(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(queue.recv().await.unwrap().job_target_id, "first");
+                jobs.output(
+                    "first",
+                    OutputChunk { stream: protocol::OutputStream::Stdout, data: "x".repeat(1024) },
+                );
+
+                // Observe the first byte, then stop reading: the client must
+                // remain blocked while flushing the rest of this frame.
+                coordinator.get_mut().read_exact(&mut [0u8; 1]).await.unwrap();
+                coordinator
+                    .send(Message::text(
+                        ServerMessage::Job {
+                            job_target_id: "second".into(),
+                            job_id: "job-second".into(),
+                            kind: "script.run".into(),
+                            payload: serde_json::json!({}),
+                        }
+                        .to_json(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(queue.recv().await.unwrap().job_target_id, "second");
+                match stop {
+                    Stop::Shutdown => shutdown.cancel(),
+                    Stop::Reconnect => network.reconnect_now(),
+                    Stop::Silence => {}
                 }
+                // Keep both halves open without reading any more output.
+            };
+            let (ended, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(session(socket, heartbeat, &jobs, &network, &shutdown), peer)
+            })
+            .await
+            .expect(
+                "a blocked write must not stop reads, shutdown, reconnect, or silence detection",
+            );
+            match (stop, ended) {
+                (Stop::Shutdown, Ended::Shutdown) => {}
+                (Stop::Reconnect, Ended::Lost { reason, .. }) => {
+                    assert_eq!(reason, "reconnecting after a network change");
+                }
+                (Stop::Silence, Ended::Lost { reason, .. }) => {
+                    assert_eq!(reason, "coordinator stopped responding");
+                }
+                _ => panic!("session ended for the wrong reason"),
             }
         }
     }

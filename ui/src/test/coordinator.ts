@@ -3,7 +3,7 @@
 // to follow what a screen does; `override` lets a test make a call misbehave.
 
 import type { Device, Group, Job, Script, Session, Setting, Updates } from '../api/types'
-import { apiError, device, job, mockFetch, target, type Call } from './helpers'
+import { apiError, device, job, jobRead, mockFetch, target, type Call } from './helpers'
 
 type Reply = { status?: number; body?: unknown }
 
@@ -221,8 +221,7 @@ export function fakeCoordinator(initial: Partial<Omit<FakeServer, 'calls'>> = {}
     }
     if (path.startsWith('/jobs?')) return { body: { jobs: Object.values(server.jobs) } }
     if (method === 'GET' && path.startsWith('/jobs/')) {
-      const found = server.jobs[path.slice('/jobs/'.length)]
-      return found ? { body: { job: found } } : undefined
+      return jobRead(path, server.jobs)
     }
     return undefined
   })

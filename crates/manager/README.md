@@ -9,8 +9,8 @@ Hotspot) for places without a network.
 From the repository root:
 
 ```
-cargo build -p manager
-cargo test -p manager
+cargo build --locked -p manager
+cargo test --locked -p manager
 ```
 
 `coordinator-core` embeds `ui/dist`, so build the web UI first
@@ -19,12 +19,17 @@ placeholder page.
 
 ## Installers
 
-Installers are built with the Tauri CLI, run from this directory:
+For a signed Windows release, use `scripts/manager-package.ps1` from the
+repository root. It builds and tests the UI, packages with the pinned Tauri CLI,
+verifies the updater signature, and writes an installer, `.sig` and `latest.json`.
+
+Manual CLI packaging is also available. In a POSIX shell, start at the repository root:
 
 ```
-cd ui && npm ci && npm run build && cd ..
+npm --prefix ui ci
+npm --prefix ui run build
 cd crates/manager
-npx --yes @tauri-apps/cli@2 build
+npx --yes @tauri-apps/cli@2.12.1 build -- --locked
 ```
 
 This builds `manager` in release mode and bundles it for the current OS
@@ -58,29 +63,31 @@ Windows specifics:
 
 `bundle.createUpdaterArtifacts` is on, so the CLI signs the updater
 artifacts. It needs the private key in the environment and the public key
-in `plugins.updater.pubkey`, against which it checks every signature it
-makes. That field is empty in `tauri.conf.json` (builds without a key must
+in `plugins.updater.pubkey`. That field is empty in `tauri.conf.json` (builds without a key must
 work), so a release build passes the committed key in:
 
 ```
 export TAURI_SIGNING_PRIVATE_KEY=<key text, or path to the key file>
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=<password, empty if none>
 cd crates/manager
-npx --yes @tauri-apps/cli@2 build \
-  --config "{\"plugins\":{\"updater\":{\"pubkey\":\"$(tr -d '\r\n' < updater.pub)\"}}}"
+npx --yes @tauri-apps/cli@2.12.1 build \
+  --config "{\"plugins\":{\"updater\":{\"pubkey\":\"$(tr -d '\r\n' < updater.pub)\"}}}" -- --locked
 ```
 
-A private key that does not belong to `updater.pub` fails the build here
-rather than producing updates no installed manager would accept.
+The pinned CLI only warns about some key mismatches. The release workflow and
+`scripts/manager-package.ps1` additionally verify the complete signature against
+the committed public key and check its signed version before exporting a package.
+Use that script for local Windows release packaging; a raw CLI build alone does
+not provide this verification gate.
 
 For a local installer without the project key, skip the updater artifacts:
 
 ```
-npx --yes @tauri-apps/cli@2 build --bundles nsis --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}"
+npx --yes @tauri-apps/cli@2.12.1 build --bundles nsis --config "{\"bundle\":{\"createUpdaterArtifacts\":false}}" -- --locked
 ```
 
 (or generate a throwaway key pair *outside the repository* with
-`npx @tauri-apps/cli@2 signer generate -w <temp dir>/throwaway.key`, and use
+`npx @tauri-apps/cli@2.12.1 signer generate -w <temp dir>/throwaway.key`, and use
 it for both variables and `SC_UPDATER_PUB_FILE`, see below).
 
 ## Self-update
@@ -94,6 +101,11 @@ opens and from "Check for updates" in its footer, shows the version and
 release notes, and installs only when the operator clicks "Install and
 restart". Installing stops the local coordinator (and the hotspot) first.
 Without internet the check fails quietly and the manager keeps working.
+Manifest checks have a 20-second deadline; installer downloads have a separate
+10-minute deadline. Checks cannot replace an update while it is being installed.
+If starting the installer fails, the Manager keeps its window usable and attempts
+to restore the local coordinator. The updater requires the advertised version to
+match the version authenticated by the signature.
 
 ### The public key: `updater.pub`
 
@@ -101,7 +113,7 @@ Self-update is only enabled in builds that have the updater public key. It
 is read at build time from `crates/manager/updater.pub` by `build.rs`:
 
 1. The owner generates the key pair once, outside the repository:
-   `npx @tauri-apps/cli@2 signer generate -w <somewhere safe>/surface-coordinator-updater.key`
+   `npx @tauri-apps/cli@2.12.1 signer generate -w <somewhere safe>/surface-coordinator-updater.key`
 2. The private key file's content and its password go into the GitHub
    Actions secrets `TAURI_SIGNING_PRIVATE_KEY` and
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Never commit it.

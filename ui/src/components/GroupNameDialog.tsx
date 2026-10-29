@@ -44,7 +44,7 @@ export function GroupNameDialog({
   }
 
   return (
-    <Modal title="Rename group" onClose={onClose}>
+    <Modal title="Rename group" onClose={onClose} busy={busy}>
       <form onSubmit={(e) => void submit(e)} noValidate>
         <div className="field">
           <label htmlFor={`${id}-name`}>Name</label>
@@ -54,6 +54,7 @@ export function GroupNameDialog({
             data-autofocus
             autoComplete="off"
             value={name}
+            disabled={busy}
             onChange={(e) => setName(e.target.value)}
             aria-invalid={error ? true : undefined}
           />
@@ -64,7 +65,7 @@ export function GroupNameDialog({
           ) : null}
         </div>
         <div className="modal-actions">
-          <button type="button" onClick={onClose}>
+          <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
           <button type="submit" className="primary" disabled={busy}>

@@ -10,7 +10,7 @@
 //! it is unfinished on purpose, marked as awaiting the restart, and is
 //! finished by the next start (see `crate::update`).
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use protocol::{reason, JobResult, JobStatus};
@@ -66,16 +66,12 @@ impl Ledger {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join(FILE_NAME);
         let mut entries = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<File>(&bytes) {
-                Ok(file) => file.entries,
-                Err(error) => {
-                    // Keep the unreadable file for inspection and start
-                    // clean rather than refusing to run at all.
-                    tracing::error!(%error, path = %path.display(), "job ledger is corrupt; starting a new one");
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
-                    Vec::new()
-                }
-            },
+            Ok(bytes) => serde_json::from_slice::<File>(&bytes).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "job ledger {} is corrupt: {error}; restore a known-good backup before restarting to preserve duplicate protection",
+                    path.display(),
+                ))
+            })?.entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
@@ -95,7 +91,7 @@ impl Ledger {
         }
         let ledger = Ledger { path: Some(path), entries };
         if interrupted {
-            ledger.save();
+            ledger.save()?;
         }
         Ok(ledger)
     }
@@ -109,8 +105,9 @@ impl Ledger {
         self.entries.iter().filter(|entry| !entry.acked)
     }
 
-    /// Records that a job is about to run.
-    pub fn start(&mut self, id: &str) {
+    /// Records that a job is about to run. A persistent ledger must commit
+    /// successfully before the caller may perform the job's side effects.
+    pub fn start(&mut self, id: &str) -> io::Result<()> {
         self.entries.push(Entry {
             id: id.to_owned(),
             result: None,
@@ -118,16 +115,35 @@ impl Ledger {
             never_started: false,
             awaiting_restart: false,
         });
-        self.save();
+        if let Err(error) = self.save() {
+            self.entries.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Marks a running job as one that completes after a restart of the
-    /// client, so that the restart does not make it `interrupted`.
-    pub fn await_restart(&mut self, id: &str) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id && e.result.is_none()) {
-            entry.awaiting_restart = true;
-            self.save();
+    /// client, so that the restart does not make it `interrupted`. The caller
+    /// must persist this transition before writing its update marker or
+    /// replacing the executable.
+    pub fn await_restart(&mut self, id: &str) -> io::Result<()> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == id && entry.result.is_none())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("job {id} has no unfinished durable start record"),
+                )
+            })?;
+        let previous = self.entries[index].awaiting_restart;
+        self.entries[index].awaiting_restart = true;
+        if let Err(error) = self.save() {
+            self.entries[index].awaiting_restart = previous;
+            return Err(error);
         }
+        Ok(())
     }
 
     /// Unfinished jobs waiting for a restart of the client.
@@ -151,7 +167,7 @@ impl Ledger {
             never_started: true,
             awaiting_restart: false,
         });
-        self.save();
+        self.save_best_effort();
     }
 
     /// Whether the coordinator has acknowledged the result for `id`. An id
@@ -177,7 +193,7 @@ impl Ledger {
                 awaiting_restart: false,
             }),
         }
-        self.save();
+        self.save_best_effort();
     }
 
     /// Marks a finished entry as acknowledged. Returns whether anything changed.
@@ -189,7 +205,7 @@ impl Ledger {
         };
         entry.acked = true;
         self.prune();
-        self.save();
+        self.save_best_effort();
         true
     }
 
@@ -207,19 +223,39 @@ impl Ledger {
         });
     }
 
-    /// Writes the ledger atomically. A failure is logged, not fatal: the
-    /// in-memory ledger still protects against duplicates until a restart.
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
+    /// Flush the staged contents before replacing the previous ledger. In
+    /// particular, success here is the permission to begin an irreversible job.
+    fn save(&self) -> io::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
         let write = || -> io::Result<()> {
             let bytes = serde_json::to_vec(&File { entries: self.entries.clone() })?;
             let temporary = path.with_extension("json.tmp");
-            std::fs::write(&temporary, bytes)?;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
             std::fs::rename(&temporary, path)
         };
-        if let Err(error) = write() {
-            tracing::error!(%error, path = %path.display(), "failed to save the job ledger");
+        write().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot persist job ledger {}: {error}", path.display(),),
+            )
+        })
+    }
+
+    /// After a job has durably started, retaining its id already prevents
+    /// another execution after restart. Keep newer results in memory if a
+    /// later write fails, and retry persistence with the next ledger change.
+    fn save_best_effort(&self) {
+        if let Err(error) = self.save() {
+            tracing::error!(%error, "failed to save the job ledger");
         }
+    }
+
+    /// Confirm that all in-memory state is durable before deleting recovery data.
+    pub(crate) fn persist(&self) -> io::Result<()> {
+        self.save()
     }
 }
 
@@ -241,7 +277,7 @@ mod tests {
     fn tracks_started_finished_and_acknowledged() {
         let mut ledger = Ledger::in_memory();
         assert!(!ledger.contains("a"));
-        ledger.start("a");
+        ledger.start("a").unwrap();
         assert!(ledger.contains("a"));
         assert!(!ledger.ack("a"), "a running job cannot be acknowledged");
 
@@ -257,10 +293,10 @@ mod tests {
     fn survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(dir.path()).unwrap();
-        ledger.start("acked");
+        ledger.start("acked").unwrap();
         ledger.finish(succeeded("acked"));
         ledger.ack("acked");
-        ledger.start("unacked");
+        ledger.start("unacked").unwrap();
         ledger.finish(succeeded("unacked"));
 
         let reloaded = Ledger::load(dir.path()).unwrap();
@@ -274,7 +310,7 @@ mod tests {
     fn a_job_running_at_restart_becomes_interrupted() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(dir.path()).unwrap();
-        ledger.start("running");
+        ledger.start("running").unwrap();
         drop(ledger);
 
         for _ in 0..2 {
@@ -292,8 +328,8 @@ mod tests {
     fn a_job_awaiting_a_restart_stays_unfinished_across_restarts_until_finished() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(dir.path()).unwrap();
-        ledger.start("update");
-        ledger.await_restart("update");
+        ledger.start("update").unwrap();
+        ledger.await_restart("update").unwrap();
         drop(ledger);
 
         for _ in 0..2 {
@@ -322,6 +358,43 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_restart_must_persist_before_the_update_can_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::load(dir.path()).unwrap();
+        ledger.start("update").unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let previous = std::fs::read(&path).unwrap();
+        let blocked = dir.path().join("jobs.json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(ledger.await_restart("update").is_err());
+        assert!(ledger.awaiting_restart().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert_eq!(ledger.unacked().next().unwrap().result, None);
+        std::fs::remove_dir(blocked).unwrap();
+        ledger.await_restart("update").unwrap();
+        let reloaded = Ledger::load(dir.path()).unwrap();
+        assert_eq!(reloaded.awaiting_restart(), ["update"]);
+        assert_eq!(reloaded.unacked().next().unwrap().result, None);
+    }
+
+    #[test]
+    fn awaiting_restart_rejects_jobs_without_an_unfinished_start_record() {
+        let mut ledger = Ledger::in_memory();
+        assert_eq!(
+            ledger.await_restart("missing").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        ledger.start("finished").unwrap();
+        ledger.finish(succeeded("finished"));
+        assert_eq!(
+            ledger.await_restart("finished").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(ledger.awaiting_restart().is_empty());
+    }
+
+    #[test]
     fn a_job_that_never_started_is_recorded_with_its_result() {
         let dir = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(dir.path()).unwrap();
@@ -342,30 +415,60 @@ mod tests {
 
     #[test]
     fn an_entry_written_before_never_started_existed_counts_as_started() {
-        let entry: Entry = serde_json::from_str(r#"{"id":"old","result":null,"acked":false}"#).unwrap();
+        let entry: Entry =
+            serde_json::from_str(r#"{"id":"old","result":null,"acked":false}"#).unwrap();
         assert!(!entry.never_started);
         assert!(!entry.awaiting_restart);
     }
 
     #[test]
-    fn a_corrupt_file_is_set_aside() {
+    fn a_corrupt_ledger_is_preserved_and_prevents_startup() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(FILE_NAME), b"{ not json").unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, b"{ not json").unwrap();
+        for _ in 0..2 {
+            let error = Ledger::load(dir.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+            assert!(error.to_string().contains("restore a known-good backup"));
+            assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        }
+        assert!(!dir.path().join("jobs.json.corrupt").exists());
+    }
+
+    #[test]
+    fn a_failed_start_preserves_prior_history_and_can_be_retried_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
         let mut ledger = Ledger::load(dir.path()).unwrap();
-        assert_eq!(ledger.unacked().count(), 0);
-        assert!(dir.path().join("jobs.json.corrupt").exists());
-        ledger.start("a");
-        assert!(Ledger::load(dir.path()).unwrap().contains("a"));
+        ledger.start("previous").unwrap();
+        ledger.finish(succeeded("previous"));
+        ledger.ack("previous");
+        let path = dir.path().join(FILE_NAME);
+        let previous = std::fs::read(&path).unwrap();
+        let blocked = dir.path().join("jobs.json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(ledger.start("unsafe").is_err());
+        assert!(!ledger.contains("unsafe"));
+        assert!(ledger.contains("previous"));
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        let reloaded = Ledger::load(dir.path()).unwrap();
+        assert!(reloaded.contains("previous"));
+        assert!(!reloaded.contains("unsafe"));
+
+        std::fs::remove_dir(blocked).unwrap();
+        ledger.start("unsafe").unwrap();
+        assert!(Ledger::load(dir.path()).unwrap().contains("unsafe"));
     }
 
     #[test]
     fn old_acknowledged_entries_are_pruned_but_unacknowledged_ones_are_kept() {
         let mut ledger = Ledger::in_memory();
-        ledger.start("pending-result");
+        ledger.start("pending-result").unwrap();
         ledger.finish(succeeded("pending-result"));
         for index in 0..MAX_ACKED_ENTRIES + 5 {
             let id = format!("job-{index}");
-            ledger.start(&id);
+            ledger.start(&id).unwrap();
             ledger.finish(succeeded(&id));
             ledger.ack(&id);
         }

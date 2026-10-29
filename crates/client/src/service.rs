@@ -62,6 +62,7 @@ fn service_main(_arguments: Vec<OsString>) {
     let Some((state_dir, verbose)) = OPTIONS.get() else { return };
     init_logging(state_dir, *verbose);
     if let Err(error) = serve(state_dir) {
+        EXIT_CODE.store(FAILURE_EXIT_CODE, Ordering::SeqCst);
         tracing::error!("the service failed: {error:#}");
     }
 }
@@ -71,7 +72,11 @@ fn init_logging(state_dir: &Path, verbose: bool) {
     let _ = std::fs::create_dir_all(state_dir);
     // Without a log file the service still runs; there is nowhere to say so.
     if let Ok(file) = RotatingFile::open(state_dir.join(LOG_FILE), DEFAULT_CAP) {
-        let _ = tracing_subscriber::fmt().with_max_level(level).with_ansi(false).with_writer(file).try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(file)
+            .try_init();
     }
 }
 
@@ -94,7 +99,10 @@ fn serve(state_dir: &Path) -> anyhow::Result<()> {
             current_state: state,
             controls_accepted,
             exit_code,
-            checkpoint: 0,
+            checkpoint: u32::from(matches!(
+                state,
+                ServiceState::StartPending | ServiceState::StopPending
+            )),
             wait_hint,
             process_id: None,
         };
@@ -103,9 +111,32 @@ fn serve(state_dir: &Path) -> anyhow::Result<()> {
         }
     };
 
-    report(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, ServiceExitCode::NO_ERROR, Duration::ZERO);
-    let outcome = run_client(state_dir, shutdown);
-    report(ServiceState::StopPending, ServiceControlAccept::empty(), ServiceExitCode::NO_ERROR, Duration::from_secs(10));
+    report(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        ServiceExitCode::NO_ERROR,
+        Duration::from_secs(30),
+    );
+    let outcome = run_client(
+        state_dir,
+        shutdown,
+        || {
+            report(
+                ServiceState::Running,
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                ServiceExitCode::NO_ERROR,
+                Duration::ZERO,
+            )
+        },
+        || {
+            report(
+                ServiceState::StopPending,
+                ServiceControlAccept::empty(),
+                ServiceExitCode::NO_ERROR,
+                Duration::from_secs(10),
+            )
+        },
+    );
     let code = match &outcome {
         Ok(false) => 0,
         Ok(true) => {
@@ -126,7 +157,12 @@ fn serve(state_dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Runs the client until it stops; returns whether it asked to be restarted.
-fn run_client(state_dir: &Path, shutdown: CancellationToken) -> anyhow::Result<bool> {
+fn run_client(
+    state_dir: &Path,
+    shutdown: CancellationToken,
+    started: impl FnOnce(),
+    stopping: impl FnOnce(),
+) -> anyhow::Result<bool> {
     let settings = config::load(state_dir, Overrides::default())?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -136,13 +172,47 @@ fn run_client(state_dir: &Path, shutdown: CancellationToken) -> anyhow::Result<b
         Arc::new(WindowsPlatform::new(state_dir.join(SCRIPTS_DIR)).with_restart(shutdown.clone()));
     let config = ClientConfig::from_settings(settings, state_dir);
     tracing::info!(device_id = %config.device_id, version = %config.client_version, "client service starting");
+    let client = Client::new(config, platform.clone()).context("cannot open the client state")?;
+    // Running means configuration and durable state have opened successfully.
+    started();
     runtime.block_on(async {
-        let client = Client::new(config, platform.clone()).context("cannot open the client state")?;
-        client.run(shutdown).await;
-        anyhow::Ok(())
-    })?;
+        let running = client.run(shutdown.clone());
+        tokio::pin!(running);
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                // Report pending while cleanup is happening, not after it.
+                stopping();
+                running.await;
+            }
+            _ = &mut running => stopping(),
+        }
+    });
     // A script still being stopped must not hold the service up for long.
     runtime.shutdown_timeout(Duration::from_secs(5));
     tracing::info!("client service stopped");
     Ok(platform.restart_requested())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn invalid_configuration_never_reports_the_service_running() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(state.path().join(config::CONFIG_FILE), "not valid json").unwrap();
+        let started = Cell::new(false);
+        let stopping = Cell::new(false);
+        let outcome = run_client(
+            state.path(),
+            CancellationToken::new(),
+            || started.set(true),
+            || stopping.set(true),
+        );
+        assert!(outcome.is_err());
+        assert!(!started.get());
+        assert!(!stopping.get());
+    }
 }

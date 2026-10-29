@@ -67,7 +67,9 @@ fn lan_address() -> Option<IpAddr> {
 /// Devices then cannot connect here: the firewall drops replies that go out
 /// by a different interface than the request came in on.
 fn lan_route_problem(lan: IpAddr) -> Option<String> {
-    let IpAddr::V4(address) = lan else { return None };
+    let IpAddr::V4(address) = lan else {
+        return None;
+    };
     // A neighbour: the same address with the last bit flipped.
     let mut octets = address.octets();
     octets[3] ^= 1;
@@ -116,7 +118,12 @@ pub struct WifiService {
 
 impl WifiService {
     pub fn new(source: Arc<dyn WifiSource>) -> WifiService {
-        WifiService { source, client_port: AtomicU16::new(0), api: Mutex::new(None), online: Mutex::new(None) }
+        WifiService {
+            source,
+            client_port: AtomicU16::new(0),
+            api: Mutex::new(None),
+            online: Mutex::new(None),
+        }
     }
 
     /// Called once the embedded coordinator is up.
@@ -132,7 +139,10 @@ impl WifiService {
     }
 
     fn online_url(&self) -> Option<String> {
-        self.online.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.online
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     async fn network(&self) -> Result<WifiNetwork, String> {
@@ -159,7 +169,11 @@ impl WifiService {
 }
 
 fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
+    (
+        status,
+        Json(json!({"error": {"code": code, "message": message.into()}})),
+    )
+        .into_response()
 }
 
 /// `GET /wifi`: what the button would move devices to. Never the password.
@@ -192,11 +206,15 @@ async fn show(State(service): State<Arc<WifiService>>) -> Json<Value> {
 #[derive(Deserialize)]
 struct Move {
     targets: Value,
+    expected_ssid: String,
+    expected_coordinator_url: String,
 }
 
-/// `POST /wifi/move {targets}`: creates the `wifi.join` job for this
-/// computer's network and answers with the coordinator's own response.
-async fn move_devices(State(service): State<Arc<WifiService>>, Json(request): Json<Move>) -> Response {
+/// Creates a Wi-Fi job only for the destination the operator reviewed.
+async fn move_devices(
+    State(service): State<Arc<WifiService>>,
+    Json(request): Json<Move>,
+) -> Response {
     let network = match service.network().await {
         Ok(network) => network,
         Err(reason) => return error(StatusCode::CONFLICT, "wifi_unavailable", reason),
@@ -208,9 +226,25 @@ async fn move_devices(State(service): State<Arc<WifiService>>, Json(request): Js
             "this computer has no network address devices could reach it at",
         );
     };
-    let api = service.api.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if network.ssid != request.expected_ssid || coordinator_url != request.expected_coordinator_url
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "wifi_changed",
+            "the network or destination coordinator changed; review the current destination before moving devices",
+        );
+    }
+    let api = service
+        .api
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let Some(api) = api else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "internal", "the coordinator is not ready");
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal",
+            "the coordinator is not ready",
+        );
     };
 
     let mut payload = json!({ "ssid": network.ssid, "coordinator_url": coordinator_url });
@@ -226,7 +260,8 @@ async fn move_devices(State(service): State<Arc<WifiService>>, Json(request): Js
         .await;
     match sent {
         Ok(response) => {
-            let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body: Value = response.json().await.unwrap_or(Value::Null);
             (status, Json(body)).into_response()
         }
@@ -235,7 +270,10 @@ async fn move_devices(State(service): State<Arc<WifiService>>, Json(request): Js
 }
 
 pub fn router(service: Arc<WifiService>) -> Router {
-    Router::new().route("/wifi", get(show)).route("/wifi/move", post(move_devices)).with_state(service)
+    Router::new()
+        .route("/wifi", get(show))
+        .route("/wifi/move", post(move_devices))
+        .with_state(service)
 }
 
 /// What a saved Windows Wi-Fi profile says about the network's security.
@@ -258,7 +296,8 @@ fn password_from_profile(xml: &str) -> Result<Option<String>, String> {
     }
     if element("protected") != Some("false") {
         return Err(
-            "Windows did not release the saved Wi-Fi password; use \"Move to Wi-Fi…\" and type it".into()
+            "Windows did not release the saved Wi-Fi password; use \"Move to Wi-Fi…\" and type it"
+                .into(),
         );
     }
     let key = element("keyMaterial").ok_or("the saved Wi-Fi profile has no password")?;
@@ -313,7 +352,10 @@ mod windows {
     }
 
     fn wide_text(units: &[u16]) -> String {
-        let length = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
+        let length = units
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(units.len());
         String::from_utf16_lossy(&units[..length])
     }
 
@@ -323,7 +365,9 @@ mod windows {
             let mut version = 0u32;
             let mut handle: HANDLE = null_mut();
             // SAFETY: valid out pointers.
-            if unsafe { WlanOpenHandle(WLAN_API_VERSION_2_0, null(), &mut version, &mut handle) } != ERROR_SUCCESS {
+            if unsafe { WlanOpenHandle(WLAN_API_VERSION_2_0, null(), &mut version, &mut handle) }
+                != ERROR_SUCCESS
+            {
                 return Err("Wi-Fi is not available on this computer".into());
             }
             let handle = Handle(handle);
@@ -395,7 +439,9 @@ mod windows {
                 };
                 let xml = Memory(xml);
                 if code != ERROR_SUCCESS || xml.0.is_null() {
-                    return Err(format!("the saved profile of {ssid} could not be read (error {code})"));
+                    return Err(format!(
+                        "the saved profile of {ssid} could not be read (error {code})"
+                    ));
                 }
                 // SAFETY: a NUL-terminated string allocated by the API.
                 let text = unsafe {
@@ -446,27 +492,45 @@ mod tests {
     #[test]
     fn a_password_windows_keeps_encrypted_is_not_usable() {
         let protected = KEY.replace("<protected>false", "<protected>true");
-        assert!(password_from_profile(&profile("WPA2PSK", &protected)).unwrap_err().contains("did not release"));
+        assert!(password_from_profile(&profile("WPA2PSK", &protected))
+            .unwrap_err()
+            .contains("did not release"));
     }
 
     #[test]
     fn enterprise_networks_cannot_be_passed_on() {
-        assert!(password_from_profile(&profile("WPA2", "")).unwrap_err().contains("WPA2 sign-in"));
+        assert!(password_from_profile(&profile("WPA2", ""))
+            .unwrap_err()
+            .contains("WPA2 sign-in"));
     }
 
     #[test]
     fn clients_reach_the_online_coordinator_over_websockets_at_the_same_host_and_port() {
         let cases = [
-            ("https://coordinator.example.org", "wss://coordinator.example.org"),
-            ("https://coordinator.example.org:8443", "wss://coordinator.example.org:8443"),
-            ("https://coordinator.example.org:443", "wss://coordinator.example.org"),
+            (
+                "https://coordinator.example.org",
+                "wss://coordinator.example.org",
+            ),
+            (
+                "https://coordinator.example.org:8443",
+                "wss://coordinator.example.org:8443",
+            ),
+            (
+                "https://coordinator.example.org:443",
+                "wss://coordinator.example.org",
+            ),
             ("http://192.168.1.10:8080", "ws://192.168.1.10:8080"),
             ("http://[::1]:8080", "ws://[::1]:8080"),
         ];
         for (origin, expected) in cases {
             assert_eq!(client_url(origin).as_deref(), Some(expected), "{origin}");
         }
-        for unusable in ["", "coordinator.example.org", "ftp://coordinator.example.org", "file:///C:/x"] {
+        for unusable in [
+            "",
+            "coordinator.example.org",
+            "ftp://coordinator.example.org",
+            "file:///C:/x",
+        ] {
             assert_eq!(client_url(unusable), None, "{unusable}");
         }
     }
@@ -475,7 +539,11 @@ mod tests {
     fn the_real_adapter_can_be_asked_without_panicking() {
         // Read-only. The password is never printed.
         match native().current() {
-            Ok(network) => eprintln!("on {:?}, secured: {}", network.ssid, network.password.is_some()),
+            Ok(network) => eprintln!(
+                "on {:?}, secured: {}",
+                network.ssid,
+                network.password.is_some()
+            ),
             Err(reason) => eprintln!("not available: {reason}"),
         }
         eprintln!("LAN address: {:?}", lan_address());

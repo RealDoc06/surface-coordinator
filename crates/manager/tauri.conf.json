@@ -43,6 +43,7 @@
         "https://github.com/RealDoc06/surface-coordinator/releases/latest/download/latest.json"
       ],
       "pubkey": "",
+      "requireSignedVersion": true,
       "windows": {
         "installMode": "passive"
       }

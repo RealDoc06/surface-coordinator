@@ -14,7 +14,7 @@ pub const CONFIG_FILE: &str = "config.json";
 /// What `config.json` holds. Every field may be missing from the file, so
 /// that flags can fill the gaps; what is still missing after merging is an
 /// error (see [`merge`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
@@ -27,6 +27,25 @@ pub struct ConfigFile {
     /// Without one the client looks for the manager's hotspot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_url: Option<String>,
+    /// Existing installations retain discovery unless explicitly disabled.
+    #[serde(default = "discovery_enabled")]
+    pub hotspot_discovery: bool,
+}
+
+fn discovery_enabled() -> bool {
+    true
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            device_id: None,
+            key_id: None,
+            key_secret: None,
+            coordinator_url: None,
+            hotspot_discovery: true,
+        }
+    }
 }
 
 impl ConfigFile {
@@ -53,6 +72,7 @@ pub struct Settings {
     pub key_id: String,
     pub key_secret: String,
     pub device_id: String,
+    pub hotspot_discovery: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,13 +125,15 @@ fn merge(
 /// else it is generated (and stored in that file).
 pub fn load(state_dir: &Path, overrides: Overrides) -> Result<Settings, ConfigError> {
     let path = state_dir.join(CONFIG_FILE);
-    let (coordinator_url, key_id, key_secret, device_id) = merge(read(state_dir)?, overrides, &path)?;
+    let file = read(state_dir)?;
+    let hotspot_discovery = file.as_ref().is_none_or(|file| file.hotspot_discovery);
+    let (coordinator_url, key_id, key_secret, device_id) = merge(file, overrides, &path)?;
     let device_id = match device_id {
         Some(id) => id,
         None => crate::load_or_create_device_id(state_dir)
             .map_err(|source| ConfigError::DeviceId { path: state_dir.join("device_id"), source })?,
     };
-    Ok(Settings { coordinator_url, key_id, key_secret, device_id })
+    Ok(Settings { coordinator_url, key_id, key_secret, device_id, hotspot_discovery })
 }
 
 /// The device id already given to this device in `state_dir`, if any: from
@@ -133,6 +155,7 @@ mod tests {
             key_id: Some("fake-key-from-file".into()),
             key_secret: Some("fake-secret-from-file".into()),
             coordinator_url: Some("wss://file.example".into()),
+            hotspot_discovery: true,
         }
     }
 
@@ -160,6 +183,7 @@ mod tests {
                 key_id: "fake-key-from-file".into(),
                 key_secret: "fake-secret-from-file".into(),
                 device_id: "fake-device-from-file".into(),
+                hotspot_discovery: true,
             }
         );
         // The device id file of earlier versions is not consulted or created.
@@ -235,5 +259,16 @@ mod tests {
         assert!(!text.contains("coordinator_url"), "{text}");
         assert!(text.ends_with("}\n"));
         assert_eq!(serde_json::from_str::<ConfigFile>(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn disabling_discovery_is_persisted_and_old_configurations_keep_it_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), r#"{"key_id":"k","key_secret":"s"}"#);
+        assert!(load(dir.path(), Overrides::default()).unwrap().hotspot_discovery);
+        let mut config = file();
+        config.hotspot_discovery = false;
+        write(dir.path(), &config.to_json());
+        assert!(!load(dir.path(), Overrides::default()).unwrap().hotspot_discovery);
     }
 }

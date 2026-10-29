@@ -24,6 +24,8 @@ import type {
 
 export const API_BASE = '/api/v1'
 export const JOBS_PAGE_SIZE = 50
+export const READ_TIMEOUT_MS = 15_000
+export const WRITE_TIMEOUT_MS = 60_000
 
 export class ApiError extends Error {
   readonly status: number
@@ -76,23 +78,33 @@ function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   return send<T>(path, init)
 }
 
-async function send<T>(path: string, init: RequestInit): Promise<T> {
-  let res: Response
+async function send<T>(path: string, init: RequestInit, timeoutMs = init.method === 'GET' ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    res = await fetch(`${API_BASE}${path}`, init)
-  } catch {
+    const res = await fetch(`${API_BASE}${path}`, { ...init, cache: 'no-store', signal: controller.signal })
+    if (!res.ok) {
+      const err = await readError(res)
+      if (res.status === 401 && err.code === 'unauthorized') unauthorizedHandler?.()
+      throw err
+    }
+    if (res.status === 204) return undefined as T
+    try {
+      return (await res.json()) as T
+    } catch (err) {
+      if (controller.signal.aborted) throw err
+      throw new ApiError(res.status, 'bad_response', 'The coordinator sent a response that is not JSON.')
+    }
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new ApiError(0, 'request_timeout', init.method === 'GET'
+        ? 'The coordinator took too long to respond. Try again.'
+        : 'The request timed out. It may have completed; check the current state before trying again.')
+    }
+    if (err instanceof ApiError) throw err
     throw new ApiError(0, 'network_error', 'Could not reach the coordinator.')
-  }
-  if (!res.ok) {
-    const err = await readError(res)
-    if (res.status === 401 && err.code === 'unauthorized') unauthorizedHandler?.()
-    throw err
-  }
-  if (res.status === 204) return undefined as T
-  try {
-    return (await res.json()) as T
-  } catch {
-    throw new ApiError(res.status, 'bad_response', 'The coordinator sent a response that is not JSON.')
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -119,7 +131,7 @@ function uploadClient({ file, version, signature, notes }: ClientUpload) {
     credentials: 'same-origin',
     headers: { Accept: 'application/json', 'Content-Type': 'application/octet-stream', 'X-Signature': signature },
     body: file,
-  })
+  }, 5 * 60_000)
 }
 
 export const api = {
@@ -152,7 +164,9 @@ export const api = {
     if (opts.before !== undefined) params.set('before', String(opts.before))
     return request<{ jobs: Job[] }>('GET', `/jobs?${params.toString()}`)
   },
-  getJob: (id: string) => request<{ job: Job }>('GET', `/jobs/${seg(id)}`),
+  getJob: (id: string) => request<{ job: Job }>('GET', `/jobs/${seg(id)}?include_output=false`),
+  getJobOutput: (jobId: string, targetId: string) =>
+    request<{ output: string; output_truncated: boolean }>('GET', `/jobs/${seg(jobId)}/targets/${seg(targetId)}/output`),
   cancelJob: (id: string) => request<{ job: Job }>('POST', `/jobs/${seg(id)}/cancel`),
 
   // Settings catalogue
@@ -197,7 +211,10 @@ export const api = {
   /** The network the manager's computer is on; the password stays with the manager. */
   getManagerWifi: () => request<ManagerWifi>('GET', '/manager/wifi'),
   /** Moves devices to that network; the manager fills in SSID, password and coordinator address. */
-  moveToManagerWifi: (targets: TargetSpec) => request<{ job: Job }>('POST', '/manager/wifi/move', { targets }),
+  moveToManagerWifi: (targets: TargetSpec, ssid: string, coordinatorUrl: string) =>
+    request<{ job: Job }>('POST', '/manager/wifi/move', {
+      targets, expected_ssid: ssid, expected_coordinator_url: coordinatorUrl,
+    }),
 
   // Rejected connection attempts
   listRejected: () => request<{ rejected: Rejected[] }>('GET', '/rejected-connections'),

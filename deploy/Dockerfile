@@ -16,7 +16,7 @@ COPY crates ./crates
 COPY release-keys ./release-keys
 # The coordinator embeds the web UI at compile time.
 COPY --from=ui /src/ui/dist ./ui/dist
-RUN test -f ui/dist/index.html && cargo build --release -p coordinator
+RUN test -f ui/dist/index.html && cargo build --locked --release -p coordinator
 
 FROM debian:bookworm-slim
 RUN apt-get update \

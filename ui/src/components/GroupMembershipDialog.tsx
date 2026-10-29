@@ -47,7 +47,7 @@ export function GroupMembershipDialog({ op, groups, deviceIds, onApply, onClose 
   const title = op === 'add' ? 'Add to group' : 'Remove from group'
 
   return (
-    <Modal title={title} onClose={onClose}>
+    <Modal title={title} onClose={onClose} busy={busy}>
       {choices.length === 0 ? (
         <p className="muted">
           {groups.length === 0
@@ -58,7 +58,13 @@ export function GroupMembershipDialog({ op, groups, deviceIds, onApply, onClose 
         <>
           <div className="field">
             <label htmlFor={`${id}-group`}>Group</label>
-            <select id={`${id}-group`} data-autofocus value={groupId} onChange={(e) => setGroupId(e.target.value)}>
+            <select
+              id={`${id}-group`}
+              data-autofocus
+              value={groupId}
+              disabled={busy}
+              onChange={(e) => setGroupId(e.target.value)}
+            >
               {choices.map((g) => (
                 <option key={g.id} value={g.id}>
                   {g.name} ({plural(g.device_ids.length, 'member')})
@@ -84,7 +90,7 @@ export function GroupMembershipDialog({ op, groups, deviceIds, onApply, onClose 
         </p>
       ) : null}
       <div className="modal-actions">
-        <button type="button" onClick={onClose}>
+        <button type="button" onClick={onClose} disabled={busy}>
           Cancel
         </button>
         {choices.length > 0 ? (

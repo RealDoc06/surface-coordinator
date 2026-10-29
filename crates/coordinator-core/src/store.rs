@@ -1,10 +1,11 @@
 //! SQLite storage.
 //!
-//! One connection behind a mutex, used from async code through
-//! [`Store::call`], which runs the closure on the blocking pool. The query
-//! functions themselves are synchronous and take the connection.
+//! Async requests share bounded batches on one blocking worker. Each request
+//! is isolated by a savepoint; replies follow the batch's durable WAL commit.
+//! The query functions themselves are synchronous and take the connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,6 +126,39 @@ const MIGRATIONS: &[&str] = &["
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+", "
+    ALTER TABLE job_targets ADD COLUMN cancel_requested INTEGER;
+    CREATE INDEX jobs_by_created ON jobs(created);
+    CREATE INDEX job_targets_by_device_created ON job_targets(device_id, created);
+    CREATE INDEX job_targets_queued_expiry ON job_targets(created) WHERE state = 'queued';
+", "
+    UPDATE job_targets SET cancel_requested = finished
+        WHERE state = 'failed' AND reason = 'cancelled' AND cancel_requested IS NULL;
+    CREATE INDEX job_targets_cancellations ON job_targets(device_id, cancel_requested)
+        WHERE cancel_requested IS NOT NULL;
+", "
+    CREATE INDEX job_targets_replay ON job_targets(device_id)
+        WHERE state IN ('sent', 'running') AND cancel_requested IS NULL;
+", "
+    ALTER TABLE job_targets ADD COLUMN output_bytes INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE job_targets ADD COLUMN output_chars INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE job_target_output_chunks (
+        target_id TEXT NOT NULL REFERENCES job_targets(id) ON DELETE CASCADE,
+        seq       INTEGER NOT NULL,
+        data      TEXT NOT NULL,
+        PRIMARY KEY (target_id, seq)
+    ) WITHOUT ROWID;
+    CREATE TRIGGER compact_finished_target_output AFTER UPDATE OF state ON job_targets
+    WHEN NEW.state NOT IN ('sent', 'running')
+      AND EXISTS (SELECT 1 FROM job_target_output_chunks WHERE target_id = NEW.id)
+    BEGIN
+        UPDATE job_targets SET output = output || COALESCE((
+            SELECT group_concat(data, '') FROM (
+                SELECT data FROM job_target_output_chunks WHERE target_id = NEW.id ORDER BY seq
+            )
+        ), '') WHERE id = NEW.id;
+        DELETE FROM job_target_output_chunks WHERE target_id = NEW.id;
+    END;
 "];
 
 /// Current time as Unix milliseconds.
@@ -138,6 +172,119 @@ pub fn now_ms() -> i64 {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    work: Arc<Mutex<WorkQueue>>,
+    /// Admitted work, including the current batch. Further callers wait asynchronously.
+    capacity: Arc<tokio::sync::Semaphore>,
+}
+
+const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_COMMIT_BATCH: usize = 64;
+/// Bound newly delivered work on clients that execute their queue serially.
+const MAX_IN_FLIGHT_TARGETS: i64 = 16;
+type Completion = Box<dyn FnOnce(&Result<(), String>) + Send>;
+type Work = Box<dyn FnOnce(Option<&mut Connection>) -> (Completion, bool) + Send>;
+
+#[derive(Default)]
+struct WorkQueue {
+    pending: VecDeque<Work>,
+    running: bool,
+}
+
+/// Existing multi-statement operations remain atomic both inside an async
+/// batch and when called directly by the administration CLI.
+enum WriteTransaction<'a> {
+    Transaction(rusqlite::Transaction<'a>),
+    Savepoint(rusqlite::Savepoint<'a>),
+}
+
+impl<'a> WriteTransaction<'a> {
+    fn new(conn: &'a mut Connection) -> rusqlite::Result<Self> {
+        if conn.is_autocommit() {
+            conn.transaction_with_behavior(TransactionBehavior::Immediate).map(Self::Transaction)
+        } else {
+            conn.savepoint().map(Self::Savepoint)
+        }
+    }
+
+    fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Transaction(transaction) => transaction.commit(),
+            Self::Savepoint(savepoint) => savepoint.commit(),
+        }
+    }
+}
+
+impl Deref for WriteTransaction<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Transaction(transaction) => transaction,
+            Self::Savepoint(savepoint) => savepoint,
+        }
+    }
+}
+
+fn isolated_request<T>(
+    conn: &mut Connection,
+    work: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
+) -> (Result<T, Error>, bool) {
+    if let Err(error) = conn.execute_batch("SAVEPOINT sc_request") {
+        return (Err(error.into()), true);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(conn)))
+        .map_err(|_| Error::Internal("database operation panicked".into()))
+        .and_then(|result| result.map_err(Error::from));
+    let closed = if result.is_ok() {
+        conn.execute_batch("RELEASE sc_request")
+    } else {
+        conn.execute_batch("ROLLBACK TO sc_request; RELEASE sc_request")
+    };
+    match closed {
+        Ok(()) => (result, false),
+        Err(error) => (Err(error.into()), true),
+    }
+}
+
+/// Drains ready work without delaying the first request to fill a batch. A
+/// single FULL-synchronous commit amortizes disk flushes across busy devices.
+fn drain_work(conn: Arc<Mutex<Connection>>, work: Arc<Mutex<WorkQueue>>) {
+    loop {
+        let batch: Vec<_> = {
+            let mut queue = work.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.pending.is_empty() {
+                // Changing this while holding the queue lock prevents a
+                // caller's wakeup from being lost as this worker exits.
+                queue.running = false;
+                return;
+            }
+            let count = queue.pending.len().min(MAX_COMMIT_BATCH);
+            queue.pending.drain(..count).collect()
+        };
+        let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut failure = conn.execute_batch("BEGIN IMMEDIATE").err().map(|error| error.to_string());
+        let mut completions = Vec::with_capacity(batch.len());
+        for request in batch {
+            let (complete, aborted) = request(if failure.is_none() { Some(&mut conn) } else { None });
+            completions.push(complete);
+            // Disk-full/I/O errors can roll back SQLite's outer transaction.
+            // Never let a later savepoint become its own independent commit.
+            if failure.is_none() && (aborted || conn.is_autocommit()) {
+                failure = Some("database batch transaction was interrupted".into());
+            }
+        }
+        let committed = match failure {
+            Some(error) => Err(error),
+            None => conn.execute_batch("COMMIT").map_err(|error| error.to_string()),
+        };
+        if committed.is_err() && !conn.is_autocommit() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        drop(conn);
+        for complete in completions {
+            complete(&committed);
+        }
+    }
 }
 
 impl Store {
@@ -147,26 +294,56 @@ impl Store {
         let path: PathBuf = data_dir.join(DB_FILE);
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Grouping commits must not weaken acknowledgement durability.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
-        Ok(Store { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Store {
+            conn: Arc::new(Mutex::new(conn)),
+            work: Arc::new(Mutex::new(WorkQueue::default())),
+            capacity: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_REQUESTS)),
+        })
     }
 
-    /// Runs `f` with the connection on the blocking pool.
+    /// Runs `f` in a savepoint on the blocking pool. A successful reply means
+    /// the encompassing FULL-synchronous transaction has committed.
     pub async fn call<T, F>(&self, f: F) -> Result<T, Error>
     where
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            f(&mut conn)
-        })
-        .await
-        .map_err(|e| Error::Internal(e.to_string()))?
-        .map_err(Error::from)
+        let permit = self.capacity.clone().acquire_owned().await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let request: Work = Box::new(move |conn| {
+            let (result, aborted) = match conn {
+                Some(conn) => isolated_request(conn, f),
+                None => (Err(Error::Internal("database batch could not start".into())), false),
+            };
+            let complete: Completion = Box::new(move |committed| {
+                let _permit = permit;
+                let result = match committed {
+                    Ok(()) => result,
+                    Err(error) => Err(Error::Internal(format!("database commit failed: {error}"))),
+                };
+                let _ = reply.send(result);
+            });
+            (complete, aborted)
+        });
+        let start_worker = {
+            let mut work = self.work.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            work.pending.push_back(request);
+            let start = !work.running;
+            work.running = true;
+            start
+        };
+        if start_worker {
+            let conn = self.conn.clone();
+            let work = self.work.clone();
+            tokio::task::spawn_blocking(move || drain_work(conn, work));
+        }
+        received.await.map_err(|error| Error::Internal(error.to_string()))?
     }
 
     /// Runs `f` with the connection on the calling thread.
@@ -184,10 +361,41 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        if index == 9 {
+            migrate_output_counts(&tx)?;
+            // Resume old running jobs on the same append path. Completed
+            // rows retain their original representation for offline readers.
+            tx.execute_batch("INSERT INTO job_target_output_chunks (target_id, seq, data)
+                SELECT id, 0, output FROM job_targets
+                WHERE state IN ('sent', 'running') AND length(CAST(output AS BLOB)) > 0;
+                UPDATE job_targets SET output = '' WHERE state IN ('sent', 'running');")?;
+        }
         tx.pragma_update(None, "user_version", index + 1)?;
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Count existing output in bounded pages. SQLite length(TEXT) stops at NUL,
+/// whereas event offsets and the browser count every Unicode code point.
+fn migrate_output_counts(conn: &Connection) -> rusqlite::Result<()> {
+    let mut after = i64::MIN;
+    loop {
+        let rows = conn.prepare(
+            "SELECT rowid, id, output FROM job_targets WHERE rowid > ?1 ORDER BY rowid LIMIT 256",
+        )?.query_map([after], |row| {
+            let output: String = row.get(2)?;
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, output.len(), output.chars().count()))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (rowid, id, bytes, chars) in rows {
+            conn.execute("UPDATE job_targets SET output_bytes = ?2, output_chars = ?3 WHERE id = ?1",
+                params![id, bytes as i64, chars as i64])?;
+            after = rowid;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- keys
@@ -382,17 +590,23 @@ pub fn upsert_device_online(conn: &Connection, device: &DeviceInfo<'_>) -> rusql
     Ok(())
 }
 
-pub fn set_device_offline(conn: &Connection, id: &str, last_seen: i64) -> rusqlite::Result<()> {
-    conn.execute(
+pub fn set_device_offline(conn: &mut Connection, id: &str, last_seen: i64) -> rusqlite::Result<Vec<TargetChange>> {
+    let tx = WriteTransaction::new(conn)?;
+    tx.execute(
         "UPDATE devices SET online = 0, last_seen = ?2 WHERE id = ?1",
         params![id, last_seen],
     )?;
-    Ok(())
+    let changes = settle_pending_cancels(&tx, Some(id))?;
+    tx.commit()?;
+    Ok(changes)
 }
 
 /// Clears online flags left behind by a server that did not stop cleanly.
-pub fn mark_all_devices_offline(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute("UPDATE devices SET online = 0 WHERE online = 1", [])?;
+pub fn mark_all_devices_offline(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = WriteTransaction::new(conn)?;
+    tx.execute("UPDATE devices SET online = 0 WHERE online = 1", [])?;
+    settle_pending_cancels(&tx, None)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -521,7 +735,7 @@ pub fn create_job(
     targets: &Targets,
     done_if_on_version: Option<&Version>,
 ) -> rusqlite::Result<Result<Job, CreateJobError>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     let device_ids: Vec<String> = match targets {
         Targets::All => tx
             .prepare("SELECT id FROM devices ORDER BY hostname, id")?
@@ -600,11 +814,35 @@ pub fn create_job(
     Ok(Ok(job))
 }
 
+// Completed output remains in the original column. Unresolved jobs append
+// small durable rows instead of rewriting an ever-growing output string.
+const TARGET_OUTPUT_SQL: &str = "t.output || COALESCE((
+    SELECT group_concat(data, '') FROM (
+        SELECT data FROM job_target_output_chunks WHERE target_id = t.id ORDER BY seq
+    )
+), '')";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetOutput {
+    pub output: String,
+    pub output_truncated: bool,
+}
+
+/// Reads only the selected target, including its unmaterialized live output.
+pub fn get_target_output(conn: &Connection, job_id: &str, target_id: &str) -> rusqlite::Result<Option<TargetOutput>> {
+    conn.query_row(
+        &format!("SELECT {TARGET_OUTPUT_SQL}, t.output_truncated FROM job_targets t WHERE t.job_id = ?1 AND t.id = ?2"),
+        params![job_id, target_id],
+        |row| Ok(TargetOutput { output: row.get(0)?, output_truncated: row.get(1)? }),
+    ).optional()
+}
+
 fn job_targets(conn: &Connection, job_id: &str, with_output: bool) -> rusqlite::Result<Vec<JobTarget>> {
+    let output = if with_output { TARGET_OUTPUT_SQL } else { "NULL" };
     conn.prepare(
-        "SELECT id, device_id, state, exit_code, reason, message, output, output_truncated,
+        &format!("SELECT t.id, device_id, state, exit_code, reason, message, {output}, output_truncated,
                 created, started, finished
-         FROM job_targets WHERE job_id = ?1 ORDER BY rowid",
+         FROM job_targets t WHERE job_id = ?1 ORDER BY t.rowid"),
     )?
     .query_map([job_id], |row| {
         Ok(JobTarget {
@@ -725,58 +963,82 @@ pub fn get_target_change(conn: &Connection, target_id: &str) -> rusqlite::Result
 /// A job target ready to be sent to its device.
 #[derive(Debug, Clone)]
 pub struct Dispatch {
+    pub rowid: i64,
     pub job_target_id: String,
     pub job_id: String,
     pub kind: String,
     pub payload: serde_json::Value,
 }
 
-/// Returns the targets to send to a device, oldest first, and marks the
-/// queued ones as sent (those are also returned as changes). With
-/// `include_unresolved`, targets already sent or running are returned too
-/// (for re-delivery after a reconnect; the client ignores the ones it
-/// already has). With `only_kind`, targets of other kinds are left alone
-/// (a restricted connection only takes `client.update`).
-pub fn take_dispatchable(
+/// Loads one target in insertion order, marking queued work sent. Previously
+/// sent work after this connection's cursor is replayed once on reconnect.
+/// New queued work is eligible even if SQLite reused a deleted rowid.
+pub fn take_next_dispatchable(
     conn: &mut Connection,
     device_id: &str,
-    include_unresolved: bool,
+    after_rowid: i64,
     only_kind: Option<&str>,
-) -> rusqlite::Result<(Vec<Dispatch>, Vec<TargetChange>)> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let states = if include_unresolved { "('queued', 'sent', 'running')" } else { "('queued')" };
-    let rows: Vec<(Dispatch, bool)> = tx
-        .prepare(&format!(
-            "SELECT t.id, j.id, j.kind, j.payload, t.state = 'queued'
+) -> rusqlite::Result<Option<(Dispatch, Option<TargetChange>)>> {
+    let tx = WriteTransaction::new(conn)?;
+    // Each ordered candidate uses an index range and loads at most one row.
+    // Combining queued work and replay in one OR query would repeatedly sort
+    // the entire unresolved backlog for every message sent.
+    let mut queued: Option<i64> = tx.query_row(
+        "SELECT t.rowid FROM job_targets t
+         WHERE device_id = ?1 AND state = 'queued' AND cancel_requested IS NULL
+           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id AND j.kind = ?2))
+         ORDER BY t.rowid LIMIT 1",
+        params![device_id, only_kind], |row| row.get(0),
+    ).optional()?;
+    if queued.is_some() {
+        let in_flight: i64 = tx.query_row(
+            "SELECT count(*) FROM job_targets t
+             WHERE device_id = ?1 AND state IN ('sent', 'running')
+               AND (?2 IS NULL OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id AND j.kind = ?2))",
+            params![device_id, only_kind], |row| row.get(0),
+        )?;
+        if in_flight >= MAX_IN_FLIGHT_TARGETS {
+            queued = None;
+        }
+    }
+    let replay: Option<i64> = tx.query_row(
+        "SELECT t.rowid FROM job_targets t INDEXED BY job_targets_replay
+         WHERE device_id = ?1 AND state IN ('sent', 'running') AND cancel_requested IS NULL
+           AND t.rowid > ?2
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = t.job_id AND j.kind = ?3))
+         ORDER BY t.rowid LIMIT 1",
+        params![device_id, after_rowid, only_kind], |row| row.get(0),
+    ).optional()?;
+    let Some(rowid) = [queued, replay].into_iter().flatten().min() else { return Ok(None) };
+    let row = tx.query_row(
+            "SELECT t.id, j.id, j.kind, j.payload, t.state = 'queued', t.rowid
              FROM job_targets t JOIN jobs j ON j.id = t.job_id
-             WHERE t.device_id = ?1 AND t.state IN {states} AND (?2 IS NULL OR j.kind = ?2)
-             ORDER BY t.created, t.rowid"
-        ))?
-        .query_map(params![device_id, only_kind], |row| {
+             WHERE t.rowid = ?1",
+        [rowid], |row| {
             let payload: String = row.get(3)?;
             Ok((
                 Dispatch {
+                    rowid: row.get(5)?,
                     job_target_id: row.get(0)?,
                     job_id: row.get(1)?,
                     kind: row.get(2)?,
                     payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
                 },
-                row.get(4)?,
+                row.get::<_, bool>(4)?,
             ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut changes = Vec::new();
-    for (dispatch, was_queued) in &rows {
-        if *was_queued {
-            tx.execute(
-                "UPDATE job_targets SET state = 'sent' WHERE id = ?1 AND state = 'queued'",
-                [&dispatch.job_target_id],
-            )?;
-            changes.extend(get_target_change(&tx, &dispatch.job_target_id)?);
-        }
-    }
+        }).optional()?;
+    let Some((dispatch, was_queued)) = row else { return Ok(None) };
+    let change = if was_queued {
+        tx.execute(
+            "UPDATE job_targets SET state = 'sent' WHERE id = ?1 AND state = 'queued'",
+            [&dispatch.job_target_id],
+        )?;
+        get_target_change(&tx, &dispatch.job_target_id)?
+    } else {
+        None
+    };
     tx.commit()?;
-    Ok((rows.into_iter().map(|(dispatch, _)| dispatch).collect(), changes))
+    Ok(Some((dispatch, change)))
 }
 
 /// `sent` → `running`. Repeats are harmless and return `None`.
@@ -817,11 +1079,10 @@ pub fn append_target_output(
     data: &str,
     max_bytes: usize,
 ) -> rusqlite::Result<Option<OutputAppended>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // `length` of TEXT counts characters, of a BLOB bytes.
+    let tx = WriteTransaction::new(conn)?;
     let current: Option<(i64, i64, i64, bool, String)> = tx
         .query_row(
-            "SELECT last_seq, length(CAST(output AS BLOB)), length(output), output_truncated, job_id
+            "SELECT last_seq, output_bytes, output_chars, output_truncated, job_id
              FROM job_targets
              WHERE id = ?1 AND device_id = ?2 AND state IN ('sent', 'running')",
             params![target_id, device_id],
@@ -841,25 +1102,26 @@ pub fn append_target_output(
         None
     } else {
         let remaining = max_bytes.saturating_sub(stored_bytes as usize);
-        if data.len() <= remaining {
-            tx.execute(
-                "UPDATE job_targets SET output = output || ?2, last_seq = ?3 WHERE id = ?1",
-                params![target_id, data, seq],
-            )?;
-            Some(OutputAppended { job_id, data: data.to_owned(), truncated: false, offset })
+        let (kept, truncated) = if data.len() <= remaining {
+            (data.to_owned(), false)
         } else {
             let mut cut = remaining;
             while !data.is_char_boundary(cut) {
                 cut -= 1;
             }
-            let kept = format!("{}{}", &data[..cut], TRUNCATION_MARKER);
-            tx.execute(
-                "UPDATE job_targets SET output = output || ?2, last_seq = ?3, output_truncated = 1
-                 WHERE id = ?1",
-                params![target_id, kept, seq],
-            )?;
-            Some(OutputAppended { job_id, data: kept, truncated: true, offset })
+            (format!("{}{}", &data[..cut], TRUNCATION_MARKER), true)
+        };
+        // Empty chunks advance de-duplication without consuming durable rows.
+        if !kept.is_empty() {
+            tx.execute("INSERT INTO job_target_output_chunks (target_id, seq, data) VALUES (?1, ?2, ?3)",
+                params![target_id, seq, kept])?;
         }
+        tx.execute(
+            "UPDATE job_targets SET last_seq = ?2, output_bytes = output_bytes + ?3,
+             output_chars = output_chars + ?4, output_truncated = ?5 WHERE id = ?1",
+            params![target_id, seq, kept.len() as i64, kept.chars().count() as i64, truncated],
+        )?;
+        Some(OutputAppended { job_id, data: kept, truncated, offset })
     };
     tx.commit()?;
     Ok(appended)
@@ -872,9 +1134,9 @@ pub struct TargetResult<'a> {
     pub message: Option<&'a str>,
 }
 
-/// Records the final result of a target that is still unresolved and belongs
-/// to the device. Anything else (a repeat, a target of another device, an
-/// unknown id) changes nothing and returns `None`.
+/// Records an unresolved target's result, including an unconfirmed Wi-Fi
+/// handoff. Confirmed results, other devices' targets and unknown ids are
+/// unchanged and return `None`.
 pub fn finish_target(
     conn: &Connection,
     target_id: &str,
@@ -885,8 +1147,9 @@ pub fn finish_target(
     let changed = conn.execute(
         "UPDATE job_targets
          SET state = ?3, exit_code = ?4, reason = ?5, message = ?6, finished = ?7
-         WHERE id = ?1 AND device_id = ?2 AND state IN ('sent', 'running')",
-        params![target_id, device_id, state, result.exit_code, result.reason, result.message, now_ms()],
+         WHERE id = ?1 AND device_id = ?2
+           AND (state IN ('sent', 'running') OR (state = 'failed' AND reason = ?8))",
+        params![target_id, device_id, state, result.exit_code, result.reason, result.message, now_ms(), HANDOFF_UNCONFIRMED],
     )?;
     if changed == 0 {
         return Ok(None);
@@ -909,6 +1172,8 @@ pub struct Cancelled {
 /// `signal(device_id, job_target_id)` tries to tell the device to stop and
 /// returns whether it could; if so the target is left for the device's
 /// `job.result` to settle, otherwise (the device is gone) it fails at once.
+/// In-flight power targets always await the device's result: its native
+/// operation may already be committed and cannot reliably be cancelled.
 /// The caller holds the presence lock around this, so a device cannot go
 /// offline between `signal` and the commit without that being seen.
 pub fn cancel_job(
@@ -916,12 +1181,12 @@ pub fn cancel_job(
     job_id: &str,
     mut signal: impl FnMut(&str, &str) -> bool,
 ) -> rusqlite::Result<Option<Cancelled>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let exists: bool =
-        tx.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1)", [job_id], |row| row.get(0))?;
-    if !exists {
+    let tx = WriteTransaction::new(conn)?;
+    let kind: Option<String> =
+        tx.query_row("SELECT kind FROM jobs WHERE id = ?1", [job_id], |row| row.get(0)).optional()?;
+    let Some(kind) = kind else {
         return Ok(None);
-    }
+    };
     let unfinished: Vec<(String, String, String)> = tx
         .prepare(
             "SELECT id, device_id, state FROM job_targets
@@ -931,7 +1196,19 @@ pub fn cancel_job(
         .collect::<rusqlite::Result<_>>()?;
     let mut changes = Vec::new();
     for (target_id, device_id, state) in unfinished {
-        if state != target_state::QUEUED && signal(&device_id, &target_id) {
+        // Persist the intent before queueing the signal. A lost socket or a
+        // coordinator restart must never cause this target to run again.
+        // Keep per-device ordering when cancellations happen in one clock
+        // tick or the wall clock moves backwards during a live connection.
+        tx.execute(
+            "UPDATE job_targets SET cancel_requested = COALESCE(cancel_requested,
+                MAX(?2, COALESCE((SELECT MAX(cancel_requested) FROM job_targets WHERE device_id = ?3), 0) + 1))
+             WHERE id = ?1",
+            params![target_id, now_ms(), device_id],
+        )?;
+        if state != target_state::QUEUED
+            && (signal(&device_id, &target_id) || kind == protocol::job_kind::POWER)
+        {
             continue;
         }
         tx.execute(
@@ -947,23 +1224,59 @@ pub fn cancel_job(
     Ok(Some(Cancelled { job, changes }))
 }
 
-/// A device's targets that were cancelled since `since`, oldest first. A
-/// target cancelled while its device was offline may still be running there,
-/// so the device is told again when it connects; it ignores ids it does not
-/// know.
-pub fn cancelled_targets_since(conn: &Connection, device_id: &str, since: i64) -> rusqlite::Result<Vec<String>> {
-    conn.prepare(
+/// Once a cancelled device disconnects, settle its targets as we do for an
+/// offline cancellation. The stored cancellation is replayed when it returns.
+/// Power operations may be committed already, so only their device can settle them.
+fn settle_pending_cancels(conn: &Connection, device_id: Option<&str>) -> rusqlite::Result<Vec<TargetChange>> {
+    let ids = conn.prepare(
         "SELECT id FROM job_targets
-         WHERE device_id = ?1 AND state = 'failed' AND reason = ?2 AND finished >= ?3
-         ORDER BY finished, rowid",
-    )?
-    .query_map(params![device_id, protocol::reason::CANCELLED, since], |row| row.get(0))?
-    .collect()
+         WHERE cancel_requested IS NOT NULL AND state IN ('sent', 'running')
+           AND (?1 IS NULL OR device_id = ?1)
+           AND EXISTS (SELECT 1 FROM jobs WHERE id = job_targets.job_id AND kind != ?2)",
+    )?.query_map(params![device_id, protocol::job_kind::POWER], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut changes = Vec::new();
+    for id in ids {
+        conn.execute(
+            "UPDATE job_targets SET state = 'failed', exit_code = NULL, reason = ?2,
+             message = NULL, finished = ?3 WHERE id = ?1",
+            params![id, protocol::reason::CANCELLED, now_ms()],
+        )?;
+        changes.extend(get_target_change(conn, &id)?);
+    }
+    Ok(changes)
+}
+
+pub struct Cancellation {
+    pub target_id: String,
+    pub requested_at: i64,
+    pub rowid: i64,
+}
+
+/// Replays cancellations once per connection, with constant memory even
+/// after a large offline backlog. Unacknowledged requests do not expire.
+pub fn next_cancellation(
+    conn: &Connection,
+    device_id: &str,
+    since: i64,
+    after: (i64, i64),
+) -> rusqlite::Result<Option<Cancellation>> {
+    conn.query_row(
+        "SELECT id, cancel_requested, rowid FROM job_targets
+         WHERE device_id = ?1
+           AND cancel_requested IS NOT NULL
+           AND (cancel_requested > ?4 OR (cancel_requested = ?4 AND rowid > ?5))
+           AND ((state = 'failed' AND reason = ?2 AND finished >= ?3)
+             OR state IN ('sent', 'running'))
+         ORDER BY cancel_requested, rowid LIMIT 1",
+        params![device_id, protocol::reason::CANCELLED, since, after.0, after.1],
+        |row| Ok(Cancellation { target_id: row.get(0)?, requested_at: row.get(1)?, rowid: row.get(2)? }),
+    ).optional()
 }
 
 /// Expires targets that have been queued since before `cutoff`.
 pub fn expire_queued_targets(conn: &mut Connection, cutoff: i64) -> rusqlite::Result<Vec<TargetChange>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     let ids: Vec<String> = tx
         .prepare("SELECT id FROM job_targets WHERE state = 'queued' AND created < ?1")?
         .query_map([cutoff], |row| row.get(0))?
@@ -980,24 +1293,23 @@ pub fn expire_queued_targets(conn: &mut Connection, cutoff: i64) -> rusqlite::Re
     Ok(changes)
 }
 
-/// Recorded on a `wifi.join` target presumed to have succeeded.
-pub const PRESUMED_JOINED_MESSAGE: &str = "The device left this coordinator's network and did not \
-return. It is presumed to have joined the new network and may be reporting to another coordinator.";
+pub const HANDOFF_UNCONFIRMED: &str = "handoff_unconfirmed";
+/// Silence does not establish whether Wi-Fi association succeeded.
+pub const UNCONFIRMED_HANDOFF_MESSAGE: &str = "The device disconnected before confirming the new \
+network. Check the device or its destination coordinator before retrying.";
 
-/// Marks `wifi.join` targets that are still running as succeeded when their
-/// device has been gone since before `cutoff`. A device that joined the new
-/// network reports to whichever coordinator it reached, so this one never
-/// hears the result.
+/// Marks a running `wifi.join` unconfirmed once its device has been gone
+/// since before `cutoff`. An actual result can still resolve this later.
 ///
 /// `is_online` must come from the live connection table; the stored flag can
 /// lag behind it. The caller holds the presence lock so that the stored
 /// `last_seen` and the table agree.
-pub fn presume_wifi_joins_succeeded(
+pub fn mark_wifi_handoffs_unconfirmed(
     conn: &mut Connection,
     cutoff: i64,
     is_online: impl Fn(&str) -> bool,
 ) -> rusqlite::Result<Vec<TargetChange>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     let candidates: Vec<(String, String)> = tx
         .prepare(
             "SELECT t.id, t.device_id
@@ -1016,9 +1328,9 @@ pub fn presume_wifi_joins_succeeded(
         }
         tx.execute(
             "UPDATE job_targets
-             SET state = 'succeeded', exit_code = NULL, reason = NULL, message = ?2, finished = ?3
+             SET state = 'failed', exit_code = NULL, reason = ?4, message = ?2, finished = ?3
              WHERE id = ?1 AND state = 'running'",
-            params![target_id, PRESUMED_JOINED_MESSAGE, now_ms()],
+            params![target_id, UNCONFIRMED_HANDOFF_MESSAGE, now_ms(), HANDOFF_UNCONFIRMED],
         )?;
         changes.extend(get_target_change(&tx, &target_id)?);
     }
@@ -1079,7 +1391,7 @@ pub struct DeviceDeleted {
 /// without any target are removed too. Returns `None` if there was no such
 /// device.
 pub fn delete_device(conn: &mut Connection, device_id: &str) -> rusqlite::Result<Option<DeviceDeleted>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     tx.execute("DELETE FROM job_targets WHERE device_id = ?1", [device_id])?;
     tx.execute(
         "DELETE FROM jobs WHERE NOT EXISTS (SELECT 1 FROM job_targets t WHERE t.job_id = jobs.id)",
@@ -1281,7 +1593,7 @@ pub fn create_group(conn: &Connection, name: &str) -> rusqlite::Result<Option<Gr
 }
 
 pub fn rename_group(conn: &mut Connection, id: &str, name: &str) -> rusqlite::Result<Result<Group, GroupError>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     if get_group(&tx, id)?.is_none() {
         return Ok(Err(GroupError::NotFound));
     }
@@ -1302,7 +1614,7 @@ pub fn rename_group(conn: &mut Connection, id: &str, name: &str) -> rusqlite::Re
 
 /// Deletes a group; its members stay. Returns false if there was none.
 pub fn delete_group(conn: &mut Connection, id: &str) -> rusqlite::Result<bool> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     tx.execute("DELETE FROM group_members WHERE group_id = ?1", [id])?;
     let deleted = tx.execute("DELETE FROM groups WHERE id = ?1", [id])?;
     tx.commit()?;
@@ -1315,7 +1627,7 @@ pub fn set_group_members(
     id: &str,
     device_ids: &[String],
 ) -> rusqlite::Result<Result<Group, GroupError>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     if get_group(&tx, id)?.is_none() {
         return Ok(Err(GroupError::NotFound));
     }
@@ -1416,7 +1728,7 @@ pub fn update_script(
     shell: &str,
     body: &str,
 ) -> rusqlite::Result<Result<Script, ScriptError>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     match get_script(&tx, id)? {
         None => return Ok(Err(ScriptError::NotFound)),
         Some(script) if script.built_in => return Ok(Err(ScriptError::BuiltIn)),
@@ -1440,7 +1752,7 @@ pub fn update_script(
 }
 
 pub fn delete_script(conn: &mut Connection, id: &str) -> rusqlite::Result<Result<(), ScriptError>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     match get_script(&tx, id)? {
         None => return Ok(Err(ScriptError::NotFound)),
         Some(script) if script.built_in => return Ok(Err(ScriptError::BuiltIn)),
@@ -1456,7 +1768,7 @@ pub fn delete_script(conn: &mut Connection, id: &str) -> rusqlite::Result<Result
 /// coordinator updates them). A built-in whose name a user's script already
 /// uses is left alone rather than failing the start.
 pub fn seed_builtin_scripts(conn: &mut Connection) -> rusqlite::Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = WriteTransaction::new(conn)?;
     let now = now_ms();
     for script in &crate::builtin_scripts::BUILT_IN_SCRIPTS {
         let name_in_use: bool = tx.query_row(
@@ -1532,20 +1844,25 @@ pub fn get_account_for_login(conn: &Connection, username: &str) -> rusqlite::Res
 }
 
 /// Sets a new password hash and ends the account's sessions.
-pub fn set_account_password(conn: &Connection, id: &str, password_hash: &str) -> rusqlite::Result<bool> {
-    let changed = conn.execute(
+pub fn set_account_password(conn: &mut Connection, id: &str, password_hash: &str) -> rusqlite::Result<bool> {
+    let tx = WriteTransaction::new(conn)?;
+    let changed = tx.execute(
         "UPDATE accounts SET password_hash = ?2 WHERE id = ?1",
         params![id, password_hash],
     )?;
     if changed > 0 {
-        conn.execute("DELETE FROM sessions WHERE account_id = ?1", [id])?;
+        tx.execute("DELETE FROM sessions WHERE account_id = ?1", [id])?;
     }
+    tx.commit()?;
     Ok(changed > 0)
 }
 
-pub fn delete_account(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
-    conn.execute("DELETE FROM sessions WHERE account_id = ?1", [id])?;
-    Ok(conn.execute("DELETE FROM accounts WHERE id = ?1", [id])? > 0)
+pub fn delete_account(conn: &mut Connection, id: &str) -> rusqlite::Result<bool> {
+    let tx = WriteTransaction::new(conn)?;
+    tx.execute("DELETE FROM sessions WHERE account_id = ?1", [id])?;
+    let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", [id])? > 0;
+    tx.commit()?;
+    Ok(deleted)
 }
 
 pub fn find_account_by_username(conn: &Connection, username: &str) -> rusqlite::Result<Option<Account>> {
@@ -1569,6 +1886,24 @@ pub fn create_session(
     Ok(())
 }
 
+/// Opens an account session only if the password verified outside the database
+/// is still current. A racing password reset or account deletion wins cleanly.
+pub fn create_account_session(
+    conn: &Connection,
+    token_hash: &str,
+    account_id: &str,
+    verified_password_hash: &str,
+    expires: i64,
+) -> rusqlite::Result<bool> {
+    conn.execute("DELETE FROM sessions WHERE expires < ?1", [now_ms()])?;
+    let created = conn.execute(
+        "INSERT INTO sessions (token_hash, account_id, created, expires)
+         SELECT ?1, id, ?4, ?5 FROM accounts WHERE id = ?2 AND password_hash = ?3",
+        params![token_hash, account_id, verified_password_hash, now_ms(), expires],
+    )?;
+    Ok(created > 0)
+}
+
 /// A live session: `Some(None)` is a token-mode session without an account.
 pub fn get_session(conn: &Connection, token_hash: &str) -> rusqlite::Result<Option<Option<Account>>> {
     conn.query_row(
@@ -1587,9 +1922,8 @@ pub fn get_session(conn: &Connection, token_hash: &str) -> rusqlite::Result<Opti
     .optional()
 }
 
-pub fn delete_session(conn: &Connection, token_hash: &str) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM sessions WHERE token_hash = ?1", [token_hash])?;
-    Ok(())
+pub fn delete_session(conn: &Connection, token_hash: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute("DELETE FROM sessions WHERE token_hash = ?1", [token_hash])? > 0)
 }
 
 /// Ends sessions that are not tied to an account (token-mode sessions).
@@ -1657,4 +1991,238 @@ pub fn list_rejected(conn: &Connection) -> rusqlite::Result<Vec<Rejected>> {
         })
     })?
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn seed_running_output(conn: &Connection, output: &str, last_seq: i64) {
+        conn.execute_batch("INSERT INTO enrollment_keys (id, label, secret, created) VALUES ('key', 'test', 'secret', 0);
+            INSERT INTO devices (id, enrollment_key_id, hostname, os, client_version, first_seen, last_seen)
+                VALUES ('device', 'key', 'test', 'windows', '1.0.0', 0, 0);
+            INSERT INTO jobs (id, kind, payload, created) VALUES ('job', 'script.run', '{}', 0);")
+            .unwrap();
+        conn.execute("INSERT INTO job_targets (id, job_id, device_id, state, output, last_seq, created)
+            VALUES ('target', 'job', 'device', 'running', ?1, ?2, 0)", params![output, last_seq]).unwrap();
+    }
+
+    #[test]
+    fn legacy_live_output_migrates_and_compacts_with_unicode_nul_deduplication_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        for sql in &MIGRATIONS[..9] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        let prefix = "A\0é😀";
+        seed_running_output(&conn, prefix, 7);
+        drop(conn);
+
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| {
+            assert_eq!(conn.query_row("SELECT output_bytes, output_chars FROM job_targets", [],
+                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)))?, (prefix.len(), 4));
+            let chunk = "B\0🚀";
+            let cap = prefix.len() + chunk.len() + 1;
+            let appended = append_target_output(conn, "target", "device", 8, chunk, cap)?.unwrap();
+            assert_eq!((appended.offset, appended.data.as_str()), (4, chunk));
+            assert!(append_target_output(conn, "target", "device", 8, "repeat", cap)?.is_none());
+            let capped = append_target_output(conn, "target", "device", 9, "é", cap)?.unwrap();
+            assert_eq!((capped.offset, capped.truncated), (7, true));
+            assert_eq!(capped.data, TRUNCATION_MARKER);
+            assert!(append_target_output(conn, "target", "device", 10, "discard", cap)?.is_none());
+            let expected = format!("{prefix}{chunk}{TRUNCATION_MARKER}");
+            assert_eq!(get_target_output(conn, "job", "target")?.unwrap().output, expected);
+            assert_eq!(get_job(conn, "job", true)?.unwrap().targets[0].output.as_deref(), Some(expected.as_str()));
+            assert_eq!(conn.query_row("SELECT output FROM job_targets", [], |row| row.get::<_, String>(0))?, "");
+            assert_eq!(conn.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, usize>(0))?, 3);
+            finish_target(conn, "target", "device", &TargetResult { succeeded: true, exit_code: Some(0), reason: None, message: None })?;
+            assert_eq!(conn.query_row("SELECT output FROM job_targets", [], |row| row.get::<_, String>(0))?, expected);
+            assert_eq!(conn.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, usize>(0))?, 0);
+            assert!(append_target_output(conn, "target", "device", 11, "too late", cap)?.is_none());
+            assert!(finish_target(conn, "target", "device", &TargetResult { succeeded: true, exit_code: Some(0), reason: None, message: None })?.is_none());
+            assert_eq!(get_target_output(conn, "job", "target")?.unwrap().output, expected);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_chunks_counters_and_terminal_compaction_roll_back_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| { seed_running_output(conn, "", 0); Ok(()) }).unwrap();
+        assert!(store.call(|conn| -> rusqlite::Result<()> {
+            append_target_output(conn, "target", "device", 1, "rolled back", 1024)?;
+            Err(rusqlite::Error::InvalidQuery)
+        }).await.is_err());
+        store.call_blocking(|conn| {
+            assert_eq!(conn.query_row("SELECT last_seq, output_bytes, output_chars FROM job_targets", [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))?, (0, 0, 0));
+            assert_eq!(conn.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, i64>(0))?, 0);
+            Ok(())
+        }).unwrap();
+        store.call(|conn| append_target_output(conn, "target", "device", 1, "kept\0😀", 1024)).await.unwrap();
+        store.call_blocking(|conn| conn.execute_batch("CREATE TRIGGER fail_compaction BEFORE DELETE ON job_target_output_chunks
+            BEGIN SELECT RAISE(ABORT, 'injected compaction failure'); END;")).unwrap();
+        assert!(store.call(|conn| finish_target(conn, "target", "device", &TargetResult {
+            succeeded: true, exit_code: Some(0), reason: None, message: None,
+        })).await.is_err());
+        store.call_blocking(|conn| {
+            assert_eq!(conn.query_row("SELECT state, output FROM job_targets", [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?, ("running".into(), "".into()));
+            assert_eq!(get_target_output(conn, "job", "target")?.unwrap().output, "kept\0😀");
+            conn.execute_batch("DROP TRIGGER fail_compaction")?;
+            Ok(())
+        }).unwrap();
+        store.call(|conn| finish_target(conn, "target", "device", &TargetResult {
+            succeeded: true, exit_code: Some(0), reason: None, message: None,
+        })).await.unwrap();
+        let reader = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(reader.query_row("SELECT output FROM job_targets", [], |row| row.get::<_, String>(0)).unwrap(), "kept\0😀");
+        assert_eq!(reader.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn cancelling_compacts_output_and_forgetting_a_live_device_removes_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| {
+            seed_running_output(conn, "", 0);
+            append_target_output(conn, "target", "device", 1, "cancelled output", 1024)?;
+            cancel_job(conn, "job", |_, _| false)?.unwrap();
+            assert_eq!(get_target_output(conn, "job", "target")?.unwrap().output, "cancelled output");
+            assert_eq!(conn.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, i64>(0))?, 0);
+            conn.execute("INSERT INTO job_targets (id, job_id, device_id, state, created) VALUES ('live', 'job', 'device', 'running', 0)", [])?;
+            append_target_output(conn, "live", "device", 1, "live output", 1024)?;
+            delete_device(conn, "device")?.unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM job_target_output_chunks", [], |row| row.get::<_, i64>(0))?, 0);
+            Ok(())
+        }).unwrap();
+    }
+
+    /// Holds the current batch while the next requests queue together.
+    async fn hold_batch(store: &Store) -> (tokio::task::JoinHandle<Result<(), Error>>, std::sync::mpsc::Sender<()>) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let store = store.clone();
+        let task = tokio::spawn(async move {
+            store.call(move |_| {
+                let _ = entered.send(());
+                wait.recv_timeout(Duration::from_secs(5)).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(())
+            }).await
+        });
+        ready.await.unwrap();
+        (task, release)
+    }
+
+    async fn wait_queued(store: &Store, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.work.lock().unwrap().pending.len() == count { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("requests did not queue");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_rolls_back_without_losing_other_work_in_its_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")).unwrap();
+        let (blocker, release) = hold_batch(&store).await;
+        let failed_store = store.clone();
+        let failed = tokio::spawn(async move {
+            failed_store.call(|conn| -> rusqlite::Result<()> {
+                conn.execute("INSERT INTO probe VALUES (1)", [])?;
+                Err(rusqlite::Error::InvalidQuery)
+            }).await
+        });
+        wait_queued(&store, 1).await;
+        let succeeded_store = store.clone();
+        let succeeded = tokio::spawn(async move {
+            succeeded_store.call(|conn| conn.execute("INSERT INTO probe VALUES (2)", [])).await
+        });
+        wait_queued(&store, 2).await;
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        assert!(failed.await.unwrap().is_err());
+        assert_eq!(succeeded.await.unwrap().unwrap(), 1);
+        let reader = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        let ids: Vec<i64> = reader.prepare("SELECT id FROM probe").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ids, [2]);
+    }
+
+    #[tokio::test]
+    async fn replies_wait_for_durable_commit_and_commit_failure_rolls_back_every_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| conn.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE probe (id INTEGER PRIMARY KEY);
+             CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);"
+        )).unwrap();
+        assert_eq!(store.call_blocking(|conn| conn.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))).unwrap(), 2);
+        let (blocker, release) = hold_batch(&store).await;
+        let first_store = store.clone();
+        let first = tokio::spawn(async move {
+            first_store.call(|conn| conn.execute("INSERT INTO probe VALUES (1)", [])).await
+        });
+        wait_queued(&store, 1).await;
+        let (written, ready) = tokio::sync::oneshot::channel();
+        let (commit, wait) = std::sync::mpsc::channel();
+        let second_store = store.clone();
+        let second = tokio::spawn(async move {
+            second_store.call(move |conn| {
+                conn.execute("INSERT INTO child VALUES (999)", [])?;
+                let _ = written.send(());
+                wait.recv_timeout(Duration::from_secs(5)).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(())
+            }).await
+        });
+        wait_queued(&store, 2).await;
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        ready.await.unwrap();
+        assert!(!first.is_finished(), "success was returned before the batch committed");
+        let reader = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(reader.query_row("SELECT count(*) FROM probe", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        commit.send(()).unwrap();
+        assert!(first.await.unwrap().is_err());
+        assert!(second.await.unwrap().is_err());
+        for table in ["probe", "child"] {
+            assert_eq!(reader.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        }
+        // The failed commit did not leave the worker or connection stuck.
+        store.call(|conn| conn.execute("INSERT INTO probe VALUES (2)", [])).await.unwrap();
+        assert_eq!(reader.query_row("SELECT id FROM probe", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_batch_never_commits_later_requests_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.call_blocking(|conn| conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")).unwrap();
+        let (blocker, release) = hold_batch(&store).await;
+        let aborted_store = store.clone();
+        let aborted = tokio::spawn(async move {
+            // Simulate SQLite's automatic transaction rollback on an I/O error.
+            aborted_store.call(|conn| conn.execute_batch("ROLLBACK")).await
+        });
+        wait_queued(&store, 1).await;
+        let later_store = store.clone();
+        let later = tokio::spawn(async move {
+            later_store.call(|conn| conn.execute("INSERT INTO probe VALUES (1)", [])).await
+        });
+        wait_queued(&store, 2).await;
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        assert!(aborted.await.unwrap().is_err());
+        assert!(later.await.unwrap().is_err());
+        let reader = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        assert_eq!(reader.query_row("SELECT count(*) FROM probe", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
 }

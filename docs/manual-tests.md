@@ -1,9 +1,12 @@
 # Manual test checklist
 
-Everything here needs real hardware, a real operating system service
-manager, a real network, or a pushed release. None of it runs in the automated
-suite. Work through the groups before a release; tick each box and note the
-version, the machines and anything unexpected.
+These checks cover hardware, operating system services, networks and release
+installers. Some now have opt-in scripts for disposable Windows machines:
+`scripts/client-lifecycle-validate.ps1`, `scripts/client-lifecycle-reboot.ps1`,
+`scripts/manager-vm-validation.ps1` and `scripts/deployment-validation.ps1`.
+They are separate from the ordinary unit suite. The release-specific
+[validation report](validation-0.2.4.md) records completed runs and their evidence;
+unchecked items below are a reusable checklist, not that report.
 
 ```
 Version tested:        Date:        Tester:
@@ -88,11 +91,11 @@ the client port shown (47800 by default).
 ## 2. A device finds and joins the hotspot
 
 Use a device whose enrollment key is the one the hotspot was started for, and
-that has no reachable coordinator (so it is Searching: either no coordinator
-URL configured, or the remote is unreachable).
+that has no reachable coordinator and is disconnected from Wi-Fi. A coordinator
+outage alone must not replace an existing connection.
 
-- [ ] Hotspot on, device in range. Expected: within about a minute (it scans
-  every 30 s) the device joins `SC-xxxxxxxx` and appears **online** in the UI
+- [ ] Hotspot on, disconnected device in range. Expected: discovery retries
+  promptly (normally every 5 s, plus scan/join time), the device joins `SC-xxxxxxxx` and appears **online** in the UI
   of the embedded coordinator; the device list's network column shows the
   hotspot SSID and its IP address.
 - [ ] Run a PowerShell job (`Write-Output hello`) on it. Expected: `succeeded`,
@@ -102,10 +105,22 @@ URL configured, or the remote is unreachable).
   on its network and on the remote coordinator; it never joins the hotspot
   while connected.
 - [ ] Take that device off its network (turn off the router or the device's Wi-Fi
-  and back on to a profile that cannot connect). Expected: after about 60 s
+  and back on to a profile that cannot connect). Expected: after about 20 s
   without a coordinator it starts scanning and joins the hotspot.
-- [ ] Hotspot off, device Searching. Expected: it keeps scanning every 30 s and
+- [ ] Hotspot off, disconnected device Searching. Expected: it keeps searching and
   does not join anything else.
+- [ ] Manually join a working Wi-Fi while the configured coordinator is down
+  and the enrollment hotspot is visible. Leave it for at least 6 minutes.
+  Expected: the client never changes or disconnects the selected network.
+- [ ] Repeat with Windows Location services disabled, and while DHCP is still
+  assigning an address. Expected: a hidden SSID or missing IP does not trigger
+  a blind join or disconnect.
+- [ ] Manually connect during a hotspot scan. Expected: the final adapter-state
+  check preserves the manual connection. Repeat with a disconnected secondary
+  Wi-Fi adapter present.
+- [ ] Repeat **Start** for the same hotspot while clients are connected, including
+  two simultaneous requests. Expected: clients stay connected; Windows hotspot
+  is not restarted.
 - [ ] After the device left the hotspot (group 3), check Windows' saved Wi-Fi
   networks. Expected: the hotspot profile is set to connect manually, so
   Windows does not prefer it when it is in range and the device is online
@@ -125,8 +140,9 @@ during the failure tests.
   and appears online in the **remote** coordinator's UI (new network SSID and
   IP shown).
 - [ ] Back in the embedded coordinator's UI, the job stays `running` until the
-  device has been gone for two minutes, then becomes `succeeded` with a
-  message that the device left and did not return.
+  device has been gone for two minutes, then becomes `failed` with reason
+  `handoff_unconfirmed` and **Destination unconfirmed**. Confirm success at the
+  destination coordinator; absence alone must not produce a success result.
 - [ ] Reboot the device. Expected: it reconnects to the remote coordinator
   (the new URL was stored and the profile auto-connects).
 - [ ] Repeat without a coordinator URL, with the other network having a
@@ -157,6 +173,10 @@ during the failure tests.
 - [ ] Same test with the hotspot turned off. Expected: the device keeps
   searching, no job result can arrive; when you start the hotspot later it
   rejoins and reports the failure.
+- [ ] Manually choose a different Wi-Fi before the handoff timeout. Expected:
+  rollback does not override that manual choice. With Location disabled and
+  the current SSID withheld, the selected network stays connected; manually
+  select the hotspot to recover if needed.
 
 ## 4. Client service (Windows)
 
@@ -278,17 +298,22 @@ UI/API before dispatch.
 
 ## 6. Power actions
 
-Each power job asks for confirmation in the UI. The client reports the result
-first and carries the action out once the coordinator has acknowledged it, or
-after 5 seconds.
+Each power job asks for confirmation in the UI. The client commits to the action
+once, calls Windows, and reports the native result. Restart/shutdown success
+means Windows accepted a five-second scheduled action. Sleep finishes after resume.
 
 - [ ] **Restart**: the job shows `succeeded` (it is not left `running`), the device
   goes offline about five seconds later, restarts and comes back online by
   itself (service starts at boot).
 - [ ] **Shutdown**: job `succeeded`, device goes offline and stays off. Power it
   on and check that it reconnects.
-- [ ] **Sleep**: job `succeeded`, the device sleeps and shows offline after the
-  heartbeat timeout; waking it brings it back online.
+- [ ] **Sleep**: job stays `running`, the device sleeps and shows offline after
+  the heartbeat timeout; waking it brings it back online and finishes the job.
+- [ ] Unsupported sleep fails with reason `unsupported` and leaves the device awake.
+- [ ] A native power failure after preflight appears as `failed` with the Windows error.
+- [ ] Cancel sleep after it has started and disconnected. Expected: cancellation
+  stays pending until the client returns; it cannot undo a committed power action.
+  The actual result after resume or interrupted recovery must still be shown.
 - [ ] Power job for an offline device. Expected: stays `queued` and runs when the
   device returns (and expires after the configured hours otherwise).
 - [ ] Cancel a power job that is still `queued`. Expected: `failed` / `cancelled`,
@@ -496,15 +521,13 @@ Follow `deploy/README.md` on a fresh Linux server.
 - [ ] With the server's outbound HTTPS blocked, the coordinator keeps serving; only
   the update check reports an error.
 
-## 11. Gaps left by the scripted checks
+## 11. Additional platform interactions
 
-The final verification ran the coordinator and two console-mode clients (not
-the service), drove the web UI with headless Chrome, and drove the manager
-window on Windows through its debugging port. These parts were not covered;
-do them by hand.
+Repeat these interactions when validating a new operating system or desktop
+environment. See the versioned validation report for the browser, service and
+installer checks already completed for a particular release.
 
-- [ ] Use the web UI in a real browser window (the checks used headless
-  Chrome): a small window size, keyboard use of the dialogs, and the banner
+- [ ] Use the web UI in a real browser window: a small window size, keyboard use of the dialogs, and the banner
   "Live updates paused, reconnecting..." when the coordinator is restarted.
 - [ ] In the manager window, click **Coordinator > Change coordinator...** and
   **Exit** with the mouse (the checks sent the menu commands to the window).

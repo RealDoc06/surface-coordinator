@@ -6,6 +6,7 @@
 use std::ffi::{c_void, CStr};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ptr::{addr_of, null, null_mut};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::core::GUID;
@@ -18,25 +19,31 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
 };
 use windows_sys::Win32::NetworkManagement::WiFi::{
-    dot11_BSS_type_infrastructure, wlan_connection_mode_profile, wlan_interface_state_connected,
-    wlan_intf_opcode_current_connection, WlanCloseHandle, WlanConnect, WlanDisconnect,
+    dot11_BSS_type_infrastructure, wlan_connection_mode_profile,
+    wlan_interface_state_connected as WLAN_CONNECTED,
+    wlan_interface_state_disconnected as WLAN_DISCONNECTED,
+    wlan_interface_state_not_ready as WLAN_NOT_READY,
+    wlan_intf_opcode_current_connection, wlan_intf_opcode_interface_state,
+    wlan_notification_acm_connection_complete, wlan_notification_acm_disconnected,
+    WlanCloseHandle, WlanConnect,
     WlanEnumInterfaces,
     WlanFreeMemory, WlanGetAvailableNetworkList, WlanOpenHandle, WlanQueryInterface,
-    WlanReasonCodeToString, WlanScan, WlanSetProfile, DOT11_SSID, WLAN_API_VERSION_2_0,
+    WlanReasonCodeToString, WlanRegisterNotification, WlanScan, WlanSetProfile, DOT11_SSID,
+    L2_NOTIFICATION_DATA, WLAN_API_VERSION_2_0,
     WLAN_AVAILABLE_NETWORK, WLAN_AVAILABLE_NETWORK_LIST, WLAN_CONNECTION_ATTRIBUTES,
-    WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WLAN_PROFILE_USER,
+    WLAN_CONNECTION_NOTIFICATION_DATA, WLAN_CONNECTION_PARAMETERS, WLAN_INTERFACE_INFO,
+    WLAN_INTERFACE_INFO_LIST, WLAN_INTERFACE_STATE, WLAN_NOTIFICATION_SOURCE_ACM,
+    WLAN_NOTIFICATION_SOURCE_NONE, WLAN_PROFILE_USER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKET_ADDRESS};
 
-use crate::platform::{PlatformError, WifiConnection, WifiJoinRequest};
+use crate::platform::{PlatformError, WifiConnection, WifiJoinPolicy, WifiJoinRequest};
 
 /// Windows gives no completion signal without registering for
 /// notifications; a scan is done within about four seconds.
 const SCAN_WAIT: Duration = Duration::from_secs(4);
 /// Association plus DHCP.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the old network's address may linger after a disconnect.
-const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 const WITHHELD: &str = "Windows does not reveal Wi-Fi networks to this client \
      (Location services are off)";
 
@@ -44,6 +51,8 @@ const WITHHELD: &str = "Windows does not reveal Wi-Fi networks to this client \
 enum Association {
     Connected(String),
     NotConnected,
+    /// Windows is already changing the connection. Do not interrupt it.
+    Connecting,
     /// Windows 11 withholds the name while Location services are off.
     Withheld,
 }
@@ -84,17 +93,30 @@ impl<T> Drop for WlanMemory<T> {
 struct Wlan {
     handle: HANDLE,
     interface: GUID,
+    /// Kept alive until notifications are unregistered in Drop.
+    join_notification: Option<Box<JoinNotification>>,
 }
 
 impl Drop for Wlan {
     fn drop(&mut self) {
+        if self.join_notification.is_some() {
+            // SAFETY: unregistering waits for in-flight callbacks before
+            // returning. Their boxed context still lives in `self`.
+            unsafe {
+                WlanRegisterNotification(
+                    self.handle, WLAN_NOTIFICATION_SOURCE_NONE, 0, None,
+                    null(), null(), null_mut(),
+                );
+            }
+        }
         // SAFETY: the handle is owned by `self` and closed exactly once.
         unsafe { WlanCloseHandle(self.handle, null()) };
     }
 }
 
 impl Wlan {
-    /// Opens a handle on the first Wi-Fi interface.
+    /// Prefers an active interface so a disconnected secondary adapter does
+    /// not hide the user's connection on another one.
     fn open() -> Result<Wlan, PlatformError> {
         let mut negotiated = 0u32;
         let mut handle: HANDLE = null_mut();
@@ -111,7 +133,11 @@ impl Wlan {
             }
             code => return Err(failed("WlanOpenHandle", code)),
         }
-        let mut wlan = Wlan { handle, interface: GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] } };
+        let mut wlan = Wlan {
+            handle,
+            interface: GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
+            join_notification: None,
+        };
 
         let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
         // SAFETY: valid handle and out pointer; the list is freed by the guard.
@@ -125,14 +151,33 @@ impl Wlan {
             if (*list.0).dwNumberOfItems == 0 {
                 return Err(PlatformError::Unsupported("this device has no Wi-Fi interface".into()));
             }
-            let first = addr_of!((*list.0).InterfaceInfo).cast::<WLAN_INTERFACE_INFO>();
-            wlan.interface = (*first).InterfaceGuid;
+            let interfaces = std::slice::from_raw_parts(
+                addr_of!((*list.0).InterfaceInfo).cast::<WLAN_INTERFACE_INFO>(),
+                (*list.0).dwNumberOfItems as usize,
+            );
+            let preferred = interfaces.iter().max_by_key(|interface| match interface.isState {
+                WLAN_CONNECTED => 3,
+                WLAN_DISCONNECTED => 1,
+                WLAN_NOT_READY => 0,
+                _ => 2,
+            }).expect("the interface list is not empty");
+            wlan.interface = preferred.InterfaceGuid;
         }
         Ok(wlan)
     }
 
     /// The network the interface is connected to, as far as Windows tells.
     fn association(&self) -> Result<Association, PlatformError> {
+        // Unlike current_connection, interface_state contains no location
+        // information. Association without a DHCP address is still a real
+        // connection and must not be mistaken for permission to replace it.
+        match self.interface_state()? {
+            WLAN_DISCONNECTED | WLAN_NOT_READY => {
+                return Ok(Association::NotConnected);
+            }
+            WLAN_CONNECTED => {}
+            _ => return Ok(Association::Connecting),
+        }
         let mut size = 0u32;
         let mut data: *mut c_void = null_mut();
         // SAFETY: valid handle, interface and out pointers; the data is
@@ -151,8 +196,9 @@ impl Wlan {
         let data = WlanMemory(data.cast::<WLAN_CONNECTION_ATTRIBUTES>());
         match code {
             ERROR_SUCCESS => {}
-            // The interface is not connected.
-            ERROR_INVALID_STATE => return Ok(Association::NotConnected),
+            // The state changed after interface_state reported connected.
+            // Wait for a fresh state query before treating it as idle.
+            ERROR_INVALID_STATE => return Ok(Association::Connecting),
             ERROR_ACCESS_DENIED => return Ok(Association::Withheld),
             code => return Err(failed("WlanQueryInterface", code)),
         }
@@ -161,11 +207,103 @@ impl Wlan {
         }
         // SAFETY: checked above that the buffer holds the structure.
         let attributes = unsafe { &*data.0 };
-        if attributes.isState != wlan_interface_state_connected {
-            return Ok(Association::NotConnected);
+        if attributes.isState != WLAN_CONNECTED {
+            return Ok(Association::Connecting);
         }
         Ok(Association::Connected(ssid_string(&attributes.wlanAssociationAttributes.dot11Ssid)))
     }
+
+    fn interface_state(&self) -> Result<WLAN_INTERFACE_STATE, PlatformError> {
+        let mut size = 0u32;
+        let mut data = null_mut();
+        // SAFETY: valid handle and output pointers; successful output is
+        // checked for size and freed by WlanMemory.
+        let code = unsafe {
+            WlanQueryInterface(
+                self.handle,
+                &self.interface,
+                wlan_intf_opcode_interface_state,
+                null(),
+                &mut size,
+                &mut data,
+                null_mut(),
+            )
+        };
+        let data = WlanMemory(data.cast::<WLAN_INTERFACE_STATE>());
+        check(code, "querying Wi-Fi interface state")?;
+        if data.0.is_null() || (size as usize) < std::mem::size_of::<WLAN_INTERFACE_STATE>() {
+            return Err(PlatformError::Failed("Wi-Fi interface state returned too little data".into()));
+        }
+        // SAFETY: checked above that the buffer holds the state.
+        Ok(unsafe { *data.0 })
+    }
+}
+
+const JOIN_PENDING: u32 = u32::MAX;
+const JOIN_REPLACED: u32 = u32::MAX - 1;
+
+struct JoinNotification {
+    interface: GUID,
+    ssid: String,
+    /// A WLAN reason code, or one of the sentinel values above.
+    result: AtomicU32,
+}
+
+impl JoinNotification {
+    fn record(&self, result: u32) {
+        // A successful selection of another network ends this request. Later
+        // automatic retries must not turn it back into our successful join.
+        let _ = self.result.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+            (previous != JOIN_REPLACED).then_some(result)
+        });
+    }
+}
+
+/// ACM notifications do not request location access. They prove that the
+/// requested SSID connected, unlike an IP address left from another network.
+unsafe extern "system" fn joined(notification: *mut L2_NOTIFICATION_DATA, context: *mut c_void) {
+    if notification.is_null() || context.is_null() {
+        return;
+    }
+    // SAFETY: wlanapi owns the notification for this callback. The boxed
+    // context is kept alive until unregistration has waited for callbacks.
+    let (notification, context) = unsafe { (&*notification, &*context.cast::<JoinNotification>()) };
+    let interface = &notification.InterfaceGuid;
+    if notification.NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM
+        || interface.data1 != context.interface.data1
+        || interface.data2 != context.interface.data2
+        || interface.data3 != context.interface.data3
+        || interface.data4 != context.interface.data4
+    {
+        return;
+    }
+    if notification.NotificationCode == wlan_notification_acm_disconnected as u32 {
+        // Invalidate an earlier association, but retain a failed attempt's
+        // reason for the deadline and never erase another network's selection.
+        let _ = context.result.compare_exchange(
+            ERROR_SUCCESS, JOIN_PENDING, Ordering::SeqCst, Ordering::SeqCst,
+        );
+        return;
+    }
+    if notification.NotificationCode != wlan_notification_acm_connection_complete as u32
+        || notification.pData.is_null()
+        || (notification.dwDataSize as usize) < std::mem::size_of::<WLAN_CONNECTION_NOTIFICATION_DATA>()
+    {
+        return;
+    }
+    // SAFETY: this notification code carries the structure, whose size was
+    // checked above; the data is valid for this callback.
+    let connection = unsafe { &*notification.pData.cast::<WLAN_CONNECTION_NOTIFICATION_DATA>() };
+    let result = if ssid_string(&connection.dot11Ssid) == context.ssid {
+        connection.wlanReasonCode
+    } else if connection.wlanReasonCode == ERROR_SUCCESS {
+        JOIN_REPLACED
+    } else {
+        // AutoConfig may attempt other profiles while our network is still
+        // becoming available. A failed attempt is not a new selection.
+        return;
+    };
+    context.record(result);
 }
 
 /// SSIDs are bytes, usually but not necessarily UTF-8.
@@ -313,19 +451,15 @@ pub fn current() -> Result<Option<WifiConnection>, PlatformError> {
     let ssid = match wlan.association()? {
         Association::Connected(ssid) => Some(ssid),
         Association::NotConnected => return Ok(None),
-        Association::Withheld => None,
+        Association::Withheld | Association::Connecting => None,
     };
     let (ip, gateway) = adapter_addresses(&wlan.interface)?;
-    // Without a name, an address is the only sign of a connection.
-    if ssid.is_none() && !ip.is_some_and(usable) {
-        return Ok(None);
-    }
     Ok(Some(WifiConnection { ssid, ip, gateway }))
 }
 
 /// An address from a DHCP server rather than the link-local fallback.
 fn usable(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(ip) if !ip.is_link_local())
+    matches!(ip, IpAddr::V4(ip) if !ip.is_link_local() && !ip.is_unspecified() && !ip.is_loopback())
 }
 
 fn reason_text(reason: u32) -> String {
@@ -341,7 +475,25 @@ fn reason_text(reason: u32) -> String {
 }
 
 pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
-    let wlan = Wlan::open()?;
+    let mut wlan = Wlan::open()?;
+    let preserve_connection = |wlan: &Wlan| -> Result<(), PlatformError> {
+        let allowed = match &request.policy {
+            WifiJoinPolicy::Replace => true,
+            WifiJoinPolicy::Disconnected => matches!(wlan.association()?, Association::NotConnected),
+            WifiJoinPolicy::RecoverFrom(ssid) => match wlan.association()? {
+                Association::NotConnected => true,
+                Association::Connected(current) => current == *ssid,
+                Association::Connecting | Association::Withheld => false,
+            },
+        };
+        if !allowed {
+            return Err(PlatformError::Failed(
+                "Wi-Fi connected while discovering the hotspot; preserving that connection".into(),
+            ));
+        }
+        Ok(())
+    };
+    preserve_connection(&wlan)?;
     let ssid = request.ssid.as_str();
     let xml = wide(&profile_xml(ssid, request.passphrase.as_deref(), request.auto_connect));
     let store = |flags: u32| {
@@ -366,18 +518,26 @@ pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
         )));
     }
 
-    // When Windows withholds the name of the network, being connected can
-    // only be told from having an address. Leave the current network first,
-    // so that an address seen afterwards is one from the network asked for.
-    let blind = matches!(wlan.association()?, Association::Withheld);
-    if blind {
-        // SAFETY: valid handle and interface.
-        unsafe { WlanDisconnect(wlan.handle, &wlan.interface, null()) };
-        let deadline = Instant::now() + LEAVE_TIMEOUT;
-        while adapter_addresses(&wlan.interface)?.0.is_some_and(usable) && Instant::now() < deadline {
-            std::thread::sleep(JOIN_POLL);
-        }
+    if matches!(wlan.association()?, Association::Connected(current) if current == ssid)
+        && adapter_addresses(&wlan.interface)?.0.is_some_and(usable)
+    {
+        return Ok(());
     }
+    let notification = Box::new(JoinNotification {
+        interface: wlan.interface,
+        ssid: ssid.to_owned(),
+        result: AtomicU32::new(JOIN_PENDING),
+    });
+    // SAFETY: this context stays at the same boxed address until Wlan::drop
+    // unregisters callbacks. ACM does not require location access.
+    let code = unsafe {
+        WlanRegisterNotification(
+            wlan.handle, WLAN_NOTIFICATION_SOURCE_ACM, 0, Some(joined),
+            (&*notification as *const JoinNotification).cast(), null(), null_mut(),
+        )
+    };
+    check(code, "registering Wi-Fi connection notifications")?;
+    wlan.join_notification = Some(notification);
 
     // The profile is named after the SSID.
     let profile = wide(ssid);
@@ -389,6 +549,7 @@ pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
         dot11BssType: dot11_BSS_type_infrastructure,
         dwFlags: 0,
     };
+    preserve_connection(&wlan)?;
     // SAFETY: valid handle, interface and parameters; `profile` outlives
     // the call.
     let code = unsafe { WlanConnect(wlan.handle, &wlan.interface, &parameters, null()) };
@@ -399,23 +560,57 @@ pub fn join(request: WifiJoinRequest) -> Result<(), PlatformError> {
     // `WlanConnect` only starts the connection. Ready means associated with
     // this network and an address from its DHCP server (not a link-local
     // fallback).
-    let deadline = Instant::now() + JOIN_TIMEOUT;
-    loop {
-        let associated = match wlan.association()? {
+    wait_for_join(ssid, JOIN_TIMEOUT, || {
+        let notification = wlan.join_notification.as_ref().expect("registered above");
+        let confirmed = notification.result.load(Ordering::SeqCst);
+        if confirmed == JOIN_REPLACED {
+            return Ok((confirmed, false));
+        }
+        let association = wlan.association()?;
+        let withheld = matches!(association, Association::Withheld);
+        let associated = match association {
             Association::Connected(current) => current == ssid,
-            Association::NotConnected => false,
-            Association::Withheld => true,
+            Association::NotConnected | Association::Connecting => false,
+            Association::Withheld => confirmed == ERROR_SUCCESS,
         };
-        if associated && adapter_addresses(&wlan.interface)?.0.is_some_and(usable) {
+        let ready = associated && adapter_addresses(&wlan.interface)?.0.is_some_and(usable);
+        // Recheck after the native queries so a concurrent manual selection
+        // takes precedence over an address observed for the requested network.
+        let confirmed = notification.result.load(Ordering::SeqCst);
+        Ok((confirmed, ready && (!withheld || confirmed == ERROR_SUCCESS)))
+    }, std::thread::sleep)
+}
+
+/// AutoConfig can report a failed attempt and then associate successfully a
+/// few seconds later. Observe until the existing deadline without reconnecting.
+fn wait_for_join(
+    ssid: &str,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<(u32, bool), PlatformError>,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), PlatformError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (confirmed, ready) = observe()?;
+        if confirmed == JOIN_REPLACED {
+            return Err(PlatformError::Failed(
+                "another Wi-Fi network was selected while joining; preserving that selection".into(),
+            ));
+        }
+        if ready {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            let detail = match confirmed {
+                ERROR_SUCCESS | JOIN_PENDING =>
+                    "wrong passphrase, out of range, or no address from the network".into(),
+                reason => reason_text(reason),
+            };
             return Err(PlatformError::Failed(format!(
-                "could not connect to {ssid} within {} s (wrong passphrase, out of range, or no address from the network)",
-                JOIN_TIMEOUT.as_secs()
+                "could not connect to {ssid} within {} s ({detail})", timeout.as_secs()
             )));
         }
-        std::thread::sleep(JOIN_POLL);
+        wait(JOIN_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -472,6 +667,7 @@ pub fn profile_xml(ssid: &str, passphrase: Option<&str>, auto_connect: bool) -> 
          <SSIDConfig><SSID><hex>{hex}</hex><name>{name}</name></SSID></SSIDConfig>\
          <connectionType>ESS</connectionType>\
          <connectionMode>{mode}</connectionMode>\
+         <autoSwitch>false</autoSwitch>\
          <MSM><security>{security}</security></MSM>\
          </WLANProfile>"
     )
@@ -480,6 +676,37 @@ pub fn profile_xml(ssid: &str, passphrase: Option<&str>, auto_connect: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn join_notification() -> JoinNotification {
+        JoinNotification {
+            interface: GUID { data1: 42, data2: 0, data3: 0, data4: [0; 8] },
+            ssid: "Office".into(),
+            result: AtomicU32::new(JOIN_PENDING),
+        }
+    }
+
+    fn notify_join(context: &JoinNotification, ssid: &str, reason: u32, disconnected: bool) {
+        // SAFETY: all fields are integers, fixed arrays, or raw pointers;
+        // zero initializes a valid fixture before filling the relevant fields.
+        let mut connection: WLAN_CONNECTION_NOTIFICATION_DATA = unsafe { std::mem::zeroed() };
+        connection.dot11Ssid.uSSIDLength = ssid.len() as u32;
+        connection.dot11Ssid.ucSSID[..ssid.len()].copy_from_slice(ssid.as_bytes());
+        connection.wlanReasonCode = reason;
+        let mut notification = L2_NOTIFICATION_DATA {
+            NotificationSource: WLAN_NOTIFICATION_SOURCE_ACM,
+            NotificationCode: if disconnected {
+                wlan_notification_acm_disconnected as u32
+            } else {
+                wlan_notification_acm_connection_complete as u32
+            },
+            InterfaceGuid: context.interface,
+            dwDataSize: std::mem::size_of_val(&connection) as u32,
+            pData: (&mut connection as *mut WLAN_CONNECTION_NOTIFICATION_DATA).cast(),
+        };
+        // SAFETY: the structures live throughout this synchronous callback;
+        // it only reads context fields and writes the atomic result.
+        unsafe { joined(&mut notification, std::ptr::from_ref(context).cast_mut().cast()) };
+    }
 
     fn element<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
         let open = format!("<{tag}>");
@@ -511,6 +738,7 @@ mod tests {
     fn profile_for_an_open_network_has_no_key() {
         let xml = profile_xml("Guest", None, false);
         assert_eq!(element(&xml, "connectionMode"), ["manual"]);
+        assert_eq!(element(&xml, "autoSwitch"), ["false"]);
         assert_eq!(element(&xml, "authentication"), ["open"]);
         assert_eq!(element(&xml, "encryption"), ["none"]);
         assert!(!xml.contains("sharedKey"));
@@ -553,5 +781,104 @@ mod tests {
         // A length beyond the array is not trusted.
         ssid.uSSIDLength = 99;
         assert_eq!(ssid_string(&ssid).chars().count(), 32);
+    }
+
+    #[test]
+    fn hidden_ssid_join_requires_confirmation_for_the_requested_network() {
+        let interface = GUID { data1: 42, data2: 0, data3: 0, data4: [0; 8] };
+        let mut context = JoinNotification {
+            interface,
+            ssid: "Office".into(),
+            result: AtomicU32::new(JOIN_PENDING),
+        };
+        // SAFETY: the notification data is a C structure of integers and
+        // fixed arrays; zero is a valid starting value for each field.
+        let mut connection: WLAN_CONNECTION_NOTIFICATION_DATA = unsafe { std::mem::zeroed() };
+        connection.dot11Ssid.uSSIDLength = 6;
+        connection.dot11Ssid.ucSSID[..6].copy_from_slice(b"Office");
+        let mut notification = L2_NOTIFICATION_DATA {
+            NotificationSource: WLAN_NOTIFICATION_SOURCE_ACM,
+            NotificationCode: wlan_notification_acm_connection_complete as u32,
+            InterfaceGuid: interface,
+            dwDataSize: std::mem::size_of_val(&connection) as u32,
+            pData: (&mut connection as *mut WLAN_CONNECTION_NOTIFICATION_DATA).cast(),
+        };
+        let context_ptr = (&mut context as *mut JoinNotification).cast();
+        // A completion from a different adapter cannot verify this join.
+        notification.InterfaceGuid.data1 = 99;
+        // SAFETY: both pointers refer to the live fixture structures above.
+        unsafe { joined(&mut notification, context_ptr) };
+        assert_eq!(context.result.load(Ordering::SeqCst), JOIN_PENDING);
+
+        notification.InterfaceGuid = interface;
+        notification.dwDataSize = 0;
+        unsafe { joined(&mut notification, context_ptr) };
+        assert_eq!(context.result.load(Ordering::SeqCst), JOIN_PENDING);
+
+        notification.dwDataSize = std::mem::size_of_val(&connection) as u32;
+        unsafe { joined(&mut notification, context_ptr) };
+        assert_eq!(context.result.load(Ordering::SeqCst), ERROR_SUCCESS);
+
+        // Losing that association invalidates its earlier success, even
+        // while Windows retains an address or automatically joins elsewhere.
+        notification.NotificationCode = wlan_notification_acm_disconnected as u32;
+        unsafe { joined(&mut notification, context_ptr) };
+        assert_eq!(context.result.load(Ordering::SeqCst), JOIN_PENDING);
+
+        notification.NotificationCode = wlan_notification_acm_connection_complete as u32;
+        connection.dot11Ssid.ucSSID[..6].copy_from_slice(b"Manual");
+        unsafe { joined(&mut notification, context_ptr) };
+        assert_eq!(context.result.load(Ordering::SeqCst), JOIN_REPLACED);
+    }
+
+    #[test]
+    fn transient_join_failure_waits_for_later_matching_success_and_dhcp() {
+        let context = join_notification();
+        // A real adapter reported network-not-available (163851), then
+        // AutoConfig associated with the same SSID four seconds later.
+        let mut observations = [
+            ("Office", 163851, false, false),
+            ("Office", 0, true, false),
+            ("Other", 163851, false, false),
+            ("Office", ERROR_SUCCESS, false, false),
+            ("Office", ERROR_SUCCESS, false, true),
+        ].into_iter();
+        let mut waits = 0;
+        let result = wait_for_join("Office", JOIN_TIMEOUT, || {
+            let (ssid, reason, disconnected, ready) = observations.next().expect("join should finish");
+            notify_join(&context, ssid, reason, disconnected);
+            Ok((context.result.load(Ordering::SeqCst), ready))
+        }, |_| waits += 1);
+        assert!(result.is_ok());
+        assert_eq!(waits, 4);
+        assert!(observations.next().is_none());
+    }
+
+    #[test]
+    fn successful_manual_selection_stays_protected_from_later_callbacks() {
+        let context = join_notification();
+        notify_join(&context, "Office", 163851, false);
+        notify_join(&context, "Manual", ERROR_SUCCESS, false);
+        notify_join(&context, "Manual", 0, true);
+        notify_join(&context, "Office", ERROR_SUCCESS, false);
+        let result = wait_for_join("Office", JOIN_TIMEOUT, || {
+            Ok((context.result.load(Ordering::SeqCst), true))
+        }, |_| panic!("a successful manual selection must stop the join immediately"));
+        assert!(matches!(result, Err(PlatformError::Failed(message))
+            if message.contains("preserving that selection")));
+    }
+
+    #[test]
+    fn join_deadline_reports_failure_even_after_disconnect_or_unrelated_failure() {
+        let context = join_notification();
+        notify_join(&context, "Office", 163851, false);
+        notify_join(&context, "Office", 0, true);
+        notify_join(&context, "Other", 12345, false);
+        assert_eq!(context.result.load(Ordering::SeqCst), 163851);
+        let result = wait_for_join("Office", Duration::ZERO, || {
+            Ok((context.result.load(Ordering::SeqCst), false))
+        }, |_| panic!("the join must not wait past its deadline"));
+        assert!(matches!(result, Err(PlatformError::Failed(message))
+            if message.contains("within 0 s") && message.contains(&reason_text(163851))));
     }
 }

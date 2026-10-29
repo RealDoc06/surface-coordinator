@@ -1,4 +1,4 @@
-//! `wifi.join` jobs: validation, password redaction and the presumed handoff.
+//! `wifi.join` jobs: validation, password redaction and unconfirmed handoffs.
 
 mod common;
 
@@ -9,8 +9,8 @@ use protocol::{ClientMessage, JobResult, JobStatus};
 use serde_json::{json, Value};
 
 const MASK: &str = "********";
-const HANDOFF_MESSAGE: &str = "The device left this coordinator's network and did not return. \
-It is presumed to have joined the new network and may be reporting to another coordinator.";
+const HANDOFF_MESSAGE: &str = "The device disconnected before confirming the new \
+network. Check the device or its destination coordinator before retrying.";
 
 async fn create_wifi_job(server: &TestServer, payload: Value, targets: Value) -> (u16, Value) {
     server
@@ -141,16 +141,16 @@ async fn the_api_never_shows_the_password_but_the_device_still_gets_it() {
 }
 
 #[tokio::test]
-async fn a_running_wifi_join_whose_device_never_returns_is_presumed_to_have_joined() {
+async fn a_running_wifi_join_whose_device_never_returns_is_unconfirmed() {
     let server = TestServer::start_with(|c| c.handoff_grace = Duration::from_millis(200)).await;
     let key = server.new_key();
     let mut client = FakeClient::connect(&server, &key, "device-a").await;
     let (job_id, _) = started_wifi_job(&server, &mut client, "device-a").await;
 
     client.disconnect().await;
-    let target = server.wait_for_target_state(&job_id, "succeeded").await;
+    let target = server.wait_for_target_state(&job_id, "failed").await;
     assert!(target["exit_code"].is_null());
-    assert!(target["reason"].is_null());
+    assert_eq!(target["reason"], "handoff_unconfirmed");
     assert_eq!(target["message"], HANDOFF_MESSAGE);
     assert!(target["finished_at"].as_i64().unwrap() >= target["started_at"].as_i64().unwrap());
 }
@@ -202,7 +202,7 @@ async fn a_wifi_join_whose_device_stays_online_is_left_running() {
 }
 
 #[tokio::test]
-async fn only_running_wifi_join_targets_are_presumed_joined() {
+async fn only_running_wifi_join_targets_are_marked_unconfirmed() {
     let server = TestServer::start_with(|c| c.handoff_grace = Duration::from_millis(200)).await;
     let key = server.new_key();
     let mut script_device = FakeClient::connect(&server, &key, "device-script").await;
@@ -230,9 +230,34 @@ async fn only_running_wifi_join_targets_are_presumed_joined() {
     script_device.disconnect().await;
     sent_device.disconnect().await;
     wifi_device.disconnect().await;
-    server.wait_for_target_state(&wifi_job, "succeeded").await;
+    server.wait_for_target_state(&wifi_job, "failed").await;
     // The sweep has now run at least once after the grace for the others too.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(server.single_target(&script_job).await["state"], "running");
     assert_eq!(server.single_target(&sent_job).await["state"], "sent");
+}
+
+#[tokio::test]
+async fn a_late_wifi_result_resolves_an_unconfirmed_handoff_without_repeating_the_join() {
+    let server = TestServer::start_with(|c| c.handoff_grace = Duration::from_millis(100)).await;
+    let key = server.new_key();
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    let (job_id, target_id) = started_wifi_job(&server, &mut client, "device-a").await;
+    client.disconnect().await;
+    let unconfirmed = server.wait_for_target_state(&job_id, "failed").await;
+    assert_eq!(unconfirmed["reason"], "handoff_unconfirmed");
+
+    let mut client = FakeClient::connect(&server, &key, "device-a").await;
+    assert!(client.try_recv(Duration::from_millis(100)).await.is_none());
+    client.result(&target_id, 0).await;
+    client.expect_result_ack(&target_id).await;
+    let confirmed = server.wait_for_target_state(&job_id, "succeeded").await;
+    assert_eq!(confirmed["exit_code"], 0);
+    assert!(confirmed["reason"].is_null());
+    assert!(confirmed["message"].is_null());
+
+    // Once confirmed it has the same immutable result semantics as other jobs.
+    client.result(&target_id, 1).await;
+    client.expect_result_ack(&target_id).await;
+    assert_eq!(server.single_target(&job_id).await, confirmed);
 }

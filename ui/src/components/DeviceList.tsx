@@ -19,6 +19,8 @@ type Props = {
   /** Enrollment key labels by key id, where known. */
   keyLabels: Record<string, string>
   now: number
+  /** Whether the last reported device state is backed by a live event stream. */
+  live?: boolean
   initialSelected?: string[]
   /** The user asked to run something on these targets. */
   onRun: (targets: TargetSpec) => void
@@ -59,7 +61,9 @@ export function matchesFilter(device: Device, text: string, status: StatusFilter
   if (groupId !== '' && groupId !== NO_GROUP && !(device.group_ids ?? []).includes(groupId)) return false
   const needle = text.trim().toLowerCase()
   if (needle === '') return true
-  return device.hostname.toLowerCase().includes(needle) || device.id.toLowerCase().includes(needle)
+  return [device.hostname, device.id, device.network?.ssid, device.network?.ip].some((value) =>
+    value?.toLowerCase().includes(needle),
+  )
 }
 
 /** The device table with its filters and the selection that jobs are run on. */
@@ -67,6 +71,7 @@ export function DeviceList({
   devices,
   keyLabels,
   now,
+  live = true,
   initialSelected,
   onRun,
   onMove,
@@ -92,6 +97,7 @@ export function DeviceList({
 
   // Devices can disappear while selected (forgotten elsewhere): only count real ones.
   const selectedIds = useMemo(() => devices.filter((d) => selected.has(d.id)).map((d) => d.id), [devices, selected])
+  const offlineSelected = devices.filter((d) => selected.has(d.id) && !d.online).length
   const shownSelected = shown.filter((d) => selected.has(d.id)).length
   const hiddenSelected = selectedIds.length - shownSelected
   const allShownSelected = shown.length > 0 && shownSelected === shown.length
@@ -131,10 +137,10 @@ export function DeviceList({
             Create an enrollment key under <Link to="/keys">Enrollment keys</Link> and note its id and secret.
           </li>
           <li>
-            Start the client on the device with that key id and secret and the address clients reach this coordinator on
-            (<code>wss://</code> behind TLS), for example:
+            Copy <code>client.exe</code> to the device and install it from an elevated PowerShell window. Use the
+            coordinator address reachable from the device (<code>wss://</code> behind TLS):
             <pre className="code">
-              {`$env:SC_KEY_SECRET = '<key secret>'\nclient.exe --coordinator-url ws://<coordinator address> --key-id <key id>`}
+              {`$env:SC_KEY_SECRET = '<key secret>'\n.\\client.exe install --key-id '<key-id>' --coordinator-url 'wss://<coordinator-host>'\nRemove-Item Env:SC_KEY_SECRET`}
             </pre>
           </li>
         </ol>
@@ -147,6 +153,10 @@ export function DeviceList({
 
   const selection: TargetSpec = { type: 'devices', device_ids: selectedIds }
   const none = selectedIds.length === 0
+  const fleetItems: MenuItem[] = [
+    { key: 'run-all', label: 'Run on all devices', onSelect: () => onRun({ type: 'all' }) },
+    { key: 'move-all', label: 'Move all to Wi-Fi…', onSelect: () => onMove({ type: 'all' }) },
+  ]
   const moreItems: MenuItem[] = [
     { key: 'launch', label: 'Launch app…', disabled: none || !onAction, onSelect: () => onAction?.('app.launch', selection) },
     { key: 'setting', label: 'Apply setting…', disabled: none || !onAction, onSelect: () => onAction?.('setting.apply', selection) },
@@ -161,13 +171,13 @@ export function DeviceList({
 
   return (
     <div>
-      <div className="toolbar">
+      <div className="toolbar device-filters">
         <div className="toolbar-group">
           <label className="field-inline">
-            <span className="visually-hidden">Filter devices by hostname or id</span>
+            <span className="visually-hidden">Filter devices by hostname, id, network or IP</span>
             <input
               type="search"
-              placeholder="Filter by hostname or id"
+              placeholder="Search devices or networks"
               value={text}
               onChange={(e) => setText(e.target.value)}
             />
@@ -199,8 +209,22 @@ export function DeviceList({
               Run on this group&hellip;
             </button>
           ) : null}
+          {text || status !== 'all' || groupId ? (
+            <button type="button" className="link" onClick={() => {
+              setText('')
+              setStatus('all')
+              setGroupId('')
+            }}>
+              Reset filters
+            </button>
+          ) : null}
         </div>
-        <div className="toolbar-group toolbar-actions">
+        <span className="toolbar-spacer" />
+        <span className="muted">{shown.length} of {devices.length} shown</span>
+        <MenuButton label="All devices" items={fleetItems} align="right" />
+      </div>
+      <div className="toolbar selection-toolbar">
+        <div className="toolbar-group">
           <span className="selection-count" aria-live="polite">
             <strong>{selectedIds.length} selected</strong>
             {hiddenSelected > 0 ? <span className="muted"> ({hiddenSelected} not shown)</span> : null}
@@ -210,6 +234,13 @@ export function DeviceList({
               Clear
             </button>
           ) : null}
+          <button type="button" className="link" disabled={!shown.some((d) => d.online)} onClick={() => {
+            setSelected(new Set(shown.filter((d) => d.online).map((d) => d.id)))
+          }}>
+            Select online
+          </button>
+        </div>
+        <div className="toolbar-group toolbar-actions">
           <button
             type="button"
             className="primary"
@@ -235,17 +266,15 @@ export function DeviceList({
               Move to {localWifi}
             </button>
           ) : null}
-          <MenuButton label="More actions…" items={moreItems} />
-          <button type="button" onClick={() => onRun({ type: 'all' })}>
-            Run on all devices
-          </button>
-          <button type="button" onClick={() => onMove({ type: 'all' })}>
-            Move all to Wi-Fi&hellip;
-          </button>
+          <MenuButton label="More actions…" items={moreItems} align="right" />
         </div>
       </div>
+      {offlineSelected > 0 ? (
+        <p className="hint selection-hint">{plural(offlineSelected, 'selected device')} offline. Jobs wait until they reconnect.</p>
+      ) : null}
 
-      <table className="table">
+      <div className="table-scroll" role="region" aria-label="Devices" tabIndex={0}>
+      <table className="table device-table">
         <thead>
           <tr>
             <th className="col-check">
@@ -280,7 +309,10 @@ export function DeviceList({
                 />
               </td>
               <td className="col-status">
-                <StatusDot online={device.online} />
+                <span className="online-state">
+                  <StatusDot online={device.online} />
+                  <span aria-hidden="true">{device.online ? 'Online' : 'Offline'}</span>
+                </span>
               </td>
               <td>
                 <Link to={`/devices/${encodeURIComponent(device.id)}`}>{device.hostname || shortId(device.id)}</Link>
@@ -298,7 +330,7 @@ export function DeviceList({
                 <ClientVersion device={device} />
               </td>
               <td title={formatDateTime(device.last_seen_at)}>
-                {device.online ? 'now' : relativeTime(device.last_seen_at, now)}
+                {device.online && live ? 'now' : relativeTime(device.last_seen_at, now)}
               </td>
               <td>
                 {keyLabels[device.enrollment_key_id] ?? (
@@ -318,6 +350,7 @@ export function DeviceList({
           ) : null}
         </tbody>
       </table>
+      </div>
       {membership && onGroupMembers ? (
         <GroupMembershipDialog
           op={membership}

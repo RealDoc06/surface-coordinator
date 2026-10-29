@@ -62,6 +62,10 @@ mod cli {
         /// ledger, the network state and running scripts.
         #[arg(long, env = "SC_STATE_DIR")]
         state_dir: PathBuf,
+        /// Disable automatic hotspot scanning and joining for this console
+        /// run. Explicit wifi.join jobs remain available.
+        #[arg(long)]
+        no_hotspot_discovery: bool,
         /// Log debug detail.
         #[arg(long)]
         verbose: bool,
@@ -75,6 +79,10 @@ mod cli {
         /// Coordinator base URL; without one the client looks for the manager's hotspot.
         #[arg(long)]
         coordinator_url: Option<String>,
+        /// Persistently disable automatic hotspot scanning and joining.
+        /// Explicit wifi.join jobs remain available.
+        #[arg(long)]
+        no_hotspot_discovery: bool,
         /// Where config.json and the device's state go [default: %ProgramData%\Surface Coordinator]
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -128,6 +136,7 @@ mod cli {
                     key_id: args.key_id,
                     key_secret,
                     coordinator_url: args.coordinator_url,
+                    hotspot_discovery: !args.no_hotspot_discovery,
                     install_dir: args.install_dir.unwrap_or_else(default_install_dir),
                     state_dir: args.state_dir.unwrap_or_else(default_state_dir),
                 })?;
@@ -166,7 +175,8 @@ mod cli {
             key_secret: args.key_secret,
         };
         let settings = config::load(&args.state_dir, overrides)?;
-        let config = ClientConfig::from_settings(settings, &args.state_dir);
+        let mut config = ClientConfig::from_settings(settings, &args.state_dir);
+        config.hotspot_discovery &= !args.no_hotspot_discovery;
         let device_id = config.device_id.clone();
         let shutdown = CancellationToken::new();
         let platform = Arc::new(

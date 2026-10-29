@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from '../App'
 import type { Device, Job, Session } from '../api/types'
-import { device, FakeWebSocket, job, mockFetch, target, type Call } from '../test/helpers'
+import { device, FakeWebSocket, job, jobRead, mockFetch, target, type Call } from '../test/helpers'
 
 const session: Session = {
   authenticated: true,
@@ -43,8 +43,7 @@ function coordinator(extraJobs: Job[] = []) {
     }
     if (path.startsWith('/jobs?')) return { body: { jobs: Object.values(jobs) } }
     if (method === 'GET' && path.startsWith('/jobs/')) {
-      const found = jobs[path.slice('/jobs/'.length)]
-      return found ? { body: { job: found } } : undefined
+      return jobRead(path, jobs)
     }
     return undefined
   })
@@ -98,7 +97,8 @@ describe('Move to Wi-Fi', () => {
     const user = userEvent.setup()
     render(<App />)
 
-    await user.click(await screen.findByRole('button', { name: /^Move all to Wi-Fi/ }))
+    await user.click(await screen.findByRole('button', { name: 'All devices' }))
+    await user.click(screen.getByRole('menuitem', { name: /^Move all to Wi-Fi/ }))
     expect(await screen.findByText('All devices (3)')).toBeInTheDocument()
     await user.type(screen.getByRole('textbox', { name: 'Network name (SSID)' }), 'Open net')
     await user.click(screen.getByRole('button', { name: /^Move 3 devices/ }))

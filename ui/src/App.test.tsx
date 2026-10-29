@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
 import type { Device, Job, Session } from './api/types'
-import { apiError, device, FakeWebSocket, job, mockFetch, target, type Call } from './test/helpers'
+import { apiError, device, FakeWebSocket, job, jobRead, mockFetch, target, type Call } from './test/helpers'
 
 const base: Session = {
   authenticated: true,
@@ -47,8 +47,7 @@ function coordinator(initial: Partial<Session> = {}) {
     if (path === '/rejected-connections') return { body: { rejected: [] } }
     if (path.startsWith('/jobs?')) return { body: { jobs: Object.values(server.jobs) } }
     if (method === 'GET' && path.startsWith('/jobs/')) {
-      const found = server.jobs[path.slice('/jobs/'.length)]
-      return found ? { body: { job: found } } : undefined
+      return jobRead(path, server.jobs)
     }
     return undefined
   })
@@ -236,7 +235,7 @@ describe('live updates', () => {
       socket.send({ type: 'job.output', job_id: 'j1', job_target_id: 't1', data: 'second\n', truncated: false })
       socket.send({ type: 'job.output', job_id: 'j1', job_target_id: 't1', data: 'third\n[truncated]', truncated: true })
     })
-    expect(pane.textContent).toBe('first\nsecond\nthird\n[truncated]')
+    await waitFor(() => expect(pane.textContent).toBe('first\nsecond\nthird\n[truncated]'))
     expect(screen.getByRole('note')).toHaveTextContent(/Output was truncated/)
 
     // The coordinator stores the same; finishing makes the page read it back.
@@ -251,7 +250,8 @@ describe('live updates', () => {
         output_truncated: true,
       }),
     ])
-    const loadsBefore = count(server.calls, '/jobs/j1')
+    const loadsBefore = count(server.calls, '/jobs/j1/targets/t1/output')
+    const metadataBefore = count(server.calls, '/jobs/j1?include_output=false')
     act(() =>
       socket.send({
         type: 'job.target.updated',
@@ -264,7 +264,8 @@ describe('live updates', () => {
     expect(within(row).getByText('3')).toBeInTheDocument()
     expect(within(row).getByText('2.5 s')).toBeInTheDocument()
     expect(within(row).getByText('Non-zero exit code')).toBeInTheDocument()
-    await waitFor(() => expect(count(server.calls, '/jobs/j1')).toBe(loadsBefore + 1))
+    await waitFor(() => expect(count(server.calls, '/jobs/j1/targets/t1/output')).toBe(loadsBefore + 1))
+    expect(count(server.calls, '/jobs/j1?include_output=false')).toBe(metadataBefore)
     expect(pane.textContent).toBe('first\nsecond\nthird\n[truncated]')
   })
 
@@ -285,7 +286,7 @@ describe('live updates', () => {
       socket.send({ ...event, offset: 2, data: 'a' }) // delivered twice
       socket.send({ ...event, offset: 3, data: 'b' })
     })
-    expect(pane.textContent).toBe('\u{1F600}\u{1F600}ab')
+    await waitFor(() => expect(pane.textContent).toBe('\u{1F600}\u{1F600}ab'))
   })
 
   it('shows a job as gone when its last device is forgotten while it is open', async () => {

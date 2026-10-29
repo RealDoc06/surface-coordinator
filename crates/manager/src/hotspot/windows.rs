@@ -5,7 +5,7 @@
 //! calls block, so they run on the blocking thread pool.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ::windows::core::HSTRING;
 use ::windows::Networking::Connectivity::NetworkInformation;
@@ -24,6 +24,9 @@ pub struct MobileHotspot {
     /// that timeout off while its hotspot runs and back on when it stops,
     /// if it was on before.
     restore_timeout: Arc<AtomicBool>,
+    /// Only a successful start grants ownership. If the operator replaces
+    /// this network in Windows Settings, stopping the manager leaves it alone.
+    owned_network: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl HotspotControl for MobileHotspot {
@@ -34,12 +37,33 @@ impl HotspotControl for MobileHotspot {
     fn start(&self, ssid: &str, passphrase: &str) -> BoxFuture<Result<(), String>> {
         let (ssid, passphrase) = (ssid.to_owned(), passphrase.to_owned());
         let restore_timeout = self.restore_timeout.clone();
-        Box::pin(blocking(move || start(&ssid, &passphrase, &restore_timeout)))
+        let owned_network = self.owned_network.clone();
+        Box::pin(blocking(move || {
+            let result = start(&ssid, &passphrase, &restore_timeout);
+            if result.is_ok() {
+                *owned_network.lock().unwrap_or_else(|error| error.into_inner()) = Some((ssid, passphrase));
+            } else {
+                restore_idle_timeout(&restore_timeout);
+            }
+            result
+        }))
     }
 
     fn stop(&self) -> BoxFuture<Result<(), String>> {
         let restore_timeout = self.restore_timeout.clone();
-        Box::pin(blocking(move || stop(&restore_timeout)))
+        let owned_network = self.owned_network.clone();
+        Box::pin(blocking(move || {
+            let mut owned = owned_network.lock().unwrap_or_else(|error| error.into_inner());
+            let result = match owned.as_ref() {
+                Some((ssid, passphrase)) => stop(ssid, passphrase),
+                None => Ok(()),
+            };
+            restore_idle_timeout(&restore_timeout);
+            if result.is_ok() {
+                *owned = None;
+            }
+            result
+        }))
     }
 
     fn instructions(&self, _ssid: &str, _passphrase: &str) -> Vec<String> {
@@ -68,6 +92,7 @@ fn start(ssid: &str, passphrase: &str, restore_timeout: &AtomicBool) -> Result<(
             };
             if same(current.Ssid(), ssid) && same(current.Passphrase(), passphrase) {
                 // Already ours: restarting would drop the connected devices.
+                disable_idle_timeout(restore_timeout);
                 return Ok(());
             }
         }
@@ -100,19 +125,30 @@ fn start(ssid: &str, passphrase: &str, restore_timeout: &AtomicBool) -> Result<(
     check("start Mobile Hotspot", result)
 }
 
-fn stop(restore_timeout: &AtomicBool) -> Result<(), String> {
+fn stop(ssid: &str, passphrase: &str) -> Result<(), String> {
     let manager = tethering_manager()?;
     let state = winrt("read the Mobile Hotspot state", manager.TetheringOperationalState())?;
     if state != TetheringOperationalState::Off {
+        let current = winrt("read the Mobile Hotspot configuration", manager.GetCurrentAccessPointConfiguration())?;
+        let current_ssid = winrt("read the Mobile Hotspot name", current.Ssid())?;
+        let current_passphrase = winrt("read the Mobile Hotspot password", current.Passphrase())?;
+        if current_ssid.to_string_lossy() != ssid || current_passphrase.to_string_lossy() != passphrase {
+            tracing::info!("Mobile Hotspot was changed outside the manager; leaving it running");
+            return Ok(());
+        }
         let result = winrt("stop Mobile Hotspot", manager.StopTetheringAsync().and_then(|op| op.join()))?;
         check("stop Mobile Hotspot", result)?;
     }
-    if restore_timeout.swap(false, Ordering::SeqCst) {
-        if let Err(error) = NetworkOperatorTetheringManager::EnableNoConnectionsTimeout() {
-            tracing::warn!(%error, "could not switch the Mobile Hotspot idle timeout back on");
+    Ok(())
+}
+
+fn restore_idle_timeout(restore_timeout: &AtomicBool) {
+    if restore_timeout.load(Ordering::SeqCst) {
+        match NetworkOperatorTetheringManager::EnableNoConnectionsTimeout() {
+            Ok(()) => restore_timeout.store(false, Ordering::SeqCst),
+            Err(error) => tracing::warn!(%error, "could not switch the Mobile Hotspot idle timeout back on"),
         }
     }
-    Ok(())
 }
 
 /// Best effort: without it the hotspot still works until it has been idle

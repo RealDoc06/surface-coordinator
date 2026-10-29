@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use client::platform::{
     executable, OutputChunk, Platform, PlatformError, ScriptOutcome, ScriptRequest, SystemInfo,
-    WifiConnection, WifiJoinRequest,
+    WifiConnection, WifiJoinPolicy, WifiJoinRequest,
 };
 use client::{BackoffConfig, Client, ClientConfig};
 use futures_util::{SinkExt, StreamExt};
@@ -72,8 +72,13 @@ pub struct FakePlatform {
     hold_applies: AtomicBool,
     power_supported: AtomicBool,
     power_calls: Mutex<Vec<(PowerAction, Instant)>>,
+    power_error: Mutex<Option<PlatformError>>,
+    hold_power: AtomicBool,
     executable: Mutex<Option<PathBuf>>,
     update_calls: Mutex<Vec<&'static str>>,
+    update_probe_error: Mutex<Option<PlatformError>>,
+    hold_update_probe: AtomicBool,
+    hold_update_cleanup: AtomicBool,
     /// Cancelled by a restart request: the client's shutdown token.
     restart: Mutex<Option<CancellationToken>>,
 }
@@ -100,6 +105,8 @@ struct FakeWifi {
     names_withheld: bool,
     visible: Vec<String>,
     current: Option<WifiConnection>,
+    current_error: Option<PlatformError>,
+    connect_during_scan: Option<WifiConnection>,
     /// On success the device is then on the given connection.
     outcomes: HashMap<String, Result<WifiConnection, PlatformError>>,
     scans: Vec<Instant>,
@@ -120,8 +127,13 @@ impl FakePlatform {
             hold_applies: AtomicBool::new(false),
             power_supported: AtomicBool::new(true),
             power_calls: Mutex::new(Vec::new()),
+            power_error: Mutex::new(None),
+            hold_power: AtomicBool::new(false),
             executable: Mutex::new(None),
             update_calls: Mutex::new(Vec::new()),
+            update_probe_error: Mutex::new(None),
+            hold_update_probe: AtomicBool::new(false),
+            hold_update_cleanup: AtomicBool::new(false),
             restart: Mutex::new(None),
         })
     }
@@ -129,6 +141,18 @@ impl FakePlatform {
     /// The file the client runs from, as far as updates are concerned.
     pub fn set_executable(&self, path: &Path) {
         *self.executable.lock().unwrap() = Some(path.to_owned());
+    }
+
+    pub fn fail_update_probe(&self, error: PlatformError) {
+        *self.update_probe_error.lock().unwrap() = Some(error);
+    }
+
+    pub fn hold_update_cleanup(&self) {
+        self.hold_update_cleanup.store(true, Ordering::SeqCst);
+    }
+
+    pub fn hold_update_probe(&self) {
+        self.hold_update_probe.store(true, Ordering::SeqCst);
     }
 
     /// `swap`, `restore`, `remove_old` and `restart`, in the order called.
@@ -184,6 +208,16 @@ impl FakePlatform {
         self.power_calls.lock().unwrap().clone()
     }
 
+    /// Simulates a native failure after the capability check passed.
+    pub fn fail_power(&self, error: PlatformError) {
+        *self.power_error.lock().unwrap() = Some(error);
+    }
+
+    /// Simulates a blocking suspend call, released by `release` on resume.
+    pub fn hold_power(&self) {
+        self.hold_power.store(true, Ordering::SeqCst);
+    }
+
     /// A platform with Wi-Fi: nothing in range and not connected until the
     /// test says otherwise.
     pub fn with_wifi() -> Arc<FakePlatform> {
@@ -202,6 +236,14 @@ impl FakePlatform {
 
     pub fn set_current(&self, current: Option<WifiConnection>) {
         self.wifi.lock().unwrap().current = current;
+    }
+
+    pub fn fail_wifi_current(&self, error: PlatformError) {
+        self.wifi.lock().unwrap().current_error = Some(error);
+    }
+
+    pub fn connect_during_scan(&self, connection: WifiConnection) {
+        self.wifi.lock().unwrap().connect_during_scan = Some(connection);
     }
 
     pub fn current(&self) -> Option<WifiConnection> {
@@ -262,6 +304,9 @@ impl Platform for FakePlatform {
     async fn wifi_scan(&self) -> Result<Vec<String>, PlatformError> {
         let mut wifi = self.wifi_supported()?;
         wifi.scans.push(Instant::now());
+        if let Some(connection) = wifi.connect_during_scan.take() {
+            wifi.current = Some(connection);
+        }
         if wifi.names_withheld {
             return Err(PlatformError::AccessDenied("fake: Wi-Fi names are withheld".into()));
         }
@@ -270,6 +315,16 @@ impl Platform for FakePlatform {
 
     async fn wifi_join(&self, request: WifiJoinRequest) -> Result<(), PlatformError> {
         let mut wifi = self.wifi_supported()?;
+        let allowed = match (&request.policy, wifi.current.as_ref()) {
+            (WifiJoinPolicy::Replace, _) | (_, None) => true,
+            (WifiJoinPolicy::Disconnected, Some(_)) => false,
+            (WifiJoinPolicy::RecoverFrom(ssid), Some(current)) => {
+                !wifi.names_withheld && current.ssid.as_ref() == Some(ssid)
+            }
+        };
+        if !allowed {
+            return Err(PlatformError::Failed("preserving current Wi-Fi connection".into()));
+        }
         wifi.joins.push(request.clone());
         match wifi.outcomes.get(&request.ssid).cloned() {
             Some(Ok(connection)) => {
@@ -283,6 +338,9 @@ impl Platform for FakePlatform {
 
     async fn wifi_current(&self) -> Result<Option<WifiConnection>, PlatformError> {
         let wifi = self.wifi_supported()?;
+        if let Some(error) = &wifi.current_error {
+            return Err(error.clone());
+        }
         let mut current = wifi.current.clone();
         if wifi.names_withheld {
             if let Some(current) = &mut current {
@@ -315,7 +373,10 @@ impl Platform for FakePlatform {
 
     async fn power(&self, action: PowerAction) -> Result<(), PlatformError> {
         self.power_calls.lock().unwrap().push((action, Instant::now()));
-        Ok(())
+        if self.hold_power.load(Ordering::SeqCst) {
+            self.gate.acquire().await.unwrap().forget();
+        }
+        self.power_error.lock().unwrap().clone().map_or(Ok(()), Err)
     }
 
     fn current_exe(&self) -> Result<PathBuf, PlatformError> {
@@ -331,6 +392,16 @@ impl Platform for FakePlatform {
         executable::swap(&exe, &new).map_err(|error| PlatformError::Failed(error.to_string()))
     }
 
+    async fn validate_update(&self, _path: PathBuf, _expected_version: String) -> Result<(), PlatformError> {
+        if self.hold_update_probe.load(Ordering::SeqCst) {
+            self.gate.acquire().await.unwrap().forget();
+        }
+        match self.update_probe_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn restore_executable(&self) -> Result<(), PlatformError> {
         let exe = self.update_call("restore")?;
         executable::restore(&exe).map_err(|error| PlatformError::Failed(error.to_string()))
@@ -338,6 +409,9 @@ impl Platform for FakePlatform {
 
     async fn remove_old_executable(&self) -> Result<(), PlatformError> {
         let exe = self.update_call("remove_old")?;
+        if self.hold_update_cleanup.load(Ordering::SeqCst) {
+            self.gate.acquire().await.unwrap().forget();
+        }
         executable::remove_leftovers(&exe).map_err(|error| PlatformError::Failed(error.to_string()))
     }
 
@@ -418,16 +492,17 @@ pub fn client_config(addr: SocketAddr) -> ClientConfig {
             stable_after: Duration::from_secs(30),
         },
         handshake_timeout: Duration::from_secs(5),
+        hotspot_discovery: true,
         search_after: Duration::from_millis(300),
         search_interval: Duration::from_millis(100),
         handoff_timeout: Duration::from_millis(700),
         offline_search_interval: Duration::from_millis(100),
-        blind_join_interval: Duration::from_millis(400),
         hotspot_port: protocol::EMBEDDED_CLIENT_PORT,
         power_ack_timeout: Duration::from_millis(200),
         // No update key: tests of `client.update` give their own.
         update_public_key: String::new(),
         download_timeout: Duration::from_secs(5),
+        update_confirmation_timeout: Duration::from_secs(180),
     }
 }
 

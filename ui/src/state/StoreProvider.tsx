@@ -5,6 +5,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -21,6 +22,8 @@ type StoreContextValue = {
   loadError: string | null
   /** Refetch everything the current views show. */
   reload: () => void
+  /** Reopen the events connection immediately. */
+  reconnect: () => void
   /** Refetch the enrollment keys after changing them. */
   reloadKeys: () => Promise<void>
   /** Refetch groups and devices after changing groups (the coordinator also announces it). */
@@ -53,17 +56,43 @@ type Props = {
 export function StoreProvider({ children, onDisconnected }: Props) {
   const [state, dispatch] = useReducer(reducer, initialState)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const streamRef = useRef<EventStream | null>(null)
 
   useEffect(() => {
+    let output: unknown[] = []
+    let outputTimer: ReturnType<typeof setTimeout> | null = null
+    const flushOutput = () => {
+      if (outputTimer !== null) clearTimeout(outputTimer)
+      outputTimer = null
+      if (output.length > 0) dispatch({ type: 'events', events: output })
+      output = []
+    }
     const stream = new EventStream({
-      onEvent: (event) => dispatch({ type: 'event', event }),
+      onEvent: (event) => {
+        // Noisy scripts can send hundreds of chunks a second. Render their
+        // output in 32 ms batches; device and job states stay immediate.
+        if (typeof event === 'object' && event !== null && 'type' in event && event.type === 'job.output') {
+          output.push(event)
+          if (outputTimer === null) outputTimer = setTimeout(flushOutput, 32)
+          if (output.length >= 256) flushOutput()
+          return
+        }
+        flushOutput()
+        dispatch({ type: 'event', event })
+      },
       onStatus: (status) => {
+        flushOutput()
         dispatch({ type: 'connection', status })
         if (status === 'reconnecting') onDisconnected?.()
       },
     })
+    streamRef.current = stream
     stream.start()
-    return () => stream.stop()
+    return () => {
+      if (outputTimer !== null) clearTimeout(outputTimer)
+      streamRef.current = null
+      stream.stop()
+    }
     // The stream lives as long as the provider; onDisconnected is not a dependency.
   }, [])
 
@@ -109,6 +138,7 @@ export function StoreProvider({ children, onDisconnected }: Props) {
   }, [state.syncEpoch])
 
   const reload = useCallback(() => dispatch({ type: 'sync' }), [])
+  const reconnect = useCallback(() => streamRef.current?.reconnect(), [])
   const reloadKeys = useCallback(async () => {
     const { keys } = await api.listKeys()
     dispatch({ type: 'keys.loaded', keys })
@@ -117,8 +147,8 @@ export function StoreProvider({ children, onDisconnected }: Props) {
   const reloadGroups = useCallback(() => dispatch({ type: 'event', event: { type: 'groups.changed' } }), [])
 
   const value = useMemo(
-    () => ({ state, dispatch, loadError, reload, reloadKeys, reloadGroups }),
-    [state, loadError, reload, reloadKeys, reloadGroups],
+    () => ({ state, dispatch, loadError, reload, reconnect, reloadKeys, reloadGroups }),
+    [state, loadError, reload, reconnect, reloadKeys, reloadGroups],
   )
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>
 }

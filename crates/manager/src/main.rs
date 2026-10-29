@@ -28,6 +28,10 @@ const UPDATER_PUBKEY: &str = env!("SC_UPDATER_PUBKEY");
 /// the footer saying "Checking…" for minutes.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Installers are several megabytes; allow slower connections without
+/// letting a stalled download hold the launcher forever.
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// How long opening the local coordinator waits for the enrollment keys to
 /// be copied, so they are usually there when its UI loads. Offline the copy
 /// can take longer; it then finishes in the background.
@@ -45,13 +49,19 @@ struct AppState {
     /// The update found by the last check, installed when the operator
     /// confirms.
     pending_update: tokio::sync::Mutex<Option<Update>>,
+    /// Coordinator changes and installation must not overlap, including
+    /// commands sent just before the launcher disables its controls.
+    operation: tokio::sync::Mutex<()>,
     /// How the last copy of enrollment keys from the online coordinator went.
     key_sync: Mutex<KeySync>,
 }
 
 impl AppState {
     fn allow(&self, origin: String) {
-        let mut allowed = self.allowed_origins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut allowed = self
+            .allowed_origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !allowed.contains(&origin) {
             allowed.push(origin);
         }
@@ -61,7 +71,7 @@ impl AppState {
 /// What the launcher page shows.
 #[derive(Serialize)]
 struct Status {
-    version: &'static str,
+    version: String,
     local_running: bool,
     /// Port clients connect to while the local coordinator runs.
     local_client_port: Option<u16>,
@@ -81,14 +91,18 @@ struct KeySync {
 }
 
 #[tauri::command]
-async fn status(state: State<'_, AppState>) -> Result<Status, String> {
+async fn status(app: AppHandle, state: State<'_, AppState>) -> Result<Status, String> {
     let embedded = state.embedded.lock().await;
     Ok(Status {
-        version: env!("CARGO_PKG_VERSION"),
+        version: app.package_info().version.to_string(),
         local_running: embedded.is_some(),
         local_client_port: embedded.as_ref().map(|e| e.client_addr().port()),
         remote_url: Settings::load(&state.data_dir).remote_url,
-        key_sync: state.key_sync.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        key_sync: state
+            .key_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
     })
 }
 
@@ -105,7 +119,9 @@ async fn session_cookie(window: &WebviewWindow, origin: &str) -> Option<String> 
     let window = window.clone();
     // The call blocks until the event loop has asked WebView2, so it must
     // not run on the main thread nor hold up an async worker.
-    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url)).await.ok()?;
+    let cookies = tauri::async_runtime::spawn_blocking(move || window.cookies_for_url(url))
+        .await
+        .ok()?;
     match cookies {
         Ok(cookies) => cookies
             .into_iter()
@@ -123,7 +139,9 @@ async fn session_cookie(window: &WebviewWindow, origin: &str) -> Option<String> 
 /// Without an online coordinator there is nothing to copy and nothing to say.
 async fn sync_keys(window: WebviewWindow, local_origin: String, local_token: String) {
     let state = window.state::<AppState>();
-    let Some(remote) = Settings::load(&state.data_dir).remote_url else { return };
+    let Some(remote) = Settings::load(&state.data_dir).remote_url else {
+        return;
+    };
     let outcome = match session_cookie(&window, &remote).await {
         Some(cookie) => sync::pull_keys(&remote, &cookie, &local_origin, &local_token).await,
         None => Err(SyncError::NotLoggedIn),
@@ -134,11 +152,14 @@ async fn sync_keys(window: WebviewWindow, local_origin: String, local_token: Str
             imported = report.imported,
             already_present = report.already_present,
             skipped_revoked = report.skipped_revoked,
+            revoked = report.revoked,
             "enrollment keys synced"
         ),
         Err(error) => tracing::info!(%remote, %error, "enrollment keys not synced"),
     }
-    let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64);
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
     *state.key_sync.lock().unwrap_or_else(|e| e.into_inner()) = KeySync {
         at: Some(at),
         imported: outcome.as_ref().map_or(0, |report| report.imported),
@@ -147,19 +168,33 @@ async fn sync_keys(window: WebviewWindow, local_origin: String, local_token: Str
 }
 
 /// Runs [`sync_keys`] into `running` in the background.
-fn start_key_sync(window: &WebviewWindow, running: &Embedded) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(sync_keys(window.clone(), running.origin(), running.api_token().to_owned()))
+fn start_key_sync(
+    window: &WebviewWindow,
+    running: &Embedded,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(sync_keys(
+        window.clone(),
+        running.origin(),
+        running.api_token().to_owned(),
+    ))
 }
 
 /// Starts the local coordinator if it is not running, copies the online
 /// coordinator's enrollment keys into it and shows its UI.
 #[tauri::command]
 async fn open_local(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| operation_in_progress())?;
     let mut embedded = state.embedded.lock().await;
     if embedded.is_none() {
         let data_dir = state.data_dir.join("coordinator");
         let online_coordinator = Settings::load(&state.data_dir).remote_url;
-        let options = Options { online_coordinator, ..Options::default() };
+        let options = Options {
+            online_coordinator,
+            ..Options::default()
+        };
         let started = Embedded::start(&data_dir, options).await.map_err(|error| {
             format!(
                 "The local coordinator could not be started: {error}. \
@@ -190,6 +225,10 @@ async fn stop_embedded(state: &AppState) {
 /// Stops the local coordinator; devices connected to it go offline.
 #[tauri::command]
 async fn stop_local(state: State<'_, AppState>) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| operation_in_progress())?;
     stop_embedded(&state).await;
     Ok(())
 }
@@ -201,8 +240,14 @@ async fn open_remote(
     state: State<'_, AppState>,
     address: String,
 ) -> Result<(), String> {
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| operation_in_progress())?;
     let origin = remote::normalise(&address).map_err(|error| error.to_string())?;
-    let health = remote::check(&origin).await.map_err(|error| error.to_string())?;
+    let health = remote::check(&origin)
+        .await
+        .map_err(|error| error.to_string())?;
     tracing::info!(%origin, version = %health.version, "remote coordinator reached");
 
     let mut settings = Settings::load(&state.data_dir);
@@ -222,36 +267,48 @@ async fn open_remote(
 
 /// Asks the repository's latest release whether there is a newer manager.
 ///
-/// Never fails: without internet the answer is "nothing available" with a
-/// quiet reason, so the launcher keeps working in hotspot mode.
+/// Without internet the answer is "nothing available" with a quiet reason,
+/// so the launcher keeps working in hotspot mode. Concurrent update work
+/// is refused rather than replacing the release being downloaded.
 #[tauri::command]
 async fn check_update(app: AppHandle, state: State<'_, AppState>) -> Result<UpdateStatus, String> {
-    let current = env!("CARGO_PKG_VERSION");
+    let current = app.package_info().version.to_string();
     if update::configured_key(UPDATER_PUBKEY).is_none() {
-        return Ok(UpdateStatus::not_configured(current));
+        return Ok(UpdateStatus::not_configured(&current));
     }
+    let mut pending = state
+        .pending_update
+        .try_lock()
+        .map_err(|_| update_in_progress())?;
     // The plugin was registered with the key in `main`; the endpoint comes
     // from `plugins.updater` in tauri.conf.json.
-    let checked = match app.updater_builder().timeout(UPDATE_CHECK_TIMEOUT).build() {
+    let updater = app.updater_builder().timeout(UPDATE_CHECK_TIMEOUT);
+    // Tauri's default hook destroys the webview before ShellExecuteW has
+    // confirmed that the installer started. Keep it alive for recovery if
+    // launching fails. We close the coordinator ourselves before install;
+    // the plugin exits the process immediately after a successful launch.
+    #[cfg(windows)]
+    let updater = updater.on_before_exit(|| {});
+    let checked = match updater.build() {
         Ok(updater) => updater.check().await,
         Err(error) => Err(error),
     };
-    let mut pending = state.pending_update.lock().await;
     Ok(match checked {
-        Ok(Some(found)) => {
+        Ok(Some(mut found)) => {
             tracing::info!(version = %found.version, "manager update available");
-            let status = UpdateStatus::available(current, &found.version, found.body.as_deref());
+            found.timeout = Some(UPDATE_DOWNLOAD_TIMEOUT);
+            let status = UpdateStatus::available(&current, &found.version, found.body.as_deref());
             *pending = Some(found);
             status
         }
         Ok(None) => {
             *pending = None;
-            UpdateStatus::up_to_date(current)
+            UpdateStatus::up_to_date(&current)
         }
         Err(error) => {
             // Expected in hotspot mode; not worth more than an info line.
             tracing::info!(%error, "update check failed");
-            UpdateStatus::failed(current, &error)
+            UpdateStatus::failed(&current, &error)
         }
     })
 }
@@ -267,10 +324,19 @@ async fn install_update(
     state: State<'_, AppState>,
     on_progress: Channel<String>,
 ) -> Result<(), String> {
-    // Taken out so that a second click cannot start a second install.
-    let Some(found) = state.pending_update.lock().await.take() else {
+    // Keep both guards until the attempt finishes. Failed attempts retain
+    // their release for retry; no concurrent check can overwrite it.
+    let pending = state
+        .pending_update
+        .try_lock()
+        .map_err(|_| update_in_progress())?;
+    let Some(found) = pending.as_ref() else {
         return Err("There is no update to install. Check for updates first.".to_owned());
     };
+    let _operation = state
+        .operation
+        .try_lock()
+        .map_err(|_| operation_in_progress())?;
     let report = |text: &str| {
         let _ = on_progress.send(text.to_owned());
     };
@@ -293,31 +359,56 @@ async fn install_update(
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::warn!(%error, "update download failed");
-            *state.pending_update.lock().await = Some(found);
             return Err(update::install_error_message(&error));
         }
     };
 
-    // Same path as "Stop" and quitting: the hotspot is turned off and the
-    // database closed before the installer replaces the files.
-    if state.embedded.lock().await.is_some() {
-        report("Stopping the local coordinator…");
-        stop_embedded(&state).await;
+    let mut embedded = state.embedded.lock().await;
+    let options = Options {
+        online_coordinator: Settings::load(&state.data_dir).remote_url,
+        ..Options::default()
+    };
+    let installed = update::install_with_recovery(
+        &mut embedded,
+        &state.data_dir.join("coordinator"),
+        options,
+        || {
+            tracing::info!(version = %found.version, "installing manager update");
+            found.install(bytes)
+        },
+        report,
+    )
+    .await;
+    if let Some(restored) = embedded.as_ref() {
+        state.allow(restored.origin());
     }
-    report("Installing the update…");
-    tracing::info!(version = %found.version, "installing manager update");
-    if let Err(error) = found.install(bytes) {
-        tracing::error!(%error, "update install failed");
-        *state.pending_update.lock().await = Some(found);
-        return Err(update::install_error_message(&error));
-    }
+    // Restart dispatches Exit, which takes this mutex during shutdown.
+    drop(embedded);
+    installed?;
     report("Restarting…");
     app.restart()
 }
 
+fn operation_in_progress() -> String {
+    "Another manager operation is in progress. Wait for it to finish and try again.".to_owned()
+}
+
+fn update_in_progress() -> String {
+    "An update check or installation is already in progress. Wait for it to finish.".to_owned()
+}
+
 fn show_launcher(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
-    let launcher = state.launcher.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // Keep the page carrying installation progress in place until the
+    // operation either succeeds or reports its recovery result.
+    let Ok(_operation) = state.operation.try_lock() else {
+        return;
+    };
+    let launcher = state
+        .launcher
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let (Some(window), Some(launcher)) = (app.get_webview_window(MAIN_WINDOW), launcher) {
         if let Err(error) = window.navigate(launcher) {
             tracing::error!(%error, "could not return to the launcher");
@@ -326,7 +417,9 @@ fn show_launcher(app: &tauri::AppHandle) {
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let mut builder = tauri::Builder::default();
     // Only builds with a public key get the updater at all. No capability
@@ -356,13 +449,23 @@ fn main() {
                 allowed_origins: allowed_origins.clone(),
                 launcher: launcher.clone(),
                 pending_update: tokio::sync::Mutex::new(None),
+                operation: tokio::sync::Mutex::new(()),
                 key_sync: Mutex::new(KeySync::default()),
             });
 
+            // Keep controls above the taskbar on smaller or scaled displays.
+            let maximize = app.primary_monitor().ok().flatten().is_some_and(|monitor| {
+                let area = monitor
+                    .work_area()
+                    .size
+                    .to_logical::<f64>(monitor.scale_factor());
+                area.width < 1320.0 || area.height < 940.0
+            });
             WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
                 .title("Surface Coordinator")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(1000.0, 640.0)
+                .maximized(maximize)
                 .on_navigation(move |url| {
                     if is_launcher_page(url) {
                         *launcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
@@ -376,8 +479,13 @@ fn main() {
                 })
                 .build()?;
 
-            let change = MenuItemBuilder::with_id("change-coordinator", "Change coordinator…").build(app)?;
-            let coordinator = SubmenuBuilder::new(app, "Coordinator").item(&change).separator().quit().build()?;
+            let change =
+                MenuItemBuilder::with_id("change-coordinator", "Change coordinator…").build(app)?;
+            let coordinator = SubmenuBuilder::new(app, "Coordinator")
+                .item(&change)
+                .separator()
+                .quit()
+                .build()?;
             let menu = MenuBuilder::new(app).item(&coordinator).build()?;
             app.set_menu(menu)?;
             app.on_menu_event(|app, event| {

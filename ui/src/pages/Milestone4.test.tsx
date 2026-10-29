@@ -467,6 +467,70 @@ describe('script library', () => {
     expect(screen.getByRole('textbox', { name: 'Script body' })).toHaveValue('del /q %TEMP%\\*')
   })
 
+  it('keeps selected devices when inspecting, editing and running a library script', async () => {
+    const server = fakeCoordinator({ scripts: [mine] })
+    const user = start()
+    await user.click(await screen.findByRole('checkbox', { name: 'Select LAB-01' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Select LAB-03' }))
+    await user.click(screen.getByRole('button', { name: /More actions/ }))
+    await user.click(screen.getByRole('menuitem', { name: 'Run script from library…' }))
+    await user.click(await screen.findByRole('link', { name: 'Clean temp' }))
+    const body = await screen.findByRole('textbox', { name: 'Script body' })
+    await user.clear(body)
+    await user.type(body, 'echo selected devices')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await screen.findByText('Saved.')
+    await user.click(screen.getByRole('button', { name: 'Run…' }))
+
+    expect(await screen.findByText('2 selected devices: LAB-01, LAB-03')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run on 2 devices' }))
+    await screen.findByRole('heading', { name: 'Script job' })
+    expect(jobPosts(server.calls)[0]?.body).toMatchObject({
+      payload: { shell: 'cmd', body: 'echo selected devices' },
+      targets: { type: 'devices', device_ids: ['a', 'c'] },
+    })
+  })
+
+  it('keeps selected devices through duplicating a script and returning to the library', async () => {
+    const server = fakeCoordinator({ scripts: [builtIn] })
+    const user = start()
+    await user.click(await screen.findByRole('checkbox', { name: 'Select LAB-02' }))
+    await user.click(screen.getByRole('button', { name: /More actions/ }))
+    await user.click(screen.getByRole('menuitem', { name: 'Run script from library…' }))
+    await user.click(await screen.findByRole('link', { name: 'Check disk' }))
+    await user.click(await screen.findByRole('button', { name: 'Duplicate' }))
+    await user.click(screen.getByRole('button', { name: 'Create script' }))
+    expect(await screen.findByText('1 selected device: LAB-02')).toBeInTheDocument()
+    await user.click(await screen.findByRole('link', { name: 'Check disk (copy)' }))
+    await user.click(await screen.findByRole('link', { name: 'All scripts' }))
+    expect(await screen.findByText('1 selected device: LAB-02')).toBeInTheDocument()
+    await user.click(await screen.findByRole('link', { name: 'Check disk (copy)' }))
+    await user.click(await screen.findByRole('button', { name: 'Close' }))
+    expect(await screen.findByText('1 selected device: LAB-02')).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Run Check disk (copy)' }))
+    await user.click(await screen.findByRole('button', { name: 'Run on 1 device' }))
+    await screen.findByRole('heading', { name: 'Script job' })
+    expect(jobPosts(server.calls)[0]?.body).toMatchObject({ targets: { type: 'devices', device_ids: ['b'] } })
+  })
+
+  it('keeps selected devices when returning from a script that was deleted elsewhere', async () => {
+    const server = fakeCoordinator({ scripts: [mine, builtIn] })
+    const user = start()
+    await user.click(await screen.findByRole('checkbox', { name: 'Select LAB-01' }))
+    await user.click(screen.getByRole('button', { name: /More actions/ }))
+    await user.click(screen.getByRole('menuitem', { name: 'Run script from library…' }))
+    const scriptLink = await screen.findByRole('link', { name: 'Clean temp' })
+    server.scripts = [builtIn]
+    await user.click(scriptLink)
+    await screen.findByRole('heading', { name: 'Script not found' })
+    await user.click(screen.getByRole('link', { name: 'Back to scripts' }))
+    expect(await screen.findByText('1 selected device: LAB-01')).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Run Check disk' }))
+    await user.click(await screen.findByRole('button', { name: 'Run on 1 device' }))
+    await screen.findByRole('heading', { name: 'Script job' })
+    expect(jobPosts(server.calls)[0]?.body).toMatchObject({ targets: { type: 'devices', device_ids: ['a'] } })
+  })
+
   it('says when a script is not found', async () => {
     fakeCoordinator({ scripts: [] })
     start('/scripts/nope')

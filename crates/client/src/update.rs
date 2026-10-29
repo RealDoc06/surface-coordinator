@@ -8,8 +8,9 @@
 //!    the current session to `client.update.tmp` beside the executable;
 //!    check size and SHA-256, then the signature (`.sig`) against the key
 //!    built into this client.
-//! 2. Replace the executable (the running one becomes `client.old.exe`) and
-//!    write the pending-update marker, [`MARKER_FILE`].
+//! 2. Check that the signed executable can start as the expected version.
+//!    Write the pending-update marker, [`MARKER_FILE`], then replace the
+//!    executable (the running one becomes `client.old.exe`).
 //! 3. Leave the job unfinished (the ledger marks it as awaiting the restart),
 //!    note "restarting" in its output, and restart.
 //!
@@ -18,7 +19,8 @@
 //! - On the new version: count the start. Up to [`MAX_STARTS`] starts, the
 //!   update is completed by the first handshake: the old executable and the
 //!   marker are deleted and the job succeeds. The next start puts the old
-//!   executable back and restarts.
+//!   executable back and restarts. A process that stays alive without a
+//!   handshake also restores the old version after its confirmation deadline.
 //! - On the previous version after such a rollback: the job fails with
 //!   `rolled_back`.
 //!
@@ -26,6 +28,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use protocol::update::{self, Version, VerifyError};
 use protocol::{reason, ClientUpdatePayload, JobResult, OutputStream};
@@ -57,6 +60,10 @@ pub struct Marker {
     /// The previous version has been put back.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rolled_back: bool,
+    /// Why this provisional version was rolled back, when the health
+    /// deadline rather than repeated starts triggered recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -80,11 +87,14 @@ pub fn read_marker(state_dir: &Path) -> io::Result<Option<Marker>> {
     }
 }
 
-/// Writes the marker atomically.
+/// Flushes the recovery information before atomically replacing the marker.
 pub fn write_marker(state_dir: &Path, marker: &Marker) -> io::Result<()> {
     let path = state_dir.join(MARKER_FILE);
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(marker)?)?;
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(marker)?)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&temporary, &path)
 }
 
@@ -136,6 +146,7 @@ async fn try_install<P: Platform>(
 ) -> Result<Outcome, JobResult> {
     let fail = |reason: &str, message: String| jobs::failed(id, reason, Some(message));
     let settings = &context.update;
+    let _lifecycle = settings.lifecycle.lock().await;
 
     let version: Version =
         payload.version.parse().map_err(|error: update::ParseVersionError| fail(reason::INVALID_PAYLOAD, error.to_string()))?;
@@ -201,36 +212,38 @@ async fn try_install<P: Platform>(
         Err(error) => return Err(fail(reason::BAD_SIGNATURE, error.to_string())),
     }
 
+    platform.validate_update(download.path.clone(), version.to_string()).await
+        .map_err(|error| jobs::platform_failure(id, error))?;
+
     // Replacing the executable is the point of no return.
     if !jobs.commit(id) {
         return Err(jobs::cancelled(id));
     }
     // Before the swap: should the client stop right after it, the next
     // start must not take the job for interrupted (see `on_start`).
-    jobs.await_restart(id);
-    download.keep = true;
-    if let Err(error) = platform.swap_executable(download.path.clone()).await {
-        download.keep = false;
-        return Err(jobs::platform_failure(id, error));
-    }
+    jobs.await_restart(id).map_err(|error| fail(reason::ERROR, format!(
+        "cannot persist the update restart state: {error}; version {running} is still in place"
+    )))?;
     let marker = Marker {
         job_target_id: id.to_owned(),
         previous_version: settings.client_version.clone(),
         new_version: version.to_string(),
         starts: 0,
         rolled_back: false,
+        failure: None,
     };
+    // Persist recovery information before changing the executable. A crash
+    // after a successful swap must not strand the new version without it.
     if let Err(error) = write_marker(state_dir, &marker) {
-        // Without the marker the new version could not complete the job;
-        // better not to run it at all.
-        let restored = match platform.restore_executable().await {
-            Ok(()) => {
-                let _ = platform.remove_old_executable().await;
-                format!("version {running} is still in place")
-            }
-            Err(restore_error) => format!("putting version {running} back failed too: {restore_error}"),
-        };
-        return Err(fail(reason::ERROR, format!("cannot write the update marker: {error}; {restored}")));
+        return Err(fail(reason::ERROR, format!(
+            "cannot write the update marker: {error}; version {running} is still in place"
+        )));
+    }
+    download.keep = true;
+    if let Err(error) = platform.swap_executable(download.path.clone()).await {
+        download.keep = false;
+        delete_marker(state_dir);
+        return Err(jobs::platform_failure(id, error));
     }
 
     tracing::info!(job_target_id = %id, %version, "client update installed; restarting");
@@ -346,7 +359,8 @@ pub(crate) enum Startup {
     Restart,
 }
 
-/// An update that completes with the first handshake of this start.
+/// An update that completes with the first handshake or rolls back at its
+/// confirmation deadline.
 pub(crate) struct Completion {
     state_dir: PathBuf,
     job_target_id: String,
@@ -357,13 +371,39 @@ impl Completion {
     /// Call once a handshake has completed.
     pub(crate) async fn complete<P: Platform>(self, platform: &P, jobs: &JobManager) {
         tracing::info!(version = %self.new_version, "client update completed");
+        // Keep the marker, backup, and lifecycle lock until success is durable.
+        // A restart during a disk fault can then complete the same update again
+        // instead of reporting an interrupted job or accepting another update.
+        persist_result(jobs, jobs::succeeded(&self.job_target_id, format!("updated to {}", self.new_version))).await;
         if let Err(error) = platform.remove_old_executable().await {
             tracing::warn!(%error, "cannot remove the previous executable");
         }
-        // The result first: should the client stop in between, the next start
-        // reports success once more rather than the job not at all.
-        jobs.finish(jobs::succeeded(&self.job_target_id, format!("updated to {}", self.new_version)));
         delete_marker(&self.state_dir);
+    }
+
+    /// A new process can stay alive forever without ever connecting. The
+    /// crash-loop counter cannot catch that failure, so provisional updates
+    /// also have a deadline. A coincident long outage may conservatively
+    /// restore a valid update; ordinary confirmed clients never roll back.
+    pub(crate) async fn timed_out<P: Platform>(self, platform: &P, jobs: &JobManager, timeout: Duration) {
+        let mut marker = match read_marker(&self.state_dir) {
+            Ok(Some(marker)) if marker.job_target_id == self.job_target_id && !marker.rolled_back => marker,
+            _ => return,
+        };
+        marker.failure = Some(format!(
+            "version {} did not confirm a coordinator connection within {} s",
+            marker.new_version, timeout.as_secs(),
+        ));
+        tracing::error!(version = %marker.new_version, "update confirmation timed out; restoring previous version");
+        let _ = restore_and_restart(platform, jobs, &self.state_dir, marker).await;
+    }
+}
+
+async fn persist_result(jobs: &JobManager, result: JobResult) {
+    jobs.finish(result);
+    while let Err(error) = jobs.persist() {
+        tracing::warn!(%error, "cannot persist update result; retaining recovery information");
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -420,43 +460,19 @@ async fn resume<P: Platform>(
             return Startup::Continue(Some(completion));
         }
         tracing::error!("version {new} did not complete a handshake in {MAX_STARTS} starts; restoring version {previous}");
-        if let Err(error) = platform.restore_executable().await {
-            tracing::error!(%error, "cannot restore the previous version; staying on {new}");
-            delete_marker(state_dir);
-            jobs.finish(jobs::failed(
-                &id,
-                reason::ERROR,
-                Some(format!(
-                    "version {new} did not complete a handshake in {MAX_STARTS} starts, and restoring version {previous} failed: {error}"
-                )),
-            ));
-            return Startup::Continue(None);
-        }
-        marker.rolled_back = true;
-        if let Err(error) = write_marker(state_dir, &marker) {
-            tracing::error!(%error, "cannot record the rollback in the update marker");
-        }
-        return match platform.request_restart() {
-            Ok(()) => Startup::Restart,
-            Err(error) => {
-                tracing::error!(%error, "cannot restart; version {previous} runs from the next start");
-                Startup::Continue(None)
-            }
-        };
+        return restore_and_restart(platform, jobs, state_dir, marker).await;
     }
 
     if marker.rolled_back && client_version == previous {
         tracing::warn!("the update to {new} was rolled back");
+        persist_result(jobs, jobs::failed(
+            &id,
+            reason::ROLLED_BACK,
+            Some(format!("{}; version {previous} restored", failure_detail(&marker))),
+        )).await;
         if let Err(error) = platform.remove_old_executable().await {
             tracing::warn!(%error, "cannot remove the executable of the failed version");
         }
-        jobs.finish(jobs::failed(
-            &id,
-            reason::ROLLED_BACK,
-            Some(format!(
-                "version {new} did not complete a handshake in {MAX_STARTS} starts; version {previous} restored"
-            )),
-        ));
         delete_marker(state_dir);
         return Startup::Continue(None);
     }
@@ -468,13 +484,49 @@ async fn resume<P: Platform>(
         rolled_back = marker.rolled_back,
         "the update marker matches neither the running version nor the expected one; dropping it"
     );
-    jobs.finish(jobs::failed(
+    persist_result(jobs, jobs::failed(
         &id,
         reason::ERROR,
         Some(format!("the update from {previous} to {new} did not take effect: version {client_version} is running")),
-    ));
+    )).await;
     delete_marker(state_dir);
     Startup::Continue(None)
+}
+
+fn failure_detail(marker: &Marker) -> String {
+    marker.failure.clone().unwrap_or_else(|| format!(
+        "version {} did not complete a handshake in {MAX_STARTS} starts", marker.new_version
+    ))
+}
+
+async fn restore_and_restart<P: Platform>(
+    platform: &P,
+    jobs: &JobManager,
+    state_dir: &Path,
+    mut marker: Marker,
+) -> Startup {
+    if let Err(error) = platform.restore_executable().await {
+        tracing::error!(%error, "cannot restore the previous client version");
+        persist_result(jobs, jobs::failed(
+            &marker.job_target_id,
+            reason::ERROR,
+            Some(format!("{}, and restoring version {} failed: {error}",
+                failure_detail(&marker), marker.previous_version)),
+        )).await;
+        delete_marker(state_dir);
+        return Startup::Continue(None);
+    }
+    marker.rolled_back = true;
+    if let Err(error) = write_marker(state_dir, &marker) {
+        tracing::error!(%error, "cannot record the rollback in the update marker");
+    }
+    match platform.request_restart() {
+        Ok(()) => Startup::Restart,
+        Err(error) => {
+            tracing::error!(%error, "cannot restart; previous client runs from the next start");
+            Startup::Continue(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +553,7 @@ mod tests {
             new_version: "1.1.0".into(),
             starts: 0,
             rolled_back: false,
+            failure: None,
         };
         write_marker(dir.path(), &marker).unwrap();
         let text = std::fs::read_to_string(dir.path().join(MARKER_FILE)).unwrap();

@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use client::platform::PlatformError;
-use common::{client_config, start_client, FakeCoordinator, FakePlatform, WAIT};
+use common::{client_config, start_client, start_client_with_state, FakeCoordinator, FakePlatform, WAIT};
 use protocol::{reason, JobResult, JobStatus, PowerAction, RunAs};
 use serde_json::{json, Value};
 
@@ -243,11 +243,11 @@ async fn a_script_run_as_the_user_reaches_the_platform_as_such() {
 // ------------------------------------------------------------ power
 
 #[tokio::test]
-async fn power_reports_success_first_and_acts_once_the_result_is_acknowledged() {
+async fn power_reports_native_acceptance_then_waits_for_ack_before_another_job() {
     let coordinator = FakeCoordinator::start().await;
     let platform = FakePlatform::new();
     let mut config = client_config(coordinator.addr);
-    // Long enough that only the acknowledgement can explain the action.
+    // Long enough that only the acknowledgement can release the next job.
     config.power_ack_timeout = Duration::from_secs(20);
     let client = start_client(config, platform.clone());
     let (mut connection, _) = coordinator.accept().await;
@@ -255,20 +255,15 @@ async fn power_reports_success_first_and_acts_once_the_result_is_acknowledged() 
     connection.send_job("t1", "power", json!({"action": "restart"})).await;
     connection.send_script("after", "out ran after the power job").await;
     connection.expect_started("t1").await;
-    assert_succeeded(&connection.expect_result("t1").await, "restarting");
+    assert_succeeded(&connection.expect_result("t1").await, "restart scheduled by Windows");
 
-    // Nothing happens, and nothing else starts, until the coordinator
-    // has the result.
+    // The OS accepted the request before success was reported. No next job
+    // starts until the coordinator has stored that result.
     assert_eq!(connection.try_recv(QUIET).await, None);
-    assert!(platform.power_calls().is_empty());
-
-    let acked_at = Instant::now();
-    connection.ack("t1").await;
     let calls = power_calls(&platform, 1).await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, PowerAction::Restart);
-    let after_ack = calls[0].1.saturating_duration_since(acked_at);
-    assert!(after_ack < Duration::from_secs(2), "acted {after_ack:?} after the acknowledgement");
+    connection.ack("t1").await;
 
     // The worker carries on (on a device that did not actually restart).
     connection.expect_started("after").await;
@@ -276,7 +271,7 @@ async fn power_reports_success_first_and_acts_once_the_result_is_acknowledged() 
 }
 
 #[tokio::test]
-async fn power_acts_after_the_timeout_when_no_acknowledgement_comes() {
+async fn power_result_ack_timeout_does_not_block_the_worker_forever() {
     let coordinator = FakeCoordinator::start().await;
     let platform = FakePlatform::new();
     // `client_config` waits 200 ms for the acknowledgement.
@@ -284,18 +279,19 @@ async fn power_acts_after_the_timeout_when_no_acknowledgement_comes() {
     let (mut connection, _) = coordinator.accept().await;
 
     connection.send_job("t1", "power", json!({"action": "shutdown"})).await;
+    connection.send_script("after", "out ran after the power job").await;
     connection.expect_started("t1").await;
-    assert_succeeded(&connection.expect_result("t1").await, "shutting down");
+    assert_succeeded(&connection.expect_result("t1").await, "shutdown scheduled by Windows");
     let reported_at = Instant::now();
-    assert!(platform.power_calls().is_empty(), "acted before the result was out");
 
     let calls = power_calls(&platform, 1).await;
     assert_eq!(calls.len(), 1, "never acted");
     assert_eq!(calls[0].0, PowerAction::Shutdown);
-    let waited = calls[0].1.saturating_duration_since(reported_at);
+    connection.expect_started("after").await;
+    let waited = reported_at.elapsed();
     // The result was received a little after the timer started.
-    assert!(waited >= Duration::from_millis(100), "acted after only {waited:?}");
-    assert!(waited < Duration::from_secs(3), "acted after {waited:?}");
+    assert!(waited >= Duration::from_millis(100), "next job started after only {waited:?}");
+    assert!(waited < Duration::from_secs(3), "next job started after {waited:?}");
     client.stop().await;
 }
 
@@ -309,7 +305,7 @@ async fn power_is_carried_out_once_even_if_the_job_is_delivered_again() {
     let sleep = json!({"action": "sleep"});
     connection.send_job("t1", "power", sleep.clone()).await;
     connection.expect_started("t1").await;
-    assert_succeeded(&connection.expect_result("t1").await, "going to sleep");
+    assert_succeeded(&connection.expect_result("t1").await, "sleep request completed");
     // Again before the acknowledgement...
     connection.send_job("t1", "power", sleep.clone()).await;
     connection.ack("t1").await;
@@ -345,5 +341,76 @@ async fn power_on_a_platform_without_it_fails_before_reporting_success() {
 
     tokio::time::sleep(QUIET).await;
     assert!(platform.power_calls().is_empty());
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn native_power_failure_after_successful_preflight_is_reported_to_the_operator() {
+    let coordinator = FakeCoordinator::start().await;
+    let platform = FakePlatform::new();
+    platform.fail_power(PlatformError::Failed("native power request rejected".into()));
+    let client = start_client(client_config(coordinator.addr), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    for action in ["restart", "shutdown", "sleep"] {
+        connection.send_job(action, "power", json!({"action": action})).await;
+        connection.expect_started(action).await;
+        let result = connection.expect_result(action).await;
+        assert_failed(&result, reason::ERROR);
+        assert_eq!(result.message.as_deref(), Some("native power request rejected"));
+        connection.ack(action).await;
+    }
+    assert_eq!(platform.power_calls().len(), 3);
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn sleep_waits_for_native_return_and_survives_disconnect_cancel_and_redelivery() {
+    let coordinator = FakeCoordinator::start().await;
+    let platform = FakePlatform::new();
+    platform.hold_power();
+    let client = start_client(client_config(coordinator.addr), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    let payload = json!({"action": "sleep"});
+    connection.send_job("sleep", "power", payload.clone()).await;
+    connection.expect_started("sleep").await;
+    assert_eq!(power_calls(&platform, 1).await.len(), 1);
+    assert_eq!(connection.try_recv(QUIET).await, None, "success before native return");
+    connection.drop_abruptly();
+
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("sleep").await;
+    connection.send_job("sleep", "power", payload).await;
+    connection.cancel("sleep").await;
+    assert_eq!(connection.try_recv(QUIET).await, None);
+    assert_eq!(platform.power_calls().len(), 1);
+    platform.release();
+    assert_succeeded(&connection.expect_result("sleep").await, "sleep request completed");
+    connection.ack("sleep").await;
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn interrupted_native_sleep_is_reported_after_restart_without_repeating_it() {
+    let coordinator = FakeCoordinator::start().await;
+    let state = tempfile::tempdir().unwrap();
+    let platform = FakePlatform::new();
+    platform.hold_power();
+    let client = start_client_with_state(coordinator.addr, state.path(), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    let payload = json!({"action": "sleep"});
+    connection.send_job("sleep", "power", payload.clone()).await;
+    connection.expect_started("sleep").await;
+    assert_eq!(power_calls(&platform, 1).await.len(), 1);
+    client.stop().await;
+    connection.drop_abruptly();
+
+    let client = start_client_with_state(coordinator.addr, state.path(), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    connection.expect_started("sleep").await;
+    assert_failed(&connection.expect_result("sleep").await, reason::INTERRUPTED);
+    connection.send_job("sleep", "power", payload).await;
+    connection.ack("sleep").await;
+    assert_eq!(connection.try_recv(QUIET).await, None);
+    assert_eq!(platform.power_calls().len(), 1);
     client.stop().await;
 }

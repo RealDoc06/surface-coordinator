@@ -432,6 +432,39 @@ async fn a_job_in_progress_is_replayed_as_started_and_then_completes_once() {
 // ------------------------------------------------------------ across restarts
 
 #[tokio::test]
+async fn a_job_cannot_run_without_a_durable_start_record() {
+    let coordinator = FakeCoordinator::start().await;
+    let state = tempfile::tempdir().unwrap();
+    let platform = FakePlatform::new();
+    let client = start_client_with_state(coordinator.addr, state.path(), platform.clone());
+    let (mut connection, _) = coordinator.accept().await;
+    let blocked = state.path().join("jobs.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+
+    connection.send_script("blocked", "out must not execute").await;
+    // The first message must be failure, not job.started or script output.
+    let result = connection.expect_result("blocked").await;
+    assert_eq!(result.status, JobStatus::Failed);
+    assert_eq!(result.reason.as_deref(), Some(protocol::reason::ERROR));
+    assert!(result.message.as_deref().unwrap().contains("job was not run"));
+    assert!(result.message.as_deref().unwrap().contains("jobs.json"));
+    assert!(platform.runs().is_empty());
+    connection.drop_abruptly();
+
+    // Reconnection replays the failure without claiming that the job ran.
+    let (mut connection, _) = coordinator.accept().await;
+    assert_eq!(connection.expect_result("blocked").await, result);
+    std::fs::remove_dir(blocked).unwrap();
+    connection.send_script("blocked", "out must still not execute").await;
+    connection.send_script("after-repair", "out working").await;
+    connection.expect_started("after-repair").await;
+    connection.expect_output("after-repair", 1, OutputStream::Stdout, "working\n").await;
+    assert_eq!(connection.expect_result("after-repair").await.status, JobStatus::Succeeded);
+    assert_eq!(platform.runs().len(), 1);
+    client.stop().await;
+}
+
+#[tokio::test]
 async fn a_restarted_client_reports_an_interrupted_job_instead_of_running_it_again() {
     let coordinator = FakeCoordinator::start().await;
     let state_dir = tempfile::tempdir().unwrap();

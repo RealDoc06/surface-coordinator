@@ -78,12 +78,25 @@ pub struct WifiConnection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WifiJoinPolicy {
+    /// Explicit operator command: changing networks is its purpose.
+    Replace,
+    /// Automatic discovery must leave every existing connection alone.
+    Disconnected,
+    /// A failed explicit move may leave its destination, but not a network
+    /// the user selected afterwards. Unknown SSIDs must be preserved.
+    RecoverFrom(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiJoinRequest {
     pub ssid: String,
     /// `None` for an open network.
     pub passphrase: Option<String>,
     /// Whether the device should come back to this network by itself later.
     pub auto_connect: bool,
+    /// Platforms recheck this immediately before initiating the join.
+    pub policy: WifiJoinPolicy,
 }
 
 fn unsupported<T>(what: &str) -> Result<T, PlatformError> {
@@ -151,16 +164,17 @@ pub trait Platform: Send + Sync + 'static {
         }
     }
 
-    /// Whether [`Platform::power`] can carry out `action`, asked before the
-    /// job reports success: once it has, a failure can only be logged.
+    /// Whether [`Platform::power`] can attempt `action`, checked before the
+    /// job commits. Runtime failures are still returned by `power`.
     /// Implement it together with `power`.
     fn check_power(&self, action: PowerAction) -> Result<(), PlatformError> {
         let _ = action;
         unsupported("power actions")
     }
 
-    /// Restarts, shuts down or suspends the device. May return before the
-    /// action takes effect.
+    /// Requests a native power action. Returns only once the OS accepts a
+    /// delayed restart/shutdown, or the blocking sleep call finishes. An
+    /// error is reported as a failed job, never as a prior success.
     fn power(&self, action: PowerAction) -> impl Future<Output = Result<(), PlatformError>> + Send {
         async move {
             let _ = action;
@@ -171,6 +185,20 @@ pub trait Platform: Send + Sync + 'static {
     /// The client's executable. `client.update` downloads beside it.
     fn current_exe(&self) -> Result<PathBuf, PlatformError> {
         unsupported("updating the client")
+    }
+
+    /// After signature verification, checks that the candidate can start
+    /// and identifies as the expected version before replacing the working
+    /// service. A bad image cannot run the client's own rollback code.
+    fn validate_update(
+        &self,
+        path: PathBuf,
+        expected_version: String,
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        async move {
+            let _ = (path, expected_version);
+            unsupported("validating a client update")
+        }
     }
 
     /// Replaces the executable with `new`: the running one becomes

@@ -12,6 +12,10 @@ const localStatus = document.getElementById('local-status');
 const localError = document.getElementById('local-error');
 const keySync = document.getElementById('key-sync');
 
+let checking = false;
+let installing = false;
+let commandRunning = false;
+
 function showError(element, message) {
   element.textContent = message;
   element.hidden = !message;
@@ -52,8 +56,12 @@ async function refresh() {
 // Runs a manager command with the button disabled; reports a failure in
 // `errorElement`. On success the window usually navigates away.
 async function run(button, busyText, errorElement, command, args) {
+  if (installing || commandRunning) {
+    return false;
+  }
   const label = button.textContent;
-  button.disabled = true;
+  commandRunning = true;
+  updateControls();
   button.textContent = busyText;
   showError(errorElement, '');
   try {
@@ -61,9 +69,11 @@ async function run(button, busyText, errorElement, command, args) {
   } catch (error) {
     showError(errorElement, String(error));
   } finally {
-    button.disabled = false;
+    commandRunning = false;
+    updateControls();
     button.textContent = label;
   }
+  return true;
 }
 
 remoteForm.addEventListener('submit', (event) => {
@@ -72,13 +82,15 @@ remoteForm.addEventListener('submit', (event) => {
 });
 
 localOpen.addEventListener('click', async () => {
-  await run(localOpen, 'Starting…', localError, 'open_local');
-  refresh();
+  if (await run(localOpen, 'Starting…', localError, 'open_local')) {
+    refresh();
+  }
 });
 
 localStop.addEventListener('click', async () => {
-  await run(localStop, 'Stopping…', localError, 'stop_local');
-  refresh();
+  if (await run(localStop, 'Stopping…', localError, 'stop_local')) {
+    refresh();
+  }
 });
 
 // ---- Self-update ----------------------------------------------------------
@@ -115,8 +127,12 @@ function showUpdate(result) {
 }
 
 async function checkForUpdates(asked) {
+  if (checking || installing || commandRunning) {
+    return;
+  }
+  checking = true;
+  updateControls();
   if (asked) {
-    updateCheck.disabled = true;
     updateMessage.textContent = 'Checking…';
   }
   let result;
@@ -125,7 +141,8 @@ async function checkForUpdates(asked) {
   } catch (error) {
     result = { configured: true, available: false, error: String(error) };
   } finally {
-    updateCheck.disabled = false;
+    checking = false;
+    updateControls();
   }
   if (result.available) {
     updateMessage.textContent = '';
@@ -141,34 +158,56 @@ async function checkForUpdates(asked) {
   } else {
     updateMessage.textContent = 'You are up to date.';
   }
+  if (!result.available && !result.error) {
+    updateBanner.hidden = true;
+  }
 }
 
 // While installing nothing else may be started: the local coordinator is
 // about to be stopped and the app restarted.
-function setInstalling(installing) {
+function updateControls() {
+  const busy = installing || commandRunning;
   for (const control of document.querySelectorAll('button, input')) {
-    control.disabled = installing;
+    control.disabled = busy;
   }
+  // A completed check may replace the pending release. Keep its existing
+  // banner unchanged until the check finishes so it cannot be installed
+  // or dismissed against a different backend result.
+  updateCheck.disabled = busy || checking;
+  updateInstall.disabled = busy || checking;
+  updateLater.disabled = busy || checking;
 }
 
 updateInstall.addEventListener('click', async () => {
-  setInstalling(true);
+  if (checking || installing || commandRunning || updateBanner.hidden) {
+    return;
+  }
+  installing = true;
+  updateControls();
   showError(updateError, '');
   showText(updateProgress, 'Preparing…');
   const progress = new Channel();
-  progress.onmessage = (text) => showText(updateProgress, text);
+  progress.onmessage = (text) => {
+    if (installing) {
+      showText(updateProgress, text);
+    }
+  };
   try {
     // On success the manager restarts and this page goes away.
     await invoke('install_update', { onProgress: progress });
   } catch (error) {
     showText(updateProgress, '');
     showError(updateError, String(error));
-    setInstalling(false);
+    installing = false;
+    updateControls();
     refresh();
   }
 });
 
 updateLater.addEventListener('click', () => {
+  if (checking || installing || commandRunning) {
+    return;
+  }
   sessionStorage.setItem(DISMISSED, updateTitle.dataset.version || '');
   updateBanner.hidden = true;
 });

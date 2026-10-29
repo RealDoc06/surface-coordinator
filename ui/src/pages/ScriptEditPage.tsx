@@ -32,6 +32,8 @@ export function ScriptEditPage() {
 
 function ScriptLoader({ id }: { id: string }) {
   const { state, reload } = useStore()
+  const location = useLocation()
+  const request = useMemo(() => parseComposeRequest(location.state), [location.state])
   const [script, setScript] = useState<Script | null>(null)
   const [missing, setMissing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -63,7 +65,10 @@ function ScriptLoader({ id }: { id: string }) {
       <div className="empty">
         <h2>Script not found</h2>
         <p>
-          It may have been deleted. <Link to="/scripts">Back to scripts</Link>
+          It may have been deleted.{' '}
+          <Link to="/scripts" state={{ targets: request.targets }}>
+            Back to scripts
+          </Link>
         </p>
       </div>
     )

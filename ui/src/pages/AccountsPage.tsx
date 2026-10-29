@@ -228,7 +228,7 @@ export function AccountsPage() {
       )}
 
       {changing ? (
-        <Modal title={`Change password of ${changing.username}`} onClose={closeChange}>
+        <Modal title={`Change password of ${changing.username}`} onClose={closeChange} busy={changeBusy}>
           <form onSubmit={(e) => void onChangePassword(e)} noValidate>
             <div className="field">
               <label htmlFor="change-password">New password (at least {MIN_PASSWORD_LENGTH} characters)</label>
@@ -238,12 +238,13 @@ export function AccountsPage() {
                 autoComplete="new-password"
                 data-autofocus
                 value={newPassword}
+                disabled={changeBusy}
                 onChange={(e) => setNewPassword(e.target.value)}
               />
             </div>
             <ErrorNote message={changeError} />
             <div className="modal-actions">
-              <button type="button" onClick={closeChange}>
+              <button type="button" onClick={closeChange} disabled={changeBusy}>
                 Cancel
               </button>
               <button type="submit" className="primary" disabled={changeBusy}>

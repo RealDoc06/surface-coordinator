@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use manager::embedded::{Embedded, Options};
@@ -30,6 +31,8 @@ struct FakeControl {
     stop_failure: Mutex<Option<String>>,
     /// When set, a start waits for this before it finishes.
     start_gate: Mutex<Option<Arc<Notify>>>,
+    /// The OS may turn a hotspot off independently of the manager's cache.
+    running: Arc<AtomicBool>,
 }
 
 impl FakeControl {
@@ -40,6 +43,7 @@ impl FakeControl {
             start_failure: Mutex::new(None),
             stop_failure: Mutex::new(None),
             start_gate: Mutex::new(None),
+            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -68,18 +72,30 @@ impl HotspotControl for FakeControl {
             .push(Call::Start { ssid: ssid.to_owned(), passphrase: passphrase.to_owned() });
         let failure = self.start_failure.lock().unwrap().take();
         let gate = self.start_gate.lock().unwrap().take();
+        let running = self.running.clone();
         Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
-            failure.map_or(Ok(()), Err)
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            running.store(true, Ordering::SeqCst);
+            Ok(())
         })
     }
 
     fn stop(&self) -> BoxFuture<Result<(), String>> {
         self.calls.lock().unwrap().push(Call::Stop);
         let failure = self.stop_failure.lock().unwrap().take();
-        Box::pin(async move { failure.map_or(Ok(()), Err) })
+        let running = self.running.clone();
+        Box::pin(async move {
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            running.store(false, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     fn instructions(&self, ssid: &str, passphrase: &str) -> Vec<String> {
@@ -230,6 +246,22 @@ async fn starting_uses_the_network_name_and_password_of_the_chosen_key() {
     assert_eq!(started["error"], Value::Null);
     assert_eq!(started["instructions"], json!([]));
     assert_eq!(manager.hotspot().await, started);
+    manager.embedded.stop().await;
+}
+
+#[tokio::test]
+async fn starting_the_same_key_restores_a_hotspot_stopped_outside_the_manager() {
+    let control = FakeControl::new(Control::Automatic);
+    let manager = Manager::start(control.clone()).await;
+    let key = manager.create_key("Lab trolley");
+    assert_eq!(manager.start_hotspot(&key.id).await.status(), StatusCode::OK);
+    assert!(control.running.load(Ordering::SeqCst));
+    control.running.store(false, Ordering::SeqCst);
+    assert_eq!(manager.hotspot().await["state"], "on");
+
+    assert_eq!(manager.start_hotspot(&key.id).await.status(), StatusCode::OK);
+    assert!(control.running.load(Ordering::SeqCst));
+    assert_eq!(control.calls().len(), 2);
     manager.embedded.stop().await;
 }
 
